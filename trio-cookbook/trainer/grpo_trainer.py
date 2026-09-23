@@ -1,10 +1,9 @@
 """PyTRIO-native GRPO trainer.
 
-The public shape resembles ``trl.GRPOTrainer`` where it is useful, but the
-execution contract is intentionally different: ``training_client`` and
-``sampling_client`` are remote clients, not local Hugging Face models.  This
-module currently implements only the first GRPO algorithm (group-centered
-advantages + PyTRIO ``importance_sampling``).
+The public shape resembles ``trl.GRPOTrainer`` where it is useful.  Callers
+provide a PyTRIO-supported model name, and the trainer owns the service,
+training, and sampling clients needed by the GRPO loop.  This module currently
+implements group-centered advantages with PyTRIO ``importance_sampling``.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytrio as trio
+
 from ..utils.client import call, call_async, optimizer_params, submit_async, wait, wait_async
 from .advantages import group_advantages
 from .config import GRPOConfig
@@ -28,28 +29,33 @@ from .types import GRPOBatch, GRPOResult, SequenceSample, as_prompt_text
 
 @dataclass(slots=True)
 class TrainerState:
+    """Mutable local state tracked across GRPO training steps."""
+
+    # Number of completed trainer steps.
     global_step: int = 0
+
+    # Version of the behavior policy used to generate the next rollout batch.
     behavior_policy_version: int = 0
+
+    # Metrics collected during the most recently completed trainer step.
     metrics: dict[str, float] = field(default_factory=dict)
 
 
 class GRPOTrainer:
-    """Train a text-generation policy through public PyTRIO client methods.
+    """Train a PyTRIO-supported text-generation model with GRPO.
 
-    ``model`` is accepted as a compatibility alias only when it is already a
-    training client.  A string/path or a local Transformers model is rejected:
-    loading and optimizer ownership belong to ``ServiceClient``/PyTRIO.
+    The trainer creates and owns its PyTRIO clients.  ``model_name`` is passed
+    to ``ServiceClient.create_lora_training_client`` as the base model.
     """
 
     def __init__(
         self,
-        training_client: Any = None,
+        model_name: str,
         reward_funcs: RewardFunc | Sequence[RewardFunc] | None = None,
         args: GRPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        model: Any = None,
-        sampling_client: Any = None,
+        lora_rank: int = 32,
         processing_class: Any = None,
         prompt_tokenizer: Any = None,
         prompt_builder: Callable[[Any], Any] | None = None,
@@ -59,12 +65,12 @@ class GRPOTrainer:
         optimizer_params_factory: Any = None,
         rollout_func: Callable[..., Any] | None = None,
     ):
-        if training_client is None:
-            training_client = model
-        if training_client is None:
-            raise TypeError("Pass a PyTRIO training_client; local model loading is not supported.")
-        if isinstance(training_client, (str, bytes)):
-            raise TypeError("GRPOTrainer expects a PyTRIO client, not a model name/path.")
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise TypeError("model_name must be a non-empty PyTRIO model name.")
+        if not isinstance(lora_rank, int) or isinstance(lora_rank, bool):
+            raise TypeError("lora_rank must be an integer.")
+        if not 4 <= lora_rank <= 64:
+            raise ValueError("lora_rank must be between 4 and 64.")
         if processing_class is not None and not callable(getattr(processing_class, "encode", None)):
             # TRL's ProcessorMixin can carry text and image preprocessing.  A
             # PyTRIO text-only trainer ignores the image processor and keeps
@@ -74,19 +80,27 @@ class GRPOTrainer:
                 processing_class = None
         if reward_funcs is None:
             raise ValueError("reward_funcs is required for client-side GRPO.")
-        self.training_client = training_client
+
+        self.model_name = model_name.strip()
         self.config = args or GRPOConfig()
+        self._service_client = trio.ServiceClient()
+        self._training_client = self._service_client.create_lora_training_client(
+            base_model=self.model_name,
+            rank=lora_rank,
+            seed=self.config.seed,
+        )
         self.train_dataset = train_dataset
-        self.prompt_tokenizer = prompt_tokenizer or processing_class
+        self.prompt_tokenizer = (
+            prompt_tokenizer or processing_class or self._training_client.get_tokenizer()
+        )
         self.prompt_builder = prompt_builder
-        self.model_input_builder = model_input_builder
-        self.datum_factory = datum_factory
-        self.optimizer_params_factory = optimizer_params_factory
+        self.model_input_builder = model_input_builder or trio.ModelInput.from_ints
+        self.datum_factory = datum_factory or trio.Datum
+        self.optimizer_params_factory = optimizer_params_factory or trio.AdamParams
         self.reward_evaluator = RewardEvaluator(reward_funcs, self.config.reward_weights)
         self.rollout_func = rollout_func
         self.state = TrainerState()
-        self._sampling_client = sampling_client
-        self._sampling_params_factory = sampling_params_factory
+        self._sampling_params_factory = sampling_params_factory or trio.SamplingParams
         self._decode = self._make_decode(self.prompt_tokenizer)
 
     @staticmethod
@@ -104,18 +118,16 @@ class GRPOTrainer:
             encoded = encoded.tolist()
         return [int(token) for token in encoded]
 
-    def _prompt_input(self, prompt: Any) -> Any:
-        return self.prompt_builder(prompt) if self.prompt_builder else prompt
+    def _prompt_input(self, prompt: Any, prompt_tokens: list[int]) -> Any:
+        if self.prompt_builder is not None:
+            return self.prompt_builder(prompt)
+        return trio.ModelInput.from_ints(prompt_tokens)
 
     def _new_sampling_client(self) -> Any:
-        if self._sampling_client is not None:
-            return self._sampling_client
-        return call(self.training_client, "save_weights_and_get_sampling_client")
+        return call(self._training_client, "save_weights_and_get_sampling_client")
 
     async def _new_sampling_client_async(self) -> Any:
-        if self._sampling_client is not None:
-            return self._sampling_client
-        return await call_async(self.training_client, "save_weights_and_get_sampling_client")
+        return await call_async(self._training_client, "save_weights_and_get_sampling_client")
 
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
@@ -125,15 +137,16 @@ class GRPOTrainer:
             prompt = row[self.config.prompt_key]
             if not (isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt)):
                 prompt = as_prompt_text(prompt)
+            prompt_tokens = self._prompt_tokens(prompt)
             groups.append(
                 GRPOBatch(
                     str(index),
                     prompt,
-                    self._prompt_tokens(prompt),
+                    prompt_tokens,
                     [],
                     dict(row),
                     self.state.behavior_policy_version,
-                    self._prompt_input(prompt),
+                    self._prompt_input(prompt, prompt_tokens),
                 )
             )
         return groups
@@ -200,8 +213,8 @@ class GRPOTrainer:
         # Submit both operations before waiting.  This is the PyTRIO clock
         # cycle; waiting for forward_backward first needlessly serializes the
         # service and differs from the local TRL optimizer loop.
-        forward_method = getattr(self.training_client, "forward_backward", None)
-        optim_method = getattr(self.training_client, "optim_step", None)
+        forward_method = getattr(self._training_client, "forward_backward", None)
+        optim_method = getattr(self._training_client, "optim_step", None)
         if forward_method is None or optim_method is None:
             raise AttributeError("PyTRIO training_client needs forward_backward() and optim_step().")
         forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
@@ -217,8 +230,8 @@ class GRPOTrainer:
     async def _train_datums_async(self, datums: list[Any]) -> dict[str, float]:
         if not datums:
             return {"train/skipped": 1.0}
-        forward = await submit_async(self.training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
-        optim = await submit_async(self.training_client, "optim_step", optimizer_params(self.config, self.optimizer_params_factory))
+        forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
+        optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, self.optimizer_params_factory))
         forward_result, optim_result = await wait_async(forward), await wait_async(optim)
         metrics: dict[str, float] = {}
         for value in (forward_result, optim_result):
@@ -237,7 +250,6 @@ class GRPOTrainer:
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
-        self._sampling_client = None  # Force a fresh sampler snapshot after each update.
         return GRPOResult(self.state.global_step, metrics=metrics, num_datums=len(datums), skipped_groups=skipped)
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
@@ -250,7 +262,6 @@ class GRPOTrainer:
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
-        self._sampling_client = None
         return GRPOResult(self.state.global_step, metrics=metrics, num_datums=len(datums), skipped_groups=skipped)
 
     def train(self) -> TrainerState:
