@@ -12,3 +12,8 @@ PPO一类，GRPO一类，DPO一类
 
 期望使用类似于TRL的Trainer形式实现基于PyTRIO的强化学习训练
 
+## 环境安装
+
+```bash
+pip install -r requirements.txt
+```
