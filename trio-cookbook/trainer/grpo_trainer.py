@@ -56,52 +56,40 @@ class GRPOTrainer:
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
-        processing_class: Any = None,
-        prompt_tokenizer: Any = None,
-        prompt_builder: Callable[[Any], Any] | None = None,
-        model_input_builder: Callable[[list[int]], Any] | None = None,
-        datum_factory: Callable[..., Any] | None = None,
-        sampling_params_factory: Any = None,
-        optimizer_params_factory: Any = None,
         rollout_func: Callable[..., Any] | None = None,
     ):
+        ## Model
+        # TRL Model -> pytrio client
         if not isinstance(model_name, str) or not model_name.strip():
-            raise TypeError("model_name must be a non-empty PyTRIO model name.")
-        if not isinstance(lora_rank, int) or isinstance(lora_rank, bool):
-            raise TypeError("lora_rank must be an integer.")
-        if not 4 <= lora_rank <= 64:
-            raise ValueError("lora_rank must be between 4 and 64.")
-        if processing_class is not None and not callable(getattr(processing_class, "encode", None)):
-            # TRL's ProcessorMixin can carry text and image preprocessing.  A
-            # PyTRIO text-only trainer ignores the image processor and keeps
-            # only its tokenizer when one is available.
-            processing_class = getattr(processing_class, "tokenizer", None)
-            if processing_class is not None and not callable(getattr(processing_class, "encode", None)):
-                processing_class = None
+            raise TypeError(
+                "model_name must be a non-empty PyTRIO model name. For the "
+                "supported models, please refer to ServiceClient.get_supported_models()."
+            )
         if reward_funcs is None:
+            # 这个要保留，最好写一个默认reward奖励函数，怎么撰写，等我检查后续的代码，思考具体逻辑后再说（任务2:添加默认奖励函数）
             raise ValueError("reward_funcs is required for client-side GRPO.")
 
         self.model_name = model_name.strip()
         self.config = args or GRPOConfig()
+
+        # 训练模型：先只写lora的吧，后续再增加全量的（暂定lora的意思，不要修改该注释）
         self._service_client = trio.ServiceClient()
+        # 该训练模型后续会随着训练不断更新
         self._training_client = self._service_client.create_lora_training_client(
             base_model=self.model_name,
             rank=lora_rank,
             seed=self.config.seed,
         )
+        # 可能有格式要求？AI写的代码，后续检查格式具体形式（任务1:检查数据集格式）
         self.train_dataset = train_dataset
-        self.prompt_tokenizer = (
-            prompt_tokenizer or processing_class or self._training_client.get_tokenizer()
-        )
-        self.prompt_builder = prompt_builder
-        self.model_input_builder = model_input_builder or trio.ModelInput.from_ints
-        self.datum_factory = datum_factory or trio.Datum
-        self.optimizer_params_factory = optimizer_params_factory or trio.AdamParams
+        self._tokenizer = self._training_client.get_tokenizer()
+        if not callable(getattr(self._tokenizer, "encode", None)):
+            raise TypeError("PyTRIO TrainingClient tokenizer must provide a callable encode() method.")
+        # 多个reward结果按照权重相加，而不是直接全部固定1倍率
         self.reward_evaluator = RewardEvaluator(reward_funcs, self.config.reward_weights)
         self.rollout_func = rollout_func
         self.state = TrainerState()
-        self._sampling_params_factory = sampling_params_factory or trio.SamplingParams
-        self._decode = self._make_decode(self.prompt_tokenizer)
+        self._decode = self._make_decode(self._tokenizer)
 
     @staticmethod
     def _make_decode(tokenizer: Any) -> Callable[[list[int]], str] | None:
@@ -111,17 +99,10 @@ class GRPOTrainer:
     def _prompt_tokens(self, prompt: Any) -> list[int]:
         if isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt):
             return list(prompt)
-        if self.prompt_tokenizer is None:
-            raise TypeError("Provide prompt_tokenizer or tokenized prompts for PyTRIO Datum alignment.")
-        encoded = self.prompt_tokenizer.encode(prompt, add_special_tokens=False)
+        encoded = self._tokenizer.encode(prompt, add_special_tokens=False)
         if hasattr(encoded, "tolist"):
             encoded = encoded.tolist()
         return [int(token) for token in encoded]
-
-    def _prompt_input(self, prompt: Any, prompt_tokens: list[int]) -> Any:
-        if self.prompt_builder is not None:
-            return self.prompt_builder(prompt)
-        return trio.ModelInput.from_ints(prompt_tokens)
 
     def _new_sampling_client(self) -> Any:
         return call(self._training_client, "save_weights_and_get_sampling_client")
@@ -146,13 +127,13 @@ class GRPOTrainer:
                     [],
                     dict(row),
                     self.state.behavior_policy_version,
-                    self._prompt_input(prompt, prompt_tokens),
+                    trio.ModelInput.from_ints(prompt_tokens),
                 )
             )
         return groups
 
     def _sample_groups(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
-        adapter = SamplingAdapter(client, params_factory=self._sampling_params_factory, decode=self._decode)
+        adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
         if self.rollout_func is None:
             return [adapter.sample(group, self.config) for group in groups]
         result = self.rollout_func([group.prompt for group in groups], self)
@@ -161,7 +142,7 @@ class GRPOTrainer:
         return self._replace_rollouts(groups, result)
 
     async def _sample_groups_async(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
-        adapter = SamplingAdapter(client, params_factory=self._sampling_params_factory, decode=self._decode)
+        adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
         if self.rollout_func is None:
             return list(
                 await asyncio.gather(
@@ -203,8 +184,15 @@ class GRPOTrainer:
                 skipped += 1
                 continue
             for sample_id, (sample, advantage) in enumerate(zip(group.samples, advantages)):
-                datum = build_aligned_datum(group.prompt_tokens, sample, advantage, prompt_id=group.prompt_id, sample_id=sample_id, model_input_builder=self.model_input_builder)
-                datums.append(to_client_datum(datum, self.datum_factory))
+                datum = build_aligned_datum(
+                    group.prompt_tokens,
+                    sample,
+                    advantage,
+                    prompt_id=group.prompt_id,
+                    sample_id=sample_id,
+                    model_input_builder=trio.ModelInput.from_ints,
+                )
+                datums.append(to_client_datum(datum, trio.Datum))
         return datums, skipped, metrics
 
     def _train_datums(self, datums: list[Any]) -> dict[str, float]:
@@ -218,7 +206,7 @@ class GRPOTrainer:
         if forward_method is None or optim_method is None:
             raise AttributeError("PyTRIO training_client needs forward_backward() and optim_step().")
         forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
-        optim_future = optim_method(optimizer_params(self.config, self.optimizer_params_factory))
+        optim_future = optim_method(optimizer_params(self.config, trio.AdamParams))
         forward, optim = wait(forward_future), wait(optim_future)
         metrics: dict[str, float] = {}
         for value in (forward, optim):
@@ -231,7 +219,7 @@ class GRPOTrainer:
         if not datums:
             return {"train/skipped": 1.0}
         forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
-        optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, self.optimizer_params_factory))
+        optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, trio.AdamParams))
         forward_result, optim_result = await wait_async(forward), await wait_async(optim)
         metrics: dict[str, float] = {}
         for value in (forward_result, optim_result):

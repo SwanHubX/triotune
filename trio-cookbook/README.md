@@ -26,7 +26,6 @@ from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
 trainer = GRPOTrainer(
     training_client=training_client,       # created by ServiceClient
     sampling_client=sampling_client,
-    prompt_tokenizer=tokenizer,
     reward_funcs=my_reward,
     args=GRPOConfig(num_generations=4, max_steps=100),
     train_dataset=rows,                     # rows contain a `prompt` field
