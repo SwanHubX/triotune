@@ -17,21 +17,35 @@ while replacing local-model assumptions with PyTRIO public clients:
 | `utils/client.py` | algorithm-independent sync/async PyTRIO future and SDK-object adaptation |
 | `grpo_trainer.py` | synchronous/asynchronous training state machine |
 
-Example (the concrete SDK may provide `pytrio.Datum`, `pytrio.AdamParams` and
-`pytrio.SamplingParams` factories):
+Example:
 
 ```python
 from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
 
 trainer = GRPOTrainer(
-    training_client=training_client,       # created by ServiceClient
-    sampling_client=sampling_client,
+    model_name="Qwen/Qwen3.5-4B",
     reward_funcs=my_reward,
     args=GRPOConfig(num_generations=4, max_steps=100),
     train_dataset=rows,                     # rows contain a `prompt` field
 )
 trainer.train()
 ```
+
+A custom `rollout_func` must always return `groups`. It may add `metrics` and
+`metadata` only when they are needed:
+
+```python
+return {
+    "groups": rollout_groups,
+    "metrics": {"rollout/latency": latency},
+    "metadata": {"request_ids": request_ids},
+}
+```
+
+`groups` must contain one `GRPOBatch` per input prompt. Numeric `metrics` are
+included in the step metrics, while arbitrary `metadata` is exposed through
+`GRPOResult.metadata` and the final `TrainerState.metadata`. The default
+rollout therefore returns only `{"groups": rollout_groups}`.
 
 The source directory uses the repository's requested `trio-cookbook` name;
 projects may expose it under their preferred import alias (for example

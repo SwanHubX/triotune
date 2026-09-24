@@ -24,7 +24,7 @@ from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
 from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter
-from .types import GRPOBatch, GRPOResult, SequenceSample, as_prompt_text
+from .types import GRPOBatch, GRPOResult, RolloutResult, SequenceSample, as_prompt_text
 
 
 @dataclass(slots=True)
@@ -39,6 +39,9 @@ class TrainerState:
 
     # Metrics collected during the most recently completed trainer step.
     metrics: dict[str, float] = field(default_factory=dict)
+
+    # Metadata returned by the most recently completed rollout.
+    metadata: dict[str, Any] | None = None
 
 
 class GRPOTrainer:
@@ -92,11 +95,12 @@ class GRPOTrainer:
         self._decode = self._make_decode(self._tokenizer)
 
     @staticmethod
-    def _make_decode(tokenizer: Any) -> Callable[[list[int]], str] | None:
-        decode = getattr(tokenizer, "decode", None)
-        return decode if callable(decode) else None
+    def _make_decode(tokenizer: Any) -> Callable[[list[int]], str]:
+        # tokenizer.decode
+        return lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
     def _prompt_tokens(self, prompt: Any) -> list[int]:
+        # tokenizer.encode
         if isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt):
             return list(prompt)
         encoded = self._tokenizer.encode(prompt, add_special_tokens=False)
@@ -113,12 +117,13 @@ class GRPOTrainer:
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
         for index, row in enumerate(rows):
+            # 默认通常要求数据格式为：{"prompt": "问题文本"}
             if self.config.prompt_key not in row:
                 raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
             prompt = row[self.config.prompt_key]
             if not (isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt)):
-                prompt = as_prompt_text(prompt)
-            prompt_tokens = self._prompt_tokens(prompt)
+                prompt = as_prompt_text(prompt) # 规范化文本，可以提取content、messages、prompt包含这些字段的数据
+            prompt_tokens = self._prompt_tokens(prompt)  # encode转换文本成tokens
             groups.append(
                 GRPOBatch(
                     str(index),
@@ -132,34 +137,82 @@ class GRPOTrainer:
             )
         return groups
 
-    def _sample_groups(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
+    def _sample_groups(self, groups: list[GRPOBatch], client: Any) -> RolloutResult:
+        # 同步生成一批 prompt 的 rollout，也就是为每个 prompt 采样多个回答
         adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
         if self.rollout_func is None:
-            return [adapter.sample(group, self.config) for group in groups]
+            result = {
+                "groups": [adapter.sample(group, self.config) for group in groups],
+            }
+            return self._normalize_rollout_result(groups, result)
         result = self.rollout_func([group.prompt for group in groups], self)
         if inspect.isawaitable(result):
             raise RuntimeError("rollout_func returned an awaitable; use train_async().")
-        return self._replace_rollouts(groups, result)
+        return self._normalize_rollout_result(groups, result)
 
-    async def _sample_groups_async(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
+    async def _sample_groups_async(self, groups: list[GRPOBatch], client: Any) -> RolloutResult:
         adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
         if self.rollout_func is None:
-            return list(
-                await asyncio.gather(
-                    *(adapter.sample_async(group, self.config) for group in groups)
-                )
-            )
-        result = self.rollout_func([group.prompt for group in groups], self)
-        result = await result if inspect.isawaitable(result) else result
-        return self._replace_rollouts(groups, result)
+            result = {
+                "groups": list(
+                    await asyncio.gather(
+                        *(adapter.sample_async(group, self.config) for group in groups)
+                    )
+                ),
+            }
+        else:
+            result = self.rollout_func([group.prompt for group in groups], self)
+            result = await result if inspect.isawaitable(result) else result
+        return self._normalize_rollout_result(groups, result)
 
     @staticmethod
-    def _replace_rollouts(groups: list[GRPOBatch], result: Any) -> list[GRPOBatch]:
-        if isinstance(result, Mapping) and "groups" in result:
-            result = result["groups"]
-        if len(result) != len(groups):
+    def _normalize_rollout_result(groups: list[GRPOBatch], result: Any) -> RolloutResult:
+        if not isinstance(result, Mapping):
+            raise TypeError("rollout_func must return a mapping containing groups.")
+        required = {"groups"}
+        allowed = required | {"metrics", "metadata"}
+        missing = required.difference(result)
+        if missing:
+            raise ValueError(f"rollout_func result is missing fields: {sorted(missing)}.")
+        unexpected = set(result).difference(allowed)
+        if unexpected:
+            raise ValueError(
+                "rollout_func result has unexpected fields: "
+                f"{sorted(str(key) for key in unexpected)}."
+            )
+
+        rollout_groups = result["groups"]
+        if not isinstance(rollout_groups, Sequence) or isinstance(rollout_groups, (str, bytes)):
+            raise TypeError("rollout_func result['groups'] must be a sequence of GRPOBatch objects.")
+        rollout_groups = list(rollout_groups)
+        if len(rollout_groups) != len(groups):
             raise ValueError("rollout_func must return one group per prompt.")
-        return list(result)
+        if any(not isinstance(group, GRPOBatch) for group in rollout_groups):
+            raise TypeError("rollout_func result['groups'] must contain only GRPOBatch objects.")
+
+        normalized: RolloutResult = {"groups": rollout_groups}
+        if "metrics" in result:
+            raw_metrics = result["metrics"]
+            if not isinstance(raw_metrics, Mapping):
+                raise TypeError("rollout_func result['metrics'] must be a mapping.")
+            metrics: dict[str, float] = {}
+            for key, value in raw_metrics.items():
+                if not isinstance(key, str) or not isinstance(value, (int, float)):
+                    raise TypeError("rollout metrics must have string keys and numeric values.")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise ValueError("rollout metrics must be finite.")
+                metrics[key] = number
+            normalized["metrics"] = metrics
+
+        if "metadata" in result:
+            raw_metadata = result["metadata"]
+            if not isinstance(raw_metadata, Mapping):
+                raise TypeError("rollout_func result['metadata'] must be a mapping.")
+            if any(not isinstance(key, str) for key in raw_metadata):
+                raise TypeError("rollout metadata must have string keys.")
+            normalized["metadata"] = dict(raw_metadata)
+        return normalized
 
     def _build_datums(self, groups: Sequence[GRPOBatch], reward_groups: Sequence[Sequence[float]]) -> tuple[list[Any], int, dict[str, float]]:
         datums: list[Any] = []
@@ -230,27 +283,47 @@ class GRPOTrainer:
 
     def step(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
         groups = self._groups(rows)
-        sampled = self._sample_groups(groups, self._new_sampling_client())
+        rollout = self._sample_groups(groups, self._new_sampling_client())
+        sampled = rollout["groups"]
         reward_groups, reward_metrics = self.reward_evaluator.score(sampled)
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        if "metrics" in rollout:
+            metrics.update(rollout["metrics"])
         metrics.update(reward_metrics)
         metrics.update(self._train_datums(datums))
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
-        return GRPOResult(self.state.global_step, metrics=metrics, num_datums=len(datums), skipped_groups=skipped)
+        self.state.metadata = rollout.get("metadata")
+        return GRPOResult(
+            self.state.global_step,
+            metrics=metrics,
+            num_datums=len(datums),
+            skipped_groups=skipped,
+            metadata=rollout.get("metadata"),
+        )
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
         groups = self._groups(rows)
-        sampled = await self._sample_groups_async(groups, await self._new_sampling_client_async())
+        rollout = await self._sample_groups_async(groups, await self._new_sampling_client_async())
+        sampled = rollout["groups"]
         reward_groups, reward_metrics = await self.reward_evaluator.score_async(sampled)
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        if "metrics" in rollout:
+            metrics.update(rollout["metrics"])
         metrics.update(reward_metrics)
         metrics.update(await self._train_datums_async(datums))
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
-        return GRPOResult(self.state.global_step, metrics=metrics, num_datums=len(datums), skipped_groups=skipped)
+        self.state.metadata = rollout.get("metadata")
+        return GRPOResult(
+            self.state.global_step,
+            metrics=metrics,
+            num_datums=len(datums),
+            skipped_groups=skipped,
+            metadata=rollout.get("metadata"),
+        )
 
     def train(self) -> TrainerState:
         if self.train_dataset is None:

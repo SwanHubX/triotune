@@ -2,7 +2,7 @@
 
 from .config import GRPOConfig
 from .grpo_trainer import GRPOTrainer, TrainerState
-from .types import GRPOBatch, GRPODatum, GRPOResult, SequenceSample
+from .types import GRPOBatch, GRPODatum, GRPOResult, RolloutResult, SequenceSample
 
 __all__ = [
     "GRPOBatch",
@@ -10,6 +10,7 @@ __all__ = [
     "GRPODatum",
     "GRPOResult",
     "GRPOTrainer",
+    "RolloutResult",
     "SequenceSample",
     "TrainerState",
 ]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 
 @dataclass(slots=True)
@@ -27,6 +27,17 @@ class GRPOBatch:
     row: dict[str, Any] = field(default_factory=dict)
     behavior_policy_version: int = 0
     sampling_prompt: Any | None = None
+
+
+class _RolloutGroups(TypedDict):
+    groups: list[GRPOBatch]
+
+
+class RolloutResult(_RolloutGroups, total=False):
+    """Rollout groups with optional metrics and metadata."""
+
+    metrics: dict[str, float]
+    metadata: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -58,6 +69,7 @@ class GRPOResult:
     metrics: dict[str, float] = field(default_factory=dict)
     num_datums: int = 0
     skipped_groups: int = 0
+    metadata: dict[str, Any] | None = None
 
 
 def as_prompt_text(prompt: Any) -> str:
