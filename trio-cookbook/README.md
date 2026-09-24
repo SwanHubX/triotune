@@ -31,22 +31,6 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-A custom `rollout_func` must always return `groups`. It may add `metrics` and
-`metadata` only when they are needed:
-
-```python
-return {
-    "groups": rollout_groups,
-    "metrics": {"rollout/latency": latency},
-    "metadata": {"request_ids": request_ids},
-}
-```
-
-`groups` must contain one `GRPOBatch` per input prompt. Numeric `metrics` are
-included in the step metrics, while arbitrary `metadata` is exposed through
-`GRPOResult.metadata` and the final `TrainerState.metadata`. The default
-rollout therefore returns only `{"groups": rollout_groups}`.
-
 The source directory uses the repository's requested `trio-cookbook` name;
 projects may expose it under their preferred import alias (for example
 `trio_cookbook`) when packaging it.
