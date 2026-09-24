@@ -24,7 +24,8 @@ from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
 from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter
-from .types import GRPOBatch, GRPOResult, as_prompt_text
+from .prompts import render_prompt
+from .types import GRPOBatch, GRPOResult
 
 
 @dataclass(slots=True)
@@ -44,7 +45,9 @@ class GRPOTrainer:
     """Train a PyTRIO-supported text-generation model with GRPO.
 
     The trainer creates and owns its PyTRIO clients.  ``model_name`` is passed
-    to ``ServiceClient.create_lora_training_client`` as the base model.
+    to ``ServiceClient.create_lora_training_client`` as the base model. Dataset
+    prompts may be plain text, pre-tokenized integer IDs, or text-only chat
+    messages. Chat messages are rendered with the tokenizer chat template.
     """
 
     def __init__(
@@ -84,7 +87,11 @@ class GRPOTrainer:
         if not callable(getattr(self._tokenizer, "encode", None)):
             raise TypeError("PyTRIO TrainingClient tokenizer must provide a callable encode() method.")
         # 多个reward结果按照权重相加，而不是直接全部固定1倍率
-        self.reward_evaluator = RewardEvaluator(reward_funcs, self.config.reward_weights)
+        self.reward_evaluator = RewardEvaluator(
+            reward_funcs,
+            self.config.reward_weights,
+            prompt_key=self.config.prompt_key,
+        )
         self.state = TrainerState()
         self._decode = self._make_decode(self._tokenizer)
         self._swanlab_run = self._init_swanlab_run(lora_rank)
@@ -134,15 +141,6 @@ class GRPOTrainer:
         # tokenizer.decode
         return lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
-    def _prompt_tokens(self, prompt: Any) -> list[int]:
-        # tokenizer.encode
-        if isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt):
-            return list(prompt)
-        encoded = self._tokenizer.encode(prompt, add_special_tokens=False)
-        if hasattr(encoded, "tolist"):
-            encoded = encoded.tolist()
-        return [int(token) for token in encoded]
-
     def _new_sampling_client(self) -> Any:
         return call(self._training_client, "save_weights_and_get_sampling_client")
 
@@ -155,19 +153,21 @@ class GRPOTrainer:
             # 默认通常要求数据格式为：{"prompt": "问题文本"}
             if self.config.prompt_key not in row:
                 raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
-            prompt = row[self.config.prompt_key]
-            if not (isinstance(prompt, (list, tuple)) and all(isinstance(token, int) for token in prompt)):
-                prompt = as_prompt_text(prompt) # 规范化文本，可以提取content、messages、prompt包含这些字段的数据
-            prompt_tokens = self._prompt_tokens(prompt)  # encode转换文本成tokens
+            rendered = render_prompt(
+                row[self.config.prompt_key],
+                self._tokenizer,
+                add_generation_prompt=self.config.add_generation_prompt,
+                chat_template_kwargs=self.config.chat_template_kwargs,
+            )
             groups.append(
                 GRPOBatch(
                     str(index),
-                    prompt,
-                    prompt_tokens,
+                    rendered.text,
+                    rendered.tokens,
                     [],
                     dict(row),
                     self.state.behavior_policy_version,
-                    trio.ModelInput.from_ints(prompt_tokens),
+                    trio.ModelInput.from_ints(rendered.tokens),
                 )
             )
         return groups
@@ -226,16 +226,16 @@ class GRPOTrainer:
     def _train_datums(self, datums: list[Any]) -> dict[str, float]:
         if not datums:
             return {"train/skipped": 1.0}
-        # Submit both operations before waiting.  This is the PyTRIO clock
-        # cycle; waiting for forward_backward first needlessly serializes the
-        # service and differs from the local TRL optimizer loop.
+        # Wait for forward/backward before submitting the optimizer. If the
+        # forward request fails, no optimizer request must be sent: otherwise
+        # PyTRIO may apply stale or partial gradients from a previous batch.
         forward_method = getattr(self._training_client, "forward_backward", None)
         optim_method = getattr(self._training_client, "optim_step", None)
         if forward_method is None or optim_method is None:
             raise AttributeError("PyTRIO training_client needs forward_backward() and optim_step().")
         forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
-        optim_future = optim_method(optimizer_params(self.config, trio.AdamParams))
-        forward, optim = wait(forward_future), wait(optim_future)
+        forward = wait(forward_future)
+        optim = wait(optim_method(optimizer_params(self.config, trio.AdamParams)))
         metrics: dict[str, float] = {}
         for value in (forward, optim):
             raw = getattr(value, "metrics", None) if value is not None else None
@@ -247,8 +247,11 @@ class GRPOTrainer:
         if not datums:
             return {"train/skipped": 1.0}
         forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
+        # Do not submit optim_step until forward/backward has completed
+        # successfully; this keeps the optimizer boundary failure-safe.
+        forward_result = await wait_async(forward)
         optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, trio.AdamParams))
-        forward_result, optim_result = await wait_async(forward), await wait_async(optim)
+        optim_result = await wait_async(optim)
         metrics: dict[str, float] = {}
         for value in (forward_result, optim_result):
             raw = getattr(value, "metrics", None) if value is not None else None

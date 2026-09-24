@@ -19,10 +19,14 @@ PPO一类，GRPO一类，DPO一类
 ```bash
 uv sync
 uv run python --version
+# The local package is installed by uv, so this import works:
+uv run python -c "import trio_cookbook"
 ```
 
 也可以继续使用 requirements 文件：
 
 ```bash
 pip install -r requirements.txt
+# Install this repository as well when using pip directly:
+pip install -e .
 ```

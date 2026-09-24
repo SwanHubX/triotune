@@ -21,23 +21,23 @@ GRPO 训练流程：
 
 最小试跑：
 
-uv run python 03-grpo.py \
+uv run python trio-cookbook/recipes/grpo_gsm8k.py \
     --steps 10 \
     --batch-size 4 \
     --group-size 8 \
     --max-tokens 512 \
     --loss-fn importance_sampling \
-    --mode disabled
+    --swanlab-mode disabled
 
 正式训练：
 
-uv run python 03-grpo.py \
+uv run python trio-cookbook/recipes/grpo_gsm8k.py \
     --steps 10 \
     --batch-size 4 \
     --group-size 8 \
     --max-tokens 512 \
     --loss-fn importance_sampling \
-    --mode online
+    --swanlab-mode online
 """
 
 import argparse
@@ -88,8 +88,8 @@ class GRPOConfig:
     beta1: float
     beta2: float
     loss_fn: str
-    mode: str
-    project: str
+    swanlab_mode: str
+    swanlab_project: str
 
 
 @dataclass
@@ -135,12 +135,12 @@ def parse_args() -> GRPOConfig:
         help="训练 loss：importance_sampling / ppo",
     )
     parser.add_argument(
-        "--mode",
+        "--swanlab-mode",
         choices=("online", "disabled"),
         default="online",
         help="SwanLab 记录模式：online 上传到云端，disabled 完全关闭日志",
     )
-    parser.add_argument("--project", default="agentic-rl-lab-grpo-tashan", help="SwanLab project")
+    parser.add_argument("--swanlab-project", default="agentic-rl-lab-grpo-tashan", help="SwanLab project")
     args = parser.parse_args()
 
     return GRPOConfig(
@@ -158,8 +158,8 @@ def parse_args() -> GRPOConfig:
         beta1=args.beta1,
         beta2=args.beta2,
         loss_fn=args.loss_fn,
-        mode=args.mode,
-        project=args.project,
+        swanlab_mode=args.swanlab_mode,
+        swanlab_project=args.swanlab_project,
     )
 
 
@@ -313,6 +313,26 @@ def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Da
     )
 
 
+def run_optimization_step(
+    training_client: Any,
+    datums: list[trio.Datum],
+    *,
+    loss_fn: str,
+    adam_params: trio.AdamParams,
+) -> dict[str, Any]:
+    """Run one failure-safe forward/backward and optimizer boundary."""
+
+    if not datums:
+        return {}
+    forward_future = training_client.forward_backward(datums, loss_fn=loss_fn)
+    # Do not submit optim_step until forward/backward has completed
+    # successfully; otherwise a failed forward could apply stale gradients.
+    forward_result = forward_future.result()
+    optimizer_future = training_client.optim_step(adam_params)
+    optimizer_future.result()
+    return dict(forward_result.metrics)
+
+
 def get_num_steps(dataset: Dataset, config: GRPOConfig) -> int:
     """计算实际训练 step 数；all-data 模式会覆盖命令行里的 steps。"""
     if config.all_data:
@@ -355,12 +375,12 @@ def init_swanlab_run(
     run_name: str,
 ) -> Any | None:
     """SwanLab 只记录关键 GRPO 指标，不影响主训练逻辑。"""
-    if config.mode == "disabled":
+    if config.swanlab_mode == "disabled":
         return None
     return swanlab.init(
-        project=config.project,
+        project=config.swanlab_project,
         name=run_name,
-        mode=config.mode,
+        mode=config.swanlab_mode,
         config={
             "base_model": config.base_model,
             "run_name": run_name,
@@ -378,7 +398,7 @@ def init_swanlab_run(
             "beta1": config.beta1,
             "beta2": config.beta2,
             "loss_fn": config.loss_fn,
-            "mode": config.mode,
+            "swanlab_mode": config.swanlab_mode,
             "seed": config.seed,
             "weights_name": run_name,
         },
@@ -488,22 +508,14 @@ def main(config: GRPOConfig) -> None:
                 for sample in rollout_samples:
                     datums.append(build_grpo_datum(prompt_tokens, sample))
 
-            if datums:
-                # importance_sampling / ppo 都是 PyTRIO 内置 loss，
-                # datum 只需要 target_tokens（当前模型 forward 用）+
-                # logprobs（采样时旧策略）+ advantages（GRPO 组内相对优势）。
-                fwd_bwd_future = training_client.forward_backward(
-                    datums,
-                    loss_fn=config.loss_fn,
-                )
-
-                # 同步版 PyTRIO：提交远程前向/反向和优化器更新后，显式 `.result()` 等待完成。
-                optim_future = training_client.optim_step(adam_params)
-                fwd_bwd_result = fwd_bwd_future.result()
-                optim_future.result()
-                loss_metrics = dict(fwd_bwd_result.metrics)
-            else:
-                loss_metrics = {}
+            # importance_sampling / ppo 都是 PyTRIO 内置 loss，datum 只需要
+            # target_tokens、采样时旧策略 logprobs 和 GRPO 组内 advantage。
+            loss_metrics = run_optimization_step(
+                training_client,
+                datums,
+                loss_fn=config.loss_fn,
+                adam_params=adam_params,
+            )
 
             loss_mean = get_numeric_metric(loss_metrics, "loss_mean")
             train_tokens = count_train_tokens(datums)

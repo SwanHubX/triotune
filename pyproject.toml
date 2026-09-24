@@ -12,8 +12,19 @@ dependencies = [
     "tqdm==4.70.1",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["trio_cookbook", "trio_cookbook.trainer", "trio_cookbook.utils"]
+
+[tool.setuptools.package-dir]
+trio_cookbook = "trio-cookbook"
+"trio_cookbook.trainer" = "trio-cookbook/trainer"
+"trio_cookbook.utils" = "trio-cookbook/utils"
+
 [tool.uv]
-# The source directory keeps the repository's historical `trio-cookbook`
-# name, which is not a valid Python import package name.  uv manages the
-# environment and dependencies without attempting to install the source tree.
-package = false
+# Keep the historical on-disk directory name while installing it under the
+# valid Python import name ``trio_cookbook`` via the setuptools mapping above.
+package = true

@@ -11,7 +11,8 @@ from collections.abc import Callable
 from typing import Any
 
 from ..utils.client import call, call_async, sampling_params
-from .types import GRPOBatch, SequenceSample, as_prompt_text
+from .prompts import as_prompt_text
+from .types import GRPOBatch, SequenceSample
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -64,8 +65,8 @@ class SamplingAdapter:
 
     def sample(self, group: GRPOBatch, config: Any) -> GRPOBatch:
         prompt = group.sampling_prompt if group.sampling_prompt is not None else group.prompt
-        # A multimodal structure must not be passed through to a text-only
-        # sampler; this check also catches accidental image columns early.
+        # Trainer-created groups carry a normalized text prompt. Keep this
+        # assertion for callers that construct GRPOBatch directly.
         as_prompt_text(group.prompt)
         raw = call(
             self.client,
@@ -80,6 +81,8 @@ class SamplingAdapter:
         return GRPOBatch(group.prompt_id, group.prompt, group.prompt_tokens, samples, group.row, group.behavior_policy_version, group.sampling_prompt)
 
     async def sample_async(self, group: GRPOBatch, config: Any) -> GRPOBatch:
+        # Trainer-created groups carry a normalized text prompt. Keep this
+        # assertion for callers that construct GRPOBatch directly.
         as_prompt_text(group.prompt)
         raw = await call_async(
             self.client,

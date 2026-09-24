@@ -24,7 +24,8 @@ class GRPOConfig:
     max_completion_length: int = 512
     temperature: float = 1.0
     top_p: float = 1.0
-    top_k: int = 0
+    # PyTRIO uses -1 to mean that top-k filtering is disabled.
+    top_k: int = -1
     batch_size: int = 1
     max_steps: int | None = None
     learning_rate: float = 4e-5
@@ -40,6 +41,8 @@ class GRPOConfig:
     save_every: int = 0
     seed: int | None = None
     prompt_key: str = "prompt"
+    add_generation_prompt: bool = True
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     mode: str = "disabled"
     project: str = "trio-cookbook-grpo"
     run_name: str | None = None
@@ -54,8 +57,8 @@ class GRPOConfig:
             raise ValueError("batch_size must be positive.")
         if self.max_steps is not None and self.max_steps < 1:
             raise ValueError("max_steps must be positive when provided.")
-        if self.top_k < 0:
-            raise ValueError("top_k must be >= 0.")
+        if self.top_k == 0 or self.top_k < -1:
+            raise ValueError("top_k must be -1 (unlimited) or a positive integer.")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in (0, 1].")
         if self.temperature <= 0 or not math.isfinite(self.temperature):
@@ -73,8 +76,15 @@ class GRPOConfig:
             raise ValueError("mode must be 'disabled', 'online', 'local', or 'offline'.")
         if not self.project.strip():
             raise ValueError("project must not be empty.")
-        if self.reward_epsilon <= 0:
-            raise ValueError("reward_epsilon must be positive.")
+        if self.reward_epsilon <= 0 or not math.isfinite(self.reward_epsilon):
+            raise ValueError("reward_epsilon must be finite and positive.")
+        if not self.prompt_key.strip():
+            raise ValueError("prompt_key must not be empty.")
+        reserved = {"tokenize", "add_generation_prompt"}.intersection(self.chat_template_kwargs)
+        if reserved:
+            raise ValueError(
+                "chat_template_kwargs must not override " + ", ".join(sorted(reserved)) + "."
+            )
         if self.loss_fn != "importance_sampling":
             raise ValueError(
                 "The first PyTRIO implementation supports GRPO with "
@@ -95,6 +105,7 @@ class GRPOConfig:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "max_tokens": self.max_completion_length,
+            "seed": self.seed,
         }
 
     def optimizer_params(self) -> dict[str, float]:
