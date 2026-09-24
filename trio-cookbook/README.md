@@ -36,6 +36,22 @@ When `save_every` is greater than zero, the trainer calls PyTRIO
 The returned checkpoint URI is available as `TrainerState.checkpoint_path` and
 contains both model weights and optimizer state.
 
+SwanLab logging is disabled by default. Enable it through `GRPOConfig` when
+experiment tracking is needed:
+
+```python
+args = GRPOConfig(
+    num_generations=4,
+    max_steps=100,
+    mode="online",  # or "local" / "offline"
+    project="my-grpo-project",
+)
+```
+
+The trainer logs reward, advantage, training metrics, datum counts, skipped
+groups, and checkpoint events once per completed step, then closes the run at
+the end of synchronous or asynchronous training.
+
 The source directory uses the repository's requested `trio-cookbook` name;
 projects may expose it under their preferred import alias (for example
 `trio_cookbook`) when packaging it.

@@ -12,10 +12,11 @@ import asyncio
 import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pytrio as trio
+import swanlab
 
 from ..utils.client import call, call_async, optimizer_params, submit_async, wait, wait_async
 from .advantages import group_advantages
@@ -86,6 +87,47 @@ class GRPOTrainer:
         self.reward_evaluator = RewardEvaluator(reward_funcs, self.config.reward_weights)
         self.state = TrainerState()
         self._decode = self._make_decode(self._tokenizer)
+        self._swanlab_run = self._init_swanlab_run(lora_rank)
+
+    def _init_swanlab_run(self, lora_rank: int) -> Any | None:
+        if self.config.mode == "disabled":
+            return None
+        model_slug = self.model_name.rsplit("/", 1)[-1].replace("/", "-")
+        return swanlab.init(
+            mode=self.config.mode,
+            project=self.config.project,
+            name=self.config.run_name or f"{model_slug}-grpo",
+            log_dir=self.config.log_dir,
+            config={
+                "model_name": self.model_name,
+                "lora_rank": lora_rank,
+                **asdict(self.config),
+            },
+        )
+
+    def _log_swanlab(self, result: GRPOResult) -> None:
+        if self._swanlab_run is None:
+            return
+        payload: dict[str, float] = {
+            str(key): float(value)
+            for key, value in result.metrics.items()
+            if math.isfinite(float(value))
+        }
+        payload.update(
+            {
+                "trainer/step": float(result.step),
+                "trainer/num_datums": float(result.num_datums),
+                "trainer/skipped_groups": float(result.skipped_groups),
+                "checkpoint/saved": float(result.checkpoint_path is not None),
+            }
+        )
+        self._swanlab_run.log(payload, step=result.step)
+
+    def _finish_swanlab(self, state: str = "success", error: str | None = None) -> None:
+        if self._swanlab_run is None:
+            return
+        self._swanlab_run.finish(state=state, error=error)
+        self._swanlab_run = None
 
     @staticmethod
     def _make_decode(tokenizer: Any) -> Callable[[list[int]], str]:
@@ -149,11 +191,14 @@ class GRPOTrainer:
         skipped = 0
         metrics: dict[str, float] = {}
         batch_denominator = 1.0
-        if self.config.scale_rewards == "batch":
-            all_rewards = [float(value) for rewards in reward_groups for value in rewards]
+        all_rewards = [float(value) for rewards in reward_groups for value in rewards]
+        if all_rewards:
             mean = sum(all_rewards) / max(1, len(all_rewards))
             variance = sum((value - mean) ** 2 for value in all_rewards) / max(1, len(all_rewards))
-            batch_denominator = math.sqrt(variance) + self.config.reward_epsilon
+            metrics["reward/mean"] = mean
+            metrics["reward/std"] = math.sqrt(variance)
+            if self.config.scale_rewards == "batch":
+                batch_denominator = math.sqrt(variance) + self.config.reward_epsilon
         for group, rewards in zip(groups, reward_groups):
             advantages, group_metrics = group_advantages(
                 rewards,
@@ -251,13 +296,15 @@ class GRPOTrainer:
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
         checkpoint_path = self._save_state()
-        return GRPOResult(
+        result = GRPOResult(
             self.state.global_step,
             metrics=metrics,
             num_datums=len(datums),
             skipped_groups=skipped,
             checkpoint_path=checkpoint_path,
         )
+        self._log_swanlab(result)
+        return result
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
         groups = self._groups(rows)
@@ -270,32 +317,46 @@ class GRPOTrainer:
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
         checkpoint_path = await self._save_state_async()
-        return GRPOResult(
+        result = GRPOResult(
             self.state.global_step,
             metrics=metrics,
             num_datums=len(datums),
             skipped_groups=skipped,
             checkpoint_path=checkpoint_path,
         )
+        self._log_swanlab(result)
+        return result
 
     def train(self) -> TrainerState:
-        if self.train_dataset is None:
-            raise ValueError("train_dataset is required for train().")
-        iterator = iter(self.train_dataset)
-        while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
-            rows = list(itertools.islice(iterator, self.config.batch_size))
-            if not rows:
-                break
-            self.step(rows)
+        try:
+            if self.train_dataset is None:
+                raise ValueError("train_dataset is required for train().")
+            iterator = iter(self.train_dataset)
+            while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
+                rows = list(itertools.islice(iterator, self.config.batch_size))
+                if not rows:
+                    break
+                self.step(rows)
+        except BaseException as error:
+            self._finish_swanlab("crashed", str(error))
+            raise
+        else:
+            self._finish_swanlab()
         return self.state
 
     async def train_async(self) -> TrainerState:
-        if self.train_dataset is None:
-            raise ValueError("train_dataset is required for train_async().")
-        iterator = iter(self.train_dataset)
-        while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
-            rows = list(itertools.islice(iterator, self.config.batch_size))
-            if not rows:
-                break
-            await self.step_async(rows)
+        try:
+            if self.train_dataset is None:
+                raise ValueError("train_dataset is required for train_async().")
+            iterator = iter(self.train_dataset)
+            while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
+                rows = list(itertools.islice(iterator, self.config.batch_size))
+                if not rows:
+                    break
+                await self.step_async(rows)
+        except BaseException as error:
+            self._finish_swanlab("crashed", str(error))
+            raise
+        else:
+            self._finish_swanlab()
         return self.state
