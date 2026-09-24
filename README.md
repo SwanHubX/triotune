@@ -14,6 +14,15 @@ PPO一类，GRPO一类，DPO一类
 
 ## 环境安装
 
+使用 uv（推荐，依赖版本由 `uv.lock` 锁定）：
+
+```bash
+uv sync
+uv run python --version
+```
+
+也可以继续使用 requirements 文件：
+
 ```bash
 pip install -r requirements.txt
 ```
