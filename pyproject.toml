@@ -1,0 +1,19 @@
+[project]
+name = "trio-cookbook"
+version = "0.1.0"
+description = "PyTRIO-native GRPO training utilities and recipes"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "datasets==5.0.1",
+    "numpy==2.5.3",
+    "pytrio==0.2.9",
+    "swanlab==0.10.1",
+    "tqdm==4.70.1",
+]
+
+[tool.uv]
+# The source directory keeps the repository's historical `trio-cookbook`
+# name, which is not a valid Python import package name.  uv manages the
+# environment and dependencies without attempting to install the source tree.
+package = false
