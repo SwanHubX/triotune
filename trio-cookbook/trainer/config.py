@@ -40,6 +40,10 @@ class GRPOConfig:
     save_every: int = 0
     seed: int | None = None
     prompt_key: str = "prompt"
+    mode: str = "disabled"
+    project: str = "trio-cookbook-grpo"
+    run_name: str | None = None
+    log_dir: str | None = None
 
     def __post_init__(self) -> None:
         if self.num_generations < 2:
@@ -65,6 +69,10 @@ class GRPOConfig:
             raise ValueError("scale_rewards must be 'none', 'group', or 'batch'.")
         if self.save_every < 0:
             raise ValueError("save_every must be >= 0.")
+        if self.mode not in {"disabled", "online", "local", "offline"}:
+            raise ValueError("mode must be 'disabled', 'online', 'local', or 'offline'.")
+        if not self.project.strip():
+            raise ValueError("project must not be empty.")
         if self.reward_epsilon <= 0:
             raise ValueError("reward_epsilon must be positive.")
         if self.loss_fn != "importance_sampling":

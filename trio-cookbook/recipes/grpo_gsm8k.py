@@ -27,7 +27,7 @@ uv run python 03-grpo.py \
     --group-size 8 \
     --max-tokens 512 \
     --loss-fn importance_sampling \
-    --swanlab-mode disabled
+    --mode disabled
 
 正式训练：
 
@@ -37,7 +37,7 @@ uv run python 03-grpo.py \
     --group-size 8 \
     --max-tokens 512 \
     --loss-fn importance_sampling \
-    --swanlab-mode online
+    --mode online
 """
 
 import argparse
@@ -88,8 +88,8 @@ class GRPOConfig:
     beta1: float
     beta2: float
     loss_fn: str
-    swanlab_mode: str
-    swanlab_project: str
+    mode: str
+    project: str
 
 
 @dataclass
@@ -135,12 +135,12 @@ def parse_args() -> GRPOConfig:
         help="训练 loss：importance_sampling / ppo",
     )
     parser.add_argument(
-        "--swanlab-mode",
+        "--mode",
         choices=("online", "disabled"),
         default="online",
         help="SwanLab 记录模式：online 上传到云端，disabled 完全关闭日志",
     )
-    parser.add_argument("--swanlab-project", default="agentic-rl-lab-grpo-tashan", help="SwanLab project")
+    parser.add_argument("--project", default="agentic-rl-lab-grpo-tashan", help="SwanLab project")
     args = parser.parse_args()
 
     return GRPOConfig(
@@ -158,8 +158,8 @@ def parse_args() -> GRPOConfig:
         beta1=args.beta1,
         beta2=args.beta2,
         loss_fn=args.loss_fn,
-        swanlab_mode=args.swanlab_mode,
-        swanlab_project=args.swanlab_project,
+        mode=args.mode,
+        project=args.project,
     )
 
 
@@ -355,12 +355,12 @@ def init_swanlab_run(
     run_name: str,
 ) -> Any | None:
     """SwanLab 只记录关键 GRPO 指标，不影响主训练逻辑。"""
-    if config.swanlab_mode == "disabled":
+    if config.mode == "disabled":
         return None
     return swanlab.init(
-        project=config.swanlab_project,
+        project=config.project,
         name=run_name,
-        mode=config.swanlab_mode,
+        mode=config.mode,
         config={
             "base_model": config.base_model,
             "run_name": run_name,
@@ -378,7 +378,7 @@ def init_swanlab_run(
             "beta1": config.beta1,
             "beta2": config.beta2,
             "loss_fn": config.loss_fn,
-            "swanlab_mode": config.swanlab_mode,
+            "mode": config.mode,
             "seed": config.seed,
             "weights_name": run_name,
         },
