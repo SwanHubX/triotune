@@ -388,13 +388,14 @@ fwd_future = training_client.forward_backward(
     data=datums,
     loss_fn="importance_sampling",
 )
-optim_future = training_client.optim_step(adam_params)
-
 fwd_result = fwd_future.result()
+optim_future = training_client.optim_step(adam_params)
 optim_future.result()
 ```
 
-注意：同步 API 也返回 future。应按上面的顺序先提交 forward/backward，再提交 optimizer，然后获取结果；不要在两次提交之间插入不必要的本地阻塞。
+注意：同步 API 也返回 future。当前客户端实现会先等待 forward/backward 成功，再提交
+optimizer；这样 forward 失败时不会误触发带有旧梯度的 optimizer。只有在服务端提供
+明确的失败传播和梯度清理保证后，才可以把 optimizer 提前提交以重叠等待。
 
 ### Gate 6：单步更新
 
@@ -585,14 +586,14 @@ group 的 GRPO”。它应拥有自己的 batch producer、pairwise Datum/custom
 ## 14. 第 11 阶段：最后引入异步、流水线和陈旧策略
 
 PyTRIO 的训练异步 API 有两阶段语义：先 `await ..._async()` 提交并得到 future，
-再等待 future 的远端结果。官方时钟周期文档建议按顺序先提交 forward/backward，
-再提交 optimizer，之后统一等待：
+再等待 future 的远端结果。官方时钟周期允许先提交 forward/backward、再提交
+optimizer 以重叠等待；但本框架当前优先保证失败安全，会在确认 forward 成功后再提交
+optimizer：
 
 ```python
 fwd_future = await training_client.forward_backward_async(datums, loss_fn=loss_fn)
-optim_future = await training_client.optim_step_async(adam_params)
-
 fwd_result = await fwd_future
+optim_future = await training_client.optim_step_async(adam_params)
 await optim_future
 ```
 

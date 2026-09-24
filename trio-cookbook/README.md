@@ -48,10 +48,25 @@ args = GRPOConfig(
 )
 ```
 
-The trainer logs reward, advantage, training metrics, datum counts, skipped
-groups, and checkpoint events once per completed step, then closes the run at
-the end of synchronous or asynchronous training.
+The trainer logs aggregate reward, learning rate, loss, sampled-policy entropy,
+sample-to-train KL, timing, datum counts, skipped groups, checkpoint events,
+and remote gradient norm when PyTRIO provides it. A terminal progress bar shows
+the core metrics for synchronous and asynchronous training.
 
-The source directory uses the repository's requested `trio-cookbook` name;
-projects may expose it under their preferred import alias (for example
-`trio_cookbook`) when packaging it.
+Prompt rows are text-only. The `prompt` value may be a string, a non-empty
+integer token list, or chat messages such as:
+
+```python
+{"prompt": [
+    {"role": "system", "content": "Answer concisely."},
+    {"role": "user", "content": "What is 2 + 2?"},
+]}
+```
+
+Chat messages are passed through the tokenizer's `apply_chat_template` with a
+generation prompt before sampling. Message content must be a string because
+this first trainer accepts text inputs only.
+
+The source directory keeps the repository's historical `trio-cookbook` name,
+while the build configuration installs it under the valid Python package name
+`trio_cookbook`.

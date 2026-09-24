@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.cache/
 
 # Virtual environments
 .venv/
@@ -51,3 +52,7 @@ playground/
 tinker-cookbook/
 trl/
 cookbook/
+
+# data and output
+data/
+output/
