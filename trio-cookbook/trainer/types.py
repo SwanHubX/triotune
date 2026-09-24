@@ -58,6 +58,7 @@ class GRPOResult:
     metrics: dict[str, float] = field(default_factory=dict)
     num_datums: int = 0
     skipped_groups: int = 0
+    checkpoint_path: str | None = None
 
 
 def as_prompt_text(prompt: Any) -> str:

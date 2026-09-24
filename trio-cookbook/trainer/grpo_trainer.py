@@ -29,15 +29,14 @@ from .types import GRPOBatch, GRPOResult, as_prompt_text
 @dataclass(slots=True)
 class TrainerState:
     """Mutable local state tracked across GRPO training steps."""
-
     # Number of completed trainer steps.
     global_step: int = 0
-
     # Version of the behavior policy used to generate the next rollout batch.
     behavior_policy_version: int = 0
-
     # Metrics collected during the most recently completed trainer step.
     metrics: dict[str, float] = field(default_factory=dict)
+    # URI of the most recently saved weights and optimizer state.
+    checkpoint_path: str | None = None
 
 
 class GRPOTrainer:
@@ -145,6 +144,7 @@ class GRPOTrainer:
         )
 
     def _build_datums(self, groups: Sequence[GRPOBatch], reward_groups: Sequence[Sequence[float]]) -> tuple[list[Any], int, dict[str, float]]:
+        # 将输入转换成Datum格式
         datums: list[Any] = []
         skipped = 0
         metrics: dict[str, float] = {}
@@ -211,7 +211,36 @@ class GRPOTrainer:
                 metrics.update({str(key): float(number) for key, number in raw.items() if isinstance(number, (int, float)) and math.isfinite(float(number))})
         return metrics
 
+    def _save_state(self) -> str | None:
+        if self.config.save_every == 0 or self.state.global_step % self.config.save_every != 0:
+            return None
+        result = call(
+            self._training_client,
+            "save_state",
+            name=f"grpo-step-{self.state.global_step:08d}",
+        )
+        path = getattr(result, "path", None)
+        if not isinstance(path, str) or not path:
+            raise TypeError("PyTRIO save_state() returned no checkpoint path.")
+        self.state.checkpoint_path = path
+        return path
+
+    async def _save_state_async(self) -> str | None:
+        if self.config.save_every == 0 or self.state.global_step % self.config.save_every != 0:
+            return None
+        result = await call_async(
+            self._training_client,
+            "save_state",
+            name=f"grpo-step-{self.state.global_step:08d}",
+        )
+        path = getattr(result, "path", None)
+        if not isinstance(path, str) or not path:
+            raise TypeError("PyTRIO save_state_async() returned no checkpoint path.")
+        self.state.checkpoint_path = path
+        return path
+
     def step(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
+        # 执行一次完整的GRPO训练step
         groups = self._groups(rows)
         sampled = self._sample_groups(groups, self._new_sampling_client())
         reward_groups, reward_metrics = self.reward_evaluator.score(sampled)
@@ -221,11 +250,13 @@ class GRPOTrainer:
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
+        checkpoint_path = self._save_state()
         return GRPOResult(
             self.state.global_step,
             metrics=metrics,
             num_datums=len(datums),
             skipped_groups=skipped,
+            checkpoint_path=checkpoint_path,
         )
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
@@ -238,11 +269,13 @@ class GRPOTrainer:
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self.state.metrics = metrics
+        checkpoint_path = await self._save_state_async()
         return GRPOResult(
             self.state.global_step,
             metrics=metrics,
             num_datums=len(datums),
             skipped_groups=skipped,
+            checkpoint_path=checkpoint_path,
         )
 
     def train(self) -> TrainerState:

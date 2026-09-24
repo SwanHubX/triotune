@@ -25,11 +25,16 @@ from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
 trainer = GRPOTrainer(
     model_name="Qwen/Qwen3.5-4B",
     reward_funcs=my_reward,
-    args=GRPOConfig(num_generations=4, max_steps=100),
+    args=GRPOConfig(num_generations=4, max_steps=100, save_every=10),
     train_dataset=rows,                     # rows contain a `prompt` field
 )
 trainer.train()
 ```
+
+When `save_every` is greater than zero, the trainer calls PyTRIO
+`TrainingClient.save_state()` after every configured number of completed steps.
+The returned checkpoint URI is available as `TrainerState.checkpoint_path` and
+contains both model weights and optimizer state.
 
 The source directory uses the repository's requested `trio-cookbook` name;
 projects may expose it under their preferred import alias (for example
