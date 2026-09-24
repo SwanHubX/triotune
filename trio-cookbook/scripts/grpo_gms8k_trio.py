@@ -186,7 +186,7 @@ def boxed_answer_reward(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GSM8K through trio_cookbook.GRPOTrainer")
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--lora-rank", type=positive_int, default=32)
     parser.add_argument("--steps", type=positive_int, default=10)
     parser.add_argument("--batch-size", type=positive_int, default=4)
@@ -208,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         choices=("disabled", "online", "local", "offline"),
         default="disabled",
     )
-    parser.add_argument("--project", default="trio-cookbook-grpo-gsm8k")
+    parser.add_argument("--project", default="trio-cookbook-test")
     parser.add_argument("--run-name", default="grpo-trainer-gsm8k")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
@@ -255,7 +255,17 @@ def main() -> None:
     )
     state = trainer.train()
     print(f"Training finished at step {state.global_step}")
-    print("Final metrics: " + json.dumps(state.metrics, sort_keys=True))
+    summary_keys = (
+        "train/loss",
+        "reward/mean",
+        "policy/entropy",
+        "policy/kl_sample_train",
+        "optim/lr",
+        "optim/grad_norm",
+        "time/step",
+    )
+    summary = {key: state.metrics[key] for key in summary_keys if key in state.metrics}
+    print("Final metrics: " + json.dumps(summary, sort_keys=True))
     if state.checkpoint_path is not None:
         print(f"Latest checkpoint: {state.checkpoint_path}")
 

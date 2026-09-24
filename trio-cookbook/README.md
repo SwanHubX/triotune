@@ -48,9 +48,10 @@ args = GRPOConfig(
 )
 ```
 
-The trainer logs reward, advantage, training metrics, datum counts, skipped
-groups, and checkpoint events once per completed step, then closes the run at
-the end of synchronous or asynchronous training.
+The trainer logs aggregate reward, learning rate, loss, sampled-policy entropy,
+sample-to-train KL, timing, datum counts, skipped groups, checkpoint events,
+and remote gradient norm when PyTRIO provides it. A terminal progress bar shows
+the core metrics for synchronous and asynchronous training.
 
 Prompt rows are text-only. The `prompt` value may be a string, a non-empty
 integer token list, or chat messages such as:

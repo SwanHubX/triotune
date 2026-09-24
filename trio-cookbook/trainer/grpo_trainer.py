@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import itertools
 import math
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pytrio as trio
 import swanlab
+from tqdm import tqdm
 
 from ..utils.client import call, call_async, optimizer_params, submit_async, wait, wait_async
 from .advantages import group_advantages
@@ -26,6 +28,74 @@ from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter
 from .prompts import render_prompt
 from .types import GRPOBatch, GRPOResult
+
+
+def _is_per_prompt_metric(name: str) -> bool:
+    """Return whether a metric belongs to one prompt rather than the batch."""
+
+    _, separator, metric_name = name.partition("/")
+    return bool(separator) and metric_name.startswith(("reward/", "advantage/"))
+
+
+def _tensor_values(value: Any) -> list[float] | None:
+    data = getattr(value, "data", None)
+    if not isinstance(data, list):
+        return None
+    if not all(isinstance(item, (int, float)) for item in data):
+        return None
+    return [float(item) for item in data]
+
+
+def _rollout_metrics(groups: Sequence[GRPOBatch]) -> dict[str, float]:
+    samples = [sample for group in groups for sample in group.samples]
+    logprobs = [value for sample in samples for value in sample.logprobs]
+    lengths = [len(sample.tokens) for sample in samples]
+    metrics: dict[str, float] = {}
+    if logprobs:
+        metrics["policy/entropy"] = -sum(logprobs) / len(logprobs)
+    if lengths:
+        metrics.update(
+            {
+                "rollout/completion_length_mean": sum(lengths) / len(lengths),
+                "rollout/completion_length_min": float(min(lengths)),
+                "rollout/completion_length_max": float(max(lengths)),
+            }
+        )
+    return metrics
+
+
+def _sample_train_kl(datums: Sequence[Any], forward_result: Any) -> float | None:
+    outputs = getattr(forward_result, "loss_fn_outputs", None)
+    if not isinstance(outputs, list) or len(outputs) != len(datums):
+        return None
+
+    squared_logprob_differences: list[float] = []
+    for datum, output in zip(datums, outputs, strict=True):
+        if not isinstance(output, Mapping) or "logprobs" not in output:
+            return None
+        loss_inputs = getattr(datum, "loss_fn_inputs", None)
+        if not isinstance(loss_inputs, Mapping):
+            return None
+        old_logprobs = _tensor_values(loss_inputs.get("logprobs"))
+        advantages = _tensor_values(loss_inputs.get("advantages"))
+        current_logprobs = _tensor_values(output["logprobs"])
+        if old_logprobs is None or advantages is None or current_logprobs is None:
+            return None
+        if not len(old_logprobs) == len(advantages) == len(current_logprobs):
+            return None
+        squared_logprob_differences.extend(
+            (old - current) ** 2
+            for old, current, advantage in zip(
+                old_logprobs,
+                current_logprobs,
+                advantages,
+                strict=True,
+            )
+            if advantage != 0.0
+        )
+    if not squared_logprob_differences:
+        return None
+    return 0.5 * sum(squared_logprob_differences) / len(squared_logprob_differences)
 
 
 @dataclass(slots=True)
@@ -118,7 +188,7 @@ class GRPOTrainer:
         payload: dict[str, float] = {
             str(key): float(value)
             for key, value in result.metrics.items()
-            if math.isfinite(float(value))
+            if not _is_per_prompt_metric(str(key)) and math.isfinite(float(value))
         }
         payload.update(
             {
@@ -223,9 +293,40 @@ class GRPOTrainer:
                 datums.append(to_client_datum(datum, trio.Datum))
         return datums, skipped, metrics
 
+    def _training_metrics(
+        self,
+        datums: Sequence[Any],
+        forward_result: Any,
+        optimizer_result: Any,
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {"optim/lr": self.config.learning_rate}
+        for value in (forward_result, optimizer_result):
+            raw = getattr(value, "metrics", None) if value is not None else None
+            if isinstance(raw, Mapping):
+                metrics.update(
+                    {
+                        str(key): float(number)
+                        for key, number in raw.items()
+                        if isinstance(number, (int, float)) and math.isfinite(float(number))
+                    }
+                )
+
+        for loss_key in ("loss_mean", "loss"):
+            if loss_key in metrics:
+                metrics["train/loss"] = metrics[loss_key]
+                break
+        for grad_norm_key in ("optim/grad_norm", "grad_norm", "gradient_norm"):
+            if grad_norm_key in metrics:
+                metrics["optim/grad_norm"] = metrics[grad_norm_key]
+                break
+        kl = _sample_train_kl(datums, forward_result)
+        if kl is not None and math.isfinite(kl):
+            metrics["policy/kl_sample_train"] = kl
+        return metrics
+
     def _train_datums(self, datums: list[Any]) -> dict[str, float]:
         if not datums:
-            return {"train/skipped": 1.0}
+            return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
         # Wait for forward/backward before submitting the optimizer. If the
         # forward request fails, no optimizer request must be sent: otherwise
         # PyTRIO may apply stale or partial gradients from a previous batch.
@@ -236,28 +337,33 @@ class GRPOTrainer:
         forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
         forward = wait(forward_future)
         optim = wait(optim_method(optimizer_params(self.config, trio.AdamParams)))
-        metrics: dict[str, float] = {}
-        for value in (forward, optim):
-            raw = getattr(value, "metrics", None) if value is not None else None
-            if isinstance(raw, Mapping):
-                metrics.update({str(key): float(number) for key, number in raw.items() if isinstance(number, (int, float)) and math.isfinite(float(number))})
-        return metrics
+        return self._training_metrics(datums, forward, optim)
 
     async def _train_datums_async(self, datums: list[Any]) -> dict[str, float]:
         if not datums:
-            return {"train/skipped": 1.0}
+            return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
         forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
         # Do not submit optim_step until forward/backward has completed
         # successfully; this keeps the optimizer boundary failure-safe.
         forward_result = await wait_async(forward)
         optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, trio.AdamParams))
         optim_result = await wait_async(optim)
-        metrics: dict[str, float] = {}
-        for value in (forward_result, optim_result):
-            raw = getattr(value, "metrics", None) if value is not None else None
-            if isinstance(raw, Mapping):
-                metrics.update({str(key): float(number) for key, number in raw.items() if isinstance(number, (int, float)) and math.isfinite(float(number))})
-        return metrics
+        return self._training_metrics(datums, forward_result, optim_result)
+
+    @staticmethod
+    def _progress_postfix(result: GRPOResult) -> dict[str, str]:
+        keys = {
+            "loss": "train/loss",
+            "reward": "reward/mean",
+            "entropy": "policy/entropy",
+            "kl": "policy/kl_sample_train",
+            "grad_norm": "optim/grad_norm",
+        }
+        return {
+            label: f"{result.metrics[metric]:.4f}"
+            for label, metric in keys.items()
+            if metric in result.metrics
+        }
 
     def _save_state(self) -> str | None:
         if self.config.save_every == 0 or self.state.global_step % self.config.save_every != 0:
@@ -289,16 +395,38 @@ class GRPOTrainer:
 
     def step(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
         # 执行一次完整的GRPO训练step
+        step_started = time.perf_counter()
         groups = self._groups(rows)
+
+        rollout_started = time.perf_counter()
         sampled = self._sample_groups(groups, self._new_sampling_client())
+        rollout_time = time.perf_counter() - rollout_started
+
+        reward_started = time.perf_counter()
         reward_groups, reward_metrics = self.reward_evaluator.score(sampled)
+        reward_time = time.perf_counter() - reward_started
+
+        train_started = time.perf_counter()
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        metrics.update(_rollout_metrics(sampled))
         metrics.update(reward_metrics)
         metrics.update(self._train_datums(datums))
+        train_time = time.perf_counter() - train_started
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
-        self.state.metrics = metrics
+
+        checkpoint_started = time.perf_counter()
         checkpoint_path = self._save_state()
+        metrics.update(
+            {
+                "time/rollout": rollout_time,
+                "time/reward": reward_time,
+                "time/train": train_time,
+                "time/checkpoint": time.perf_counter() - checkpoint_started,
+                "time/step": time.perf_counter() - step_started,
+            }
+        )
+        self.state.metrics = metrics
         result = GRPOResult(
             self.state.global_step,
             metrics=metrics,
@@ -310,16 +438,38 @@ class GRPOTrainer:
         return result
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
+        step_started = time.perf_counter()
         groups = self._groups(rows)
+
+        rollout_started = time.perf_counter()
         sampled = await self._sample_groups_async(groups, await self._new_sampling_client_async())
+        rollout_time = time.perf_counter() - rollout_started
+
+        reward_started = time.perf_counter()
         reward_groups, reward_metrics = await self.reward_evaluator.score_async(sampled)
+        reward_time = time.perf_counter() - reward_started
+
+        train_started = time.perf_counter()
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        metrics.update(_rollout_metrics(sampled))
         metrics.update(reward_metrics)
         metrics.update(await self._train_datums_async(datums))
+        train_time = time.perf_counter() - train_started
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
-        self.state.metrics = metrics
+
+        checkpoint_started = time.perf_counter()
         checkpoint_path = await self._save_state_async()
+        metrics.update(
+            {
+                "time/rollout": rollout_time,
+                "time/reward": reward_time,
+                "time/train": train_time,
+                "time/checkpoint": time.perf_counter() - checkpoint_started,
+                "time/step": time.perf_counter() - step_started,
+            }
+        )
+        self.state.metrics = metrics
         result = GRPOResult(
             self.state.global_step,
             metrics=metrics,
@@ -331,6 +481,12 @@ class GRPOTrainer:
         return result
 
     def train(self) -> TrainerState:
+        progress = tqdm(
+            total=self.config.max_steps,
+            desc="GRPO train",
+            unit="step",
+            ncols=160,
+        )
         try:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train().")
@@ -339,15 +495,25 @@ class GRPOTrainer:
                 rows = list(itertools.islice(iterator, self.config.batch_size))
                 if not rows:
                     break
-                self.step(rows)
+                result = self.step(rows)
+                progress.set_postfix(self._progress_postfix(result), refresh=False)
+                progress.update(1)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
             raise
         else:
             self._finish_swanlab()
+        finally:
+            progress.close()
         return self.state
 
     async def train_async(self) -> TrainerState:
+        progress = tqdm(
+            total=self.config.max_steps,
+            desc="GRPO train",
+            unit="step",
+            ncols=160,
+        )
         try:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
@@ -356,10 +522,14 @@ class GRPOTrainer:
                 rows = list(itertools.islice(iterator, self.config.batch_size))
                 if not rows:
                     break
-                await self.step_async(rows)
+                result = await self.step_async(rows)
+                progress.set_postfix(self._progress_postfix(result), refresh=False)
+                progress.update(1)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
             raise
         else:
             self._finish_swanlab()
+        finally:
+            progress.close()
         return self.state

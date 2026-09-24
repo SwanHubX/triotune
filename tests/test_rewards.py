@@ -38,7 +38,7 @@ class RewardEvaluatorTests(unittest.TestCase):
     def test_custom_prompt_key_is_not_forwarded_to_reward_function(self) -> None:
         observed: dict[str, object] = {}
 
-        def reward(
+        def difficulty_reward(
             prompts: list[str],
             completions: list[str],
             completion_ids: list[list[int]],
@@ -63,9 +63,11 @@ class RewardEvaluatorTests(unittest.TestCase):
             row={"input": "raw prompt", "difficulty": "easy"},
         )
 
-        scores, _ = RewardEvaluator(reward, prompt_key="input").score([group])
+        evaluator = RewardEvaluator(difficulty_reward, prompt_key="input")
+        scores, metrics = evaluator.score([group])
 
         self.assertEqual(scores, [[1.0, 0.0]])
+        self.assertEqual(metrics, {"reward/difficulty_reward/mean": 0.5})
         self.assertEqual(observed["prompts"], ["rendered prompt"] * 2)
         self.assertEqual(observed["difficulty"], ["easy"] * 2)
 
