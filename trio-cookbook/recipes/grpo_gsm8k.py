@@ -1,7 +1,7 @@
 """PyTRIO 同步版 GRPO 教学脚本（只有 importance_sampling / ppo 两个内置 loss）。
 
 GRPO 训练流程：
-1. 从 GSM8K 取一批数学题；
+1. 从预处理好的 GSM8K JSONL 取一批数学题；
 2. 用当前 LoRA 权重保存出采样客户端；
 3. 每道题同步采样 group_size 个答案；
 4. 用 boxed answer reward 计算 group-relative advantage；
@@ -21,10 +21,12 @@ GRPO 训练流程：
 
 最小试跑：
 
+先运行 `bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only` 准备数据。
+
 uv run python trio-cookbook/recipes/grpo_gsm8k.py \
-    --steps 10 \
-    --batch-size 4 \
-    --group-size 8 \
+    --steps 2 \
+    --batch-size 2 \
+    --group-size 4 \
     --max-tokens 512 \
     --loss-fn importance_sampling \
     --swanlab-mode disabled
@@ -32,18 +34,24 @@ uv run python trio-cookbook/recipes/grpo_gsm8k.py \
 正式训练：
 
 uv run python trio-cookbook/recipes/grpo_gsm8k.py \
-    --steps 10 \
+    --steps 100 \
     --batch-size 4 \
     --group-size 8 \
-    --max-tokens 512 \
+    --max-tokens 1024 \
     --loss-fn importance_sampling \
-    --swanlab-mode online
+    --swanlab-mode online \
+    --workspace pytrio \
+    --exp-name gsm8k_normal_pytrio
 """
 
 import argparse
+import math
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
+from pathlib import Path
 from typing import Any
 
 from datasets import Dataset, load_dataset
@@ -53,21 +61,9 @@ import swanlab
 from tqdm import tqdm
 
 
-QUESTION_SUFFIX = "Provide a numerical answer without units, written inside \\boxed{}."
 LOSS_FNS = ("importance_sampling", "ppo")
-FEWSHOT_PREFIX = [
-    {"role": "user", "content": "How many r's are in strawberry?" + QUESTION_SUFFIX},
-    {
-        "role": "assistant",
-        "content": (
-            "<think>\n\n</think>\n\n"
-            "Let's spell the word out and number all the letters: "
-            "1) s 2) t 3) r 4) a 5) w 6) b 7) e 8) r 9) r 10) y. "
-            "We have r's at positions 3, 8, and 9. "
-            "There are three r's. \\boxed{3}"
-        ),
-    },
-]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_FILE = REPOSITORY_ROOT / "data" / "gsm8k_train.jsonl"
 
 
 @dataclass
@@ -75,6 +71,7 @@ class GRPOConfig:
     """命令行参数解析后的训练配置。"""
 
     base_model: str
+    data_file: Path
     lora_rank: int
     steps: int
     all_data: bool
@@ -90,6 +87,28 @@ class GRPOConfig:
     loss_fn: str
     swanlab_mode: str
     swanlab_project: str
+    workspace: str
+    exp_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.steps < 1 or self.batch_size < 1 or self.max_tokens < 1 or self.lora_rank < 1:
+            raise ValueError("steps, batch_size, max_tokens, and lora_rank must be positive")
+        if self.group_size < 2:
+            raise ValueError("group_size must be at least 2")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("temperature must be finite and positive")
+        if not math.isfinite(self.top_p) or not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        if not 0 <= self.beta1 < 1 or not 0 <= self.beta2 < 1:
+            raise ValueError("beta1 and beta2 must be in [0, 1)")
+        if self.loss_fn not in LOSS_FNS:
+            raise ValueError(f"loss_fn must be one of {LOSS_FNS}")
+        if not self.workspace.strip():
+            raise ValueError("workspace must not be empty")
+        if self.exp_name is not None and not self.exp_name.strip():
+            raise ValueError("exp_name must not be empty")
 
 
 @dataclass
@@ -99,19 +118,20 @@ class RolloutSample:
     tokens: list[int]
     logprobs: list[float]
     text: str
-    reward: float
-    advantage: float
+    reward: float = 0.0
+    advantage: float = 0.0
 
 
 def parse_args() -> GRPOConfig:
     """把训练配置集中到命令行参数，避免依赖环境变量。"""
     parser = argparse.ArgumentParser(description="PyTRIO 同步版 GRPO / GSM8K 教学脚本")
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B", help="PyTRIO 基础模型名")
+    parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B", help="PyTRIO 基础模型名")
+    parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE, help="已准备好的 GSM8K JSONL")
     parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     parser.add_argument(
         "--steps",
         type=int,
-        default=10,
+        default=100,
         help="GRPO 优化步数；每步从 GSM8K 取 batch-size 道题做 rollout",
     )
     parser.add_argument(
@@ -120,7 +140,7 @@ def parse_args() -> GRPOConfig:
         help="使用 GSM8K train split 全量数据训练一遍；打开后忽略 --steps",
     )
     parser.add_argument("--batch-size", type=int, default=4, help="每个 step 的 GSM8K 题目数")
-    parser.add_argument("--group-size", type=int, default=4, help="每道题采样的 completion 数")
+    parser.add_argument("--group-size", type=int, default=8, help="每道题采样的 completion 数")
     parser.add_argument("--max-tokens", type=int, default=1024, help="每次采样最多生成 token 数")
     parser.add_argument("--temperature", type=float, default=1.0, help="采样 temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="采样 top_p")
@@ -136,15 +156,18 @@ def parse_args() -> GRPOConfig:
     )
     parser.add_argument(
         "--swanlab-mode",
-        choices=("online", "disabled"),
+        choices=("online", "local", "offline", "disabled"),
         default="online",
-        help="SwanLab 记录模式：online 上传到云端，disabled 完全关闭日志",
+        help="SwanLab 记录模式",
     )
-    parser.add_argument("--swanlab-project", default="agentic-rl-lab-grpo-tashan", help="SwanLab project")
+    parser.add_argument("--swanlab-project", default="cookbook-grpo-test", help="SwanLab project")
+    parser.add_argument("--workspace", default="pytrio", help="SwanLab 组织或工作空间")
+    parser.add_argument("--exp-name", help="SwanLab 实验名称；默认按训练参数自动生成")
     args = parser.parse_args()
 
     return GRPOConfig(
         base_model=args.base_model,
+        data_file=args.data_file,
         lora_rank=args.lora_rank,
         steps=args.steps,
         all_data=args.all_data,
@@ -160,6 +183,8 @@ def parse_args() -> GRPOConfig:
         loss_fn=args.loss_fn,
         swanlab_mode=args.swanlab_mode,
         swanlab_project=args.swanlab_project,
+        workspace=args.workspace,
+        exp_name=args.exp_name,
     )
 
 
@@ -185,54 +210,81 @@ def grade_answer(response: str, ground_truth: str) -> float:
 
 
 def extract_gsm8k_answer(answer_text: str) -> str:
-    """GSM8K 的最终答案位于 `####` 后面。"""
+    """接受原始 GSM8K 答案或 JSONL 中预处理后的数值答案。"""
     match = re.search(r"####\s*(.+)", answer_text)
-    if match is None:
-        raise ValueError(f"No GSM8K final answer found: {answer_text!r}")
-    return normalize_answer(match.group(1))
+    answer = normalize_answer(match.group(1) if match else answer_text)
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", answer):
+        raise ValueError(f"Invalid GSM8K final answer: {answer_text!r}")
+    return answer
 
 
-def build_prompt(tokenizer: Any, question: str) -> list[int]:
-    """把 few-shot + 当前题目渲染成模型输入 tokens。"""
-    messages = [
-        *FEWSHOT_PREFIX,
-        {"role": "user", "content": question + QUESTION_SUFFIX},
-    ]
-    prompt_text = tokenizer.apply_chat_template(
+def build_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> list[int]:
+    """按框架相同的 chat template 设置渲染已准备好的 prompt。"""
+    prompt_tokens = tokenizer.apply_chat_template(
         messages,
-        tokenize=False,
+        tokenize=True,
         add_generation_prompt=True,
         enable_thinking=False,
     )
-    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-    if not prompt_tokens:
-        raise ValueError("Prompt tokens are empty")
-    return prompt_tokens
+    if isinstance(prompt_tokens, Mapping):
+        prompt_tokens = prompt_tokens.get("input_ids")
+    elif hasattr(prompt_tokens, "input_ids"):
+        prompt_tokens = prompt_tokens.input_ids
+    if hasattr(prompt_tokens, "tolist"):
+        prompt_tokens = prompt_tokens.tolist()
+    if (
+        isinstance(prompt_tokens, (list, tuple))
+        and len(prompt_tokens) == 1
+        and isinstance(prompt_tokens[0], (list, tuple))
+    ):
+        prompt_tokens = prompt_tokens[0]
+    if not isinstance(prompt_tokens, (list, tuple)) or not prompt_tokens or not all(
+        isinstance(token, Integral) and not isinstance(token, bool) for token in prompt_tokens
+    ):
+        raise ValueError("Chat template must return a non-empty integer token sequence")
+    return [int(token) for token in prompt_tokens]
 
 
-def load_gsm8k_train() -> Dataset:
-    """加载 GSM8K 训练集；首次运行会由 datasets 下载缓存。"""
-    dataset = load_dataset("openai/gsm8k", "main", split="train")
+def load_gsm8k_train(data_file: Path) -> Dataset:
+    """读取由独立数据准备脚本生成的 JSONL，不在训练入口中构建数据。"""
+    path = data_file.expanduser()
+    if not path.is_absolute():
+        path = REPOSITORY_ROOT / path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"GSM8K data not found at {path}; prepare it with "
+            "bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only"
+        )
+    dataset = load_dataset("json", data_files=str(path), split="train")
     if not isinstance(dataset, Dataset):
         raise TypeError(f"Expected Dataset, got {type(dataset)!r}")
+    if not {"prompt", "answer", "question"}.issubset(dataset.column_names):
+        raise ValueError("GSM8K JSONL must contain prompt, answer, and question columns")
+    if not dataset:
+        raise ValueError(f"No GSM8K rows found in {path}")
+    for index, row in enumerate(dataset):
+        messages = row["prompt"]
+        if not isinstance(messages, list) or not messages or any(
+            not isinstance(message, dict)
+            or not isinstance(message.get("role"), str)
+            or not isinstance(message.get("content"), str)
+            for message in messages
+        ):
+            raise ValueError(f"Invalid chat prompt in GSM8K row {index}")
+        if not isinstance(row["answer"], str):
+            raise ValueError(f"Invalid answer in GSM8K row {index}")
+        extract_gsm8k_answer(row["answer"])
     return dataset
-
-
-def get_stop_sequences(tokenizer: Any) -> list[str]:
-    """采样停止符尽量贴近 chat template，同时避免 None 和重复项。"""
-    candidates = [tokenizer.eos_token, "<|im_end|>"]
-    return list(dict.fromkeys([token for token in candidates if token]))
 
 
 def run_rollout_group(
     sampling_client: Any,
     tokenizer: Any,
     prompt_tokens: list[int],
-    ground_truth: str,
     sampling_params: trio.SamplingParams,
     group_size: int,
 ) -> list[RolloutSample]:
-    """同步采样一个 prompt 的 group_size 个 completion，并计算组内 advantage。"""
+    """同步采样一个 prompt 的 group_size 个 completion。"""
     # 对同一个 prompt 一次采样 group_size 个回答；同步 API 返回 future，所以这里立刻 `.result()` 等待。
     result = sampling_client.sample(
         prompt=trio.ModelInput.from_ints(prompt_tokens),
@@ -241,11 +293,9 @@ def run_rollout_group(
         return_text=True,
     ).result()
 
-    # 先把本组内每个回答的 token、旧策略 logprob、文本和 reward 收集起来。
-    # advantage 需要等整组 reward 都算完后，减去组内均值才能得到。
-    rewards: list[float] = []
-    raw_samples: list[tuple[list[int], list[float], str]] = []
-
+    if len(result.sequences) != group_size:
+        raise ValueError(f"Expected {group_size} samples, got {len(result.sequences)}")
+    samples: list[RolloutSample] = []
     for sequence in result.sequences:
         # return_text=True 时通常会直接返回文本；如果没有文本，就用 tokenizer 从 token 解码。
         text = sequence.text
@@ -261,23 +311,17 @@ def run_rollout_group(
                 f"Generated token/logprob length mismatch: {len(tokens)} != {len(logprobs)}"
             )
 
-        # reward 只看模型回答里最后一个 \boxed{}，和 GSM8K 标准答案一致则为 1，否则为 0。
-        reward = grade_answer(text, ground_truth)
-        rewards.append(reward)
-        raw_samples.append((tokens, logprobs, text))
+        samples.append(RolloutSample(tokens=tokens, logprobs=logprobs, text=text))
+    return samples
 
-    # GRPO 的核心是组内相对优势：同一道题里，比平均 reward 高的回答得到正 advantage。
+
+def score_rollout_group(samples: list[RolloutSample], ground_truth: str) -> None:
+    """计算与框架相同的 boxed reward 和组内中心化 advantage。"""
+    rewards = [grade_answer(sample.text, ground_truth) for sample in samples]
     mean_reward = sum(rewards) / len(rewards)
-    return [
-        RolloutSample(
-            tokens=tokens,
-            logprobs=logprobs,
-            text=text,
-            reward=reward,
-            advantage=reward - mean_reward,
-        )
-        for (tokens, logprobs, text), reward in zip(raw_samples, rewards, strict=True)
-    ]
+    for sample, reward in zip(samples, rewards, strict=True):
+        sample.reward = reward
+        sample.advantage = reward - mean_reward
 
 
 def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Datum:
@@ -329,8 +373,48 @@ def run_optimization_step(
     # successfully; otherwise a failed forward could apply stale gradients.
     forward_result = forward_future.result()
     optimizer_future = training_client.optim_step(adam_params)
-    optimizer_future.result()
-    return dict(forward_result.metrics)
+    optimizer_result = optimizer_future.result()
+    metrics = dict(forward_result.metrics)
+    optimizer_metrics = getattr(optimizer_result, "metrics", None)
+    if isinstance(optimizer_metrics, Mapping):
+        metrics.update(optimizer_metrics)
+    kl = sample_train_kl(datums, forward_result)
+    if kl is not None:
+        metrics["policy/kl_sample_train"] = kl
+    return metrics
+
+
+def sample_train_kl(datums: list[trio.Datum], forward_result: Any) -> float | None:
+    """和 GRPOTrainer 一样，仅在非零 advantage token 上计算采样/训练 KL。"""
+    outputs = getattr(forward_result, "loss_fn_outputs", None)
+    if not isinstance(outputs, list) or len(outputs) != len(datums):
+        return None
+
+    differences: list[float] = []
+    for datum, output in zip(datums, outputs, strict=True):
+        if not isinstance(output, Mapping) or "logprobs" not in output:
+            return None
+        inputs = getattr(datum, "loss_fn_inputs", None)
+        if not isinstance(inputs, Mapping):
+            return None
+        tensors = [
+            getattr(inputs.get("logprobs"), "data", None),
+            getattr(inputs.get("advantages"), "data", None),
+            getattr(output["logprobs"], "data", None),
+        ]
+        if not all(isinstance(values, list) for values in tensors):
+            return None
+        old_logprobs, advantages, current_logprobs = tensors
+        if not len(old_logprobs) == len(advantages) == len(current_logprobs):
+            return None
+        differences.extend(
+            (float(old) - float(current)) ** 2
+            for old, advantage, current in zip(
+                old_logprobs, advantages, current_logprobs, strict=True
+            )
+            if float(advantage) != 0.0
+        )
+    return 0.5 * sum(differences) / len(differences) if differences else None
 
 
 def get_num_steps(dataset: Dataset, config: GRPOConfig) -> int:
@@ -379,11 +463,14 @@ def init_swanlab_run(
         return None
     return swanlab.init(
         project=config.swanlab_project,
-        name=run_name,
+        workspace=config.workspace,
+        name=config.exp_name or run_name,
         mode=config.swanlab_mode,
         config={
             "base_model": config.base_model,
+            "data_file": str(config.data_file),
             "run_name": run_name,
+            "exp_name": config.exp_name or run_name,
             "lora_rank": config.lora_rank,
             "steps": config.steps,
             "all_data": config.all_data,
@@ -408,7 +495,7 @@ def init_swanlab_run(
 def get_numeric_metric(loss_metrics: dict[str, Any], key: str) -> float | None:
     """按当前 PyTRIO 实际返回的 metric key 精确取值，不做模糊匹配。"""
     value = loss_metrics.get(key)
-    if isinstance(value, int | float):
+    if isinstance(value, int | float) and math.isfinite(float(value)):
         return float(value)
     return None
 
@@ -425,11 +512,69 @@ def count_train_tokens(datums: list[trio.Datum]) -> int:
     return total
 
 
+def build_step_metrics(
+    groups: list[list[RolloutSample]],
+    datums: list[trio.Datum],
+    skipped_groups: int,
+    training_metrics: dict[str, Any],
+    learning_rate: float,
+) -> dict[str, float]:
+    """用与 GRPOTrainer 相同的名称和分母汇总一步训练指标。"""
+    samples = [sample for group in groups for sample in group]
+    rewards = [sample.reward for sample in samples]
+    lengths = [len(sample.tokens) for sample in samples]
+    logprobs = [value for sample in samples for value in sample.logprobs]
+    reward_mean = sum(rewards) / len(rewards)
+    reward_std = math.sqrt(sum((value - reward_mean) ** 2 for value in rewards) / len(rewards))
+    length_mean = sum(lengths) / len(lengths)
+
+    metrics = {
+        "reward/mean": reward_mean,
+        "reward/std": reward_std,
+        "reward/boxed_answer_reward/mean": reward_mean,
+        "rollout/completion_length_mean": length_mean,
+        "rollout/completion_length_min": float(min(lengths)),
+        "rollout/completion_length_max": float(max(lengths)),
+        "optim/lr": learning_rate,
+        "trainer/num_datums": float(len(datums)),
+        "trainer/skipped_groups": float(skipped_groups),
+        # Preserve the teaching recipe's original dashboard keys.
+        "reward": reward_mean,
+        "frac_degenerate": skipped_groups / len(groups),
+        "rollout/avg_gen_len": length_mean,
+        "datums": float(len(datums)),
+        "train_tokens": float(count_train_tokens(datums)),
+    }
+    if logprobs:
+        metrics["policy/entropy"] = -sum(logprobs) / len(logprobs)
+    if not datums:
+        metrics["trainer/skipped"] = 1.0
+
+    for key, value in training_metrics.items():
+        if isinstance(value, int | float) and math.isfinite(float(value)):
+            if "/" in key:
+                metrics[key] = float(value)
+            else:
+                metrics[f"trainer/{key}"] = float(value)
+    for source in ("loss_mean", "loss"):
+        if (loss := get_numeric_metric(training_metrics, source)) is not None:
+            metrics["trainer/loss"] = loss
+            metrics["loss"] = loss
+            metrics["loss_mean"] = loss
+            break
+    for source in ("optim/grad_norm", "grad_norm", "gradient_norm"):
+        if (grad_norm := get_numeric_metric(training_metrics, source)) is not None:
+            metrics["optim/grad_norm"] = grad_norm
+            break
+    return metrics
+
+
 def main(config: GRPOConfig) -> None:
+    run_started = time.perf_counter()
     np.random.seed(config.seed)
 
-    print("Loading GSM8K dataset...")
-    train_data = load_gsm8k_train()
+    print(f"Loading GSM8K dataset from {config.data_file}...")
+    train_data = load_gsm8k_train(config.data_file)
     print(f"Loaded {len(train_data)} GSM8K training examples")
     effective_steps = get_num_steps(train_data, config)
     run_name = build_run_name(config, effective_steps)
@@ -445,6 +590,7 @@ def main(config: GRPOConfig) -> None:
     training_client = service_client.create_lora_training_client(
         base_model=config.base_model,
         rank=config.lora_rank,
+        seed=config.seed,
     )
     tokenizer = training_client.get_tokenizer()
 
@@ -452,12 +598,13 @@ def main(config: GRPOConfig) -> None:
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         top_p=config.top_p,
-        stop=get_stop_sequences(tokenizer),
+        seed=config.seed,
     )
     adam_params = trio.AdamParams(
         learning_rate=config.learning_rate,
         beta1=config.beta1,
         beta2=config.beta2,
+        eps=1e-8,
     )
     swanlab_run = init_swanlab_run(
         config=config,
@@ -468,91 +615,81 @@ def main(config: GRPOConfig) -> None:
 
     try:
         for step in range(effective_steps):
+            step_started = time.perf_counter()
             batch_rows = pick_batch(
                 train_data,
                 step,
                 config.batch_size,
                 config.all_data,
             )
+            prepared = [
+                (build_prompt(tokenizer, row["prompt"]), extract_gsm8k_answer(row["answer"]))
+                for row in batch_rows
+            ]
 
-            # 采样必须使用当前策略，所以每个 step 先保存临时匿名 LoRA 权重并创建 sampler。
+            rollout_started = time.perf_counter()
+            # 每步发布当前 LoRA 权重，和 GRPOTrainer 一样使用当前策略采样。
             sampling_client = training_client.save_weights_and_get_sampling_client()
-
-            datums: list[trio.Datum] = []
-            prompt_mean_rewards: list[float] = []
-            rollout_lengths: list[int] = []
-            n_degenerate = 0
-
-            for row in tqdm(batch_rows, desc=f"GRPO step {step}", unit="prompt"):
-                prompt_tokens = build_prompt(tokenizer, row["question"])
-                ground_truth = extract_gsm8k_answer(row["answer"])
-                rollout_samples = run_rollout_group(
+            groups = [
+                run_rollout_group(
                     sampling_client=sampling_client,
                     tokenizer=tokenizer,
                     prompt_tokens=prompt_tokens,
-                    ground_truth=ground_truth,
                     sampling_params=sampling_params,
                     group_size=config.group_size,
                 )
+                for prompt_tokens, _ in tqdm(prepared, desc=f"GRPO step {step + 1}", unit="prompt")
+            ]
+            rollout_time = time.perf_counter() - rollout_started
 
-                rollout_lengths.extend(len(sample.tokens) for sample in rollout_samples)
-                rewards = [sample.reward for sample in rollout_samples]
-                prompt_mean_reward = sum(rewards) / len(rewards)
-                prompt_mean_rewards.append(prompt_mean_reward)
+            reward_started = time.perf_counter()
+            for samples, (_, ground_truth) in zip(groups, prepared, strict=True):
+                score_rollout_group(samples, ground_truth)
+            reward_time = time.perf_counter() - reward_started
 
-                # 同一题 group 内 reward 完全一样时，advantage 全为 0，没有训练信号，直接跳过。
-                if all(sample.advantage == 0.0 for sample in rollout_samples):
-                    n_degenerate += 1
+            train_started = time.perf_counter()
+            datums: list[trio.Datum] = []
+            skipped_groups = 0
+            for samples, (prompt_tokens, _) in zip(groups, prepared, strict=True):
+                if all(sample.advantage == 0.0 for sample in samples):
+                    skipped_groups += 1
                     continue
-
-                for sample in rollout_samples:
+                for sample in samples:
                     datums.append(build_grpo_datum(prompt_tokens, sample))
 
             # importance_sampling / ppo 都是 PyTRIO 内置 loss，datum 只需要
             # target_tokens、采样时旧策略 logprobs 和 GRPO 组内 advantage。
-            loss_metrics = run_optimization_step(
+            training_metrics = run_optimization_step(
                 training_client,
                 datums,
                 loss_fn=config.loss_fn,
                 adam_params=adam_params,
             )
-
-            loss_mean = get_numeric_metric(loss_metrics, "loss_mean")
-            train_tokens = count_train_tokens(datums)
-            mean_reward = sum(prompt_mean_rewards) / len(prompt_mean_rewards)
-            avg_gen_len = (
-                sum(rollout_lengths) / len(rollout_lengths)
-                if rollout_lengths
-                else 0.0
+            log_payload = build_step_metrics(
+                groups, datums, skipped_groups, training_metrics, config.learning_rate
             )
-            # 退化 group 指同一道题的所有回答 reward 都一样，advantage 全为 0，没有相对优劣信号。
-            # 这个比例越高，说明当前 batch 里真正用于 GRPO 学习的题目越少。
-            frac_degenerate = n_degenerate / len(prompt_mean_rewards)
-            if swanlab_run is not None:
-                log_payload = {
-                    "reward": mean_reward,
-                    "frac_degenerate": frac_degenerate,
-                    "rollout/avg_gen_len": avg_gen_len,
-                    "datums": len(datums),
-                    "train_tokens": train_tokens,
-                    **{
-                        f"trainer/{key}": value
-                        for key, value in loss_metrics.items()
-                        if key == "loss_mean"
-                    },
+            train_time = time.perf_counter() - train_started
+            log_payload.update(
+                {
+                    "trainer/step": float(step + 1),
+                    "time/rollout": rollout_time,
+                    "time/reward": reward_time,
+                    "time/train": train_time,
+                    "time/step": time.perf_counter() - step_started,
                 }
-                if loss_mean is not None:
-                    log_payload["loss"] = loss_mean
-                    log_payload["loss_mean"] = loss_mean
-                swanlab.log(log_payload, step=step)
+            )
+            if swanlab_run is not None:
+                swanlab_run.log(log_payload, step=step + 1)
 
+            loss_mean = log_payload.get("trainer/loss")
             loss_mean_text = "n/a" if loss_mean is None else f"{loss_mean:.4f}"
+            kl = log_payload.get("policy/kl_sample_train")
+            kl_text = "n/a" if kl is None else f"{kl:.4f}"
             print(
-                f"Step {step:2d} | reward: {mean_reward:.3f} | "
-                f"degenerate: {frac_degenerate:.0%} | datums: {len(datums)} | "
-                f"train_tokens: {train_tokens} | "
-                f"avg_gen_len: {avg_gen_len:.1f} | "
-                f"loss_mean: {loss_mean_text} | loss_fn: {config.loss_fn}"
+                f"Step {step + 1:2d} | reward: {log_payload['reward/mean']:.3f} | "
+                f"degenerate: {log_payload['frac_degenerate']:.0%} | datums: {len(datums)} | "
+                f"loss: {loss_mean_text} | kl: {kl_text} | "
+                f"time: {log_payload['time/step']:.2f}s | loss_fn: {config.loss_fn}"
             )
 
         print("Saving final LoRA weights for sampler...")
@@ -560,17 +697,19 @@ def main(config: GRPOConfig) -> None:
             name=run_name
         ).result()
         print(f"Saved weights name: {run_name}, path: {final_weights.path}")
-    finally:
+        run_time = time.perf_counter() - run_started
+        print(f"Training finished in {run_time:.2f}s")
+        if swanlab_run is not None:
+            swanlab_run.log({"time/run": run_time}, step=effective_steps)
+            swanlab_run.log_text(key="weights/path", data=final_weights.path, step=effective_steps)
+    except BaseException as error:
+        if swanlab_run is not None:
+            swanlab_run.finish(state="crashed", error=str(error))
+        raise
+    else:
         if swanlab_run is not None:
             swanlab_run.finish()
 
 
 if __name__ == "__main__":
-    cli_config = parse_args()
-    start_main_time = time.time()
-    main(cli_config)
-    end_main_time = time.time()
-    print("#" * 50)
-    print("# all done")
-    print(f"# train cost {end_main_time - start_main_time:.2f}s")
-    print("#" * 50)
+    main(parse_args())
