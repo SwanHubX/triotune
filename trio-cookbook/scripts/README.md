@@ -1,12 +1,13 @@
 # 训练脚本
 
-本目录存放可直接运行的 PyTRIO 训练案例。命令默认从仓库根目录
-`trio-cookbook/` 执行，并使用 `uv` 管理项目环境。启动脚本会切换到仓库根目录，
+本目录存放训练启动脚本；训练案例实现位于
+[grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py)。
+命令默认从仓库根目录执行，并使用 `uv` 管理项目环境。启动脚本会切换到仓库根目录，
 再读取 `trio-cookbook/configs/` 下的参数文件。
 
 ## 输入数据集格式
 
-`grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
+`recipes/grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
 一条 JSON 对象，文件至少包含一条有效记录。例如：
 
 ```jsonl

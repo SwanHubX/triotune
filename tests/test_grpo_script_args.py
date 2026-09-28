@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 
 def _load_script() -> ModuleType:
-    path = Path(__file__).parents[1] / "trio-cookbook" / "scripts" / "grpo_gms8k_trio.py"
+    path = Path(__file__).parents[1] / "trio-cookbook" / "recipes" / "grpo_gms8k_trio.py"
     spec = importlib.util.spec_from_file_location("grpo_gms8k_trio_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load script from {path}")

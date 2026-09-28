@@ -1,6 +1,6 @@
 """Prepare GSM8K data and train GRPO using a TOML recipe configuration.
 
-From the repository root, run ``bash trio-cookbook/scripts/train_grpo_gms8k.sh``.
+Launch this recipe with ``bash trio-cookbook/scripts/train_grpo_gms8k.sh``.
 Use ``--prepare-only`` to inspect the JSONL data before creating PyTRIO clients.
 """
 
