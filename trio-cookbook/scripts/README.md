@@ -76,3 +76,26 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --help
 ```
+
+## 与独立 GRPO 案例对比
+
+[grpo_gsm8k.py](../recipes/grpo_gsm8k.py) 可直接读取同一份
+`data/gsm8k_train.jsonl`。若文件尚不存在，先用上面的启动脚本加 `--prepare-only`
+准备；数据构建不在独立案例中进行。PyTRIO 训练工作空间由当前凭据决定，
+`--workspace pytrio` 只指定 SwanLab 日志所属的工作空间，不改变 PyTRIO 凭据。
+
+```bash
+uv run python trio-cookbook/recipes/grpo_gsm8k.py \
+  --data-file data/gsm8k_train.jsonl \
+  --steps 100 --batch-size 4 --group-size 8 \
+  --loss-fn importance_sampling \
+  --workspace pytrio
+```
+
+两个入口均记录 `reward/mean`、`reward/std`、`trainer/loss`、
+`policy/entropy`、`policy/kl_sample_train`、`optim/lr`、可用时的
+`optim/grad_norm`，以及 `time/rollout`、`time/reward`、`time/train`、
+`time/step`。KL 只统计非零 advantage 的 completion token；
+`policy/entropy` 是采样 logprob 的负均值。数值受随机采样和远端服务耗时影响，
+不保证两次运行完全相同；最后一步的 `time/step` 也因框架保存完整训练状态、
+独立案例在循环后另存采样权重而不应直接比较。

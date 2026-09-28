@@ -84,3 +84,5 @@ The GSM8K recipe uses a [TOML configuration](configs/grpo_gms8k.toml) and a
 shell launcher. From the repository root, run
 `bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only` to inspect the
 data before training; omit `--prepare-only` to start the configured run.
+The standalone [GSM8K GRPO recipe](recipes/grpo_gsm8k.py) can use the same
+prepared JSONL for metric comparisons; see the [script guide](scripts/README.md).
