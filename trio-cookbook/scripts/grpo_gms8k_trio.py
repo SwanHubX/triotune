@@ -209,6 +209,11 @@ def parse_args() -> argparse.Namespace:
         default="disabled",
     )
     parser.add_argument("--project", default="trio-cookbook-test")
+    parser.add_argument("--workspace", help="SwanLab workspace or organization")
+    parser.add_argument(
+        "--tag", "--tags", dest="tags", action="append", metavar="TAG",
+        help="SwanLab tag; repeat for multiple tags",
+    )
     parser.add_argument("--run-name", default="grpo-trainer-gsm8k")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
@@ -244,6 +249,8 @@ def main() -> None:
         chat_template_kwargs={"enable_thinking": False},
         mode=args.mode,
         project=args.project,
+        workspace=args.workspace,
+        tags=args.tags,
         run_name=args.run_name,
     )
     trainer = GRPOTrainer(

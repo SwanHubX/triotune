@@ -46,6 +46,8 @@ args = GRPOConfig(
     max_steps=100,
     mode="online",  # or "local" / "offline"
     project="my-grpo-project",
+    workspace="my-organization",  # None (default) uses SwanLab's default
+    tags=["grpo", "gsm8k"],       # None (default) uses SwanLab's default
 )
 ```
 

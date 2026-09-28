@@ -199,6 +199,8 @@ class GRPOTrainer:
         return swanlab.init(
             mode=self.config.mode,
             project=self.config.project,
+            workspace=self.config.workspace,
+            tags=self.config.tags,
             name=self.config.run_name or f"{model_slug}-grpo",
             log_dir=self.config.log_dir,
             config={

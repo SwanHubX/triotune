@@ -56,6 +56,36 @@ def _final_trainer(run: _Run, sampler: _Sampler) -> GRPOTrainer:
 
 
 class SwanLabLoggingTests(unittest.TestCase):
+    def test_init_passes_workspace_and_tags_to_swanlab(self) -> None:
+        trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer.model_name = "Qwen/Qwen3.5-9B"
+        trainer.config = GRPOConfig(mode="online", workspace="my-organization", tags=["grpo", "gsm8k"])
+
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
+            trainer._init_swanlab_run(lora_rank=32)
+
+        self.assertEqual(init.call_args.kwargs["workspace"], "my-organization")
+        self.assertEqual(init.call_args.kwargs["tags"], ["grpo", "gsm8k"])
+
+    def test_swanlab_workspace_and_tags_default_to_none(self) -> None:
+        trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer.model_name = "Qwen/Qwen3.5-9B"
+        trainer.config = GRPOConfig(mode="online")
+
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
+            trainer._init_swanlab_run(lora_rank=32)
+
+        self.assertIsNone(init.call_args.kwargs["workspace"])
+        self.assertIsNone(init.call_args.kwargs["tags"])
+
+    def test_rejects_empty_workspace_and_tags(self) -> None:
+        with self.assertRaisesRegex(ValueError, "workspace"):
+            GRPOConfig(workspace=" ")
+        with self.assertRaisesRegex(ValueError, "tags"):
+            GRPOConfig(tags=["grpo", ""])
+        with self.assertRaisesRegex(ValueError, "tags"):
+            GRPOConfig(tags="grpo")
+
     def test_logs_batch_metrics_without_per_prompt_metrics(self) -> None:
         run = _Run()
         trainer = GRPOTrainer.__new__(GRPOTrainer)

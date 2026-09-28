@@ -54,6 +54,14 @@ uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
 `--mode` 控制 SwanLab 日志模式，可选 `disabled`、`online`、`local` 和
 `offline`；启用后，训练结束时会以文本记录最终 checkpoint 地址，并展示最后
 一批中最多 4 个问题的最终模型推理结果。训练本身仍由 PyTRIO 客户端执行。
+`--workspace` 可指定 SwanLab 组织或工作空间；默认不指定，由 SwanLab 决定，
+通常为当前用户。`--tag`（也可写为 `--tags`）可重复传入多个实验标签，例如：
+
+```bash
+uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
+  --mode online --workspace my-organization --tag grpo --tag gsm8k
+```
+
 最终步数、核心指标和 checkpoint 地址会在 SwanLab 结束前打印到终端，
 同时记录为 `trainer/final_summary` 文本。需要重新下载并生成数据时，
 追加 `--rebuild-data`。完整参数可以运行：
