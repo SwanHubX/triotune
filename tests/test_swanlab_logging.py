@@ -135,7 +135,7 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_final_checkpoint_and_inference_are_logged_as_text(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
-        rows = [{"prompt": f"Prompt {i}", "question": f"Question {i}"} for i in range(5)]
+        rows = [{"messages": f"Prompt {i}", "question": f"Question {i}"} for i in range(5)]
 
         trainer._log_final_checkpoint()
         trainer._log_final_samples(rows)
@@ -159,7 +159,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer = _final_trainer(run, sampler)
         trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3)
         trainer.state = TrainerState()
-        trainer.train_dataset = [{"prompt": "Only question"}]
+        trainer.train_dataset = [{"messages": "Only question"}]
         trainer._training_client = SimpleNamespace(
             save_state=lambda *, name: SimpleNamespace(path=f"trio://{name}")
         )
@@ -193,7 +193,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
 
-        await trainer._log_final_samples_async([{"prompt": "Prompt", "question": "Question"}])
+        await trainer._log_final_samples_async([{"messages": "Prompt", "question": "Question"}])
 
         texts, step = run.texts["sample/text"]
         self.assertEqual(step, 1)
@@ -205,7 +205,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
         trainer = _final_trainer(run, sampler)
         trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3)
         trainer.state = TrainerState()
-        trainer.train_dataset = [{"prompt": "Only question"}]
+        trainer.train_dataset = [{"messages": "Only question"}]
 
         async def save_state_async(*, name: str) -> object:
             return SimpleNamespace(path=f"trio://{name}")

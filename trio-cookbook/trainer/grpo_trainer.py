@@ -334,7 +334,7 @@ class GRPOTrainer:
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
         for index, row in enumerate(rows):
-            # 默认通常要求数据格式为：{"prompt": "问题文本"}
+            # 数据行默认使用 messages 字段，值可以是文本、token ID 或对话消息。
             if self.config.prompt_key not in row:
                 raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
             rendered = render_prompt(

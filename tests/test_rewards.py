@@ -10,6 +10,26 @@ from trio_cookbook.trainer.types import GRPOBatch, SequenceSample
 
 
 class RewardEvaluatorTests(unittest.TestCase):
+    def test_default_messages_key_is_not_forwarded_to_reward_function(self) -> None:
+        observed: dict[str, object] = {}
+
+        def reward(**kwargs: object) -> list[float]:
+            observed.update(kwargs)
+            return [1.0]
+
+        group = GRPOBatch(
+            prompt_id="0",
+            prompt="rendered prompt",
+            prompt_tokens=[1],
+            samples=[SequenceSample(tokens=[2], logprobs=[-0.1], text="answer")],
+            row={"messages": [{"role": "user", "content": "question"}], "answer": "42"},
+        )
+
+        RewardEvaluator(reward).score([group])
+
+        self.assertNotIn("messages", observed)
+        self.assertEqual(observed["answer"], ["42"])
+
     def test_trainer_propagates_custom_prompt_key_to_reward_evaluator(self) -> None:
         class Tokenizer:
             def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:

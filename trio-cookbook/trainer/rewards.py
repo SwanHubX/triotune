@@ -61,7 +61,7 @@ class RewardEvaluator:
         reward_funcs: RewardFunc | Sequence[RewardFunc],
         weights: Sequence[float] | None = None,
         *,
-        prompt_key: str = "prompt",
+        prompt_key: str = "messages",
     ) -> None:
         self.functions = [reward_funcs] if callable(reward_funcs) else list(reward_funcs)
         if not self.functions:
