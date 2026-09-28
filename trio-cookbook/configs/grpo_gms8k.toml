@@ -24,8 +24,8 @@ seed = 42
 enable_thinking = false
 
 [swanlab]
-mode = "disabled"
-project = "trio-cookbook-test"
-run_name = "grpo-trainer-gsm8k"
-# workspace = "my-organization"
-# tags = ["grpo", "gsm8k"]
+mode = "online"
+project = "cookbook-grpo-test"
+run_name = "gsm8k"
+workspace = "pytrio"
+tags = ["grpo", "gsm8k"]
