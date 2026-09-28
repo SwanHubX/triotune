@@ -60,16 +60,11 @@ class RewardEvaluator:
         self,
         reward_funcs: RewardFunc | Sequence[RewardFunc],
         weights: Sequence[float] | None = None,
-        *,
-        prompt_key: str = "messages",
     ) -> None:
         self.functions = [reward_funcs] if callable(reward_funcs) else list(reward_funcs)
         if not self.functions:
             raise ValueError("At least one reward function is required.")
         self.function_names = _reward_names(self.functions)
-        if not isinstance(prompt_key, str) or not prompt_key.strip():
-            raise ValueError("prompt_key must be a non-empty string.")
-        self.prompt_key = prompt_key
         if weights is None:
             self.weights = [1.0] * len(self.functions)
         else:
@@ -90,7 +85,7 @@ class RewardEvaluator:
         columns: dict[str, list[Any]] = {}
         for group in groups:
             for key, value in group.row.items():
-                if key != self.prompt_key:
+                if key != "prompt":
                     columns.setdefault(key, []).extend([value] * len(group.samples))
         columns.update(
             {

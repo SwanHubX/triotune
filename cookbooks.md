@@ -15,12 +15,12 @@
 
 ## TRL 前端 API 与适配结论
 
-TRL 的入口是 `GRPOTrainer(model, reward_funcs, args, train_dataset, ... )`：数据行提供 `messages`，生成结果提供 token 与 log-probability，`reward_funcs` 返回标量奖励，Trainer 在本地计算组内 advantage、比率/裁剪损失并执行 PyTorch 优化；`rollout_func` 和 `environment_factory` 是可选扩展点。
+TRL 的入口是 `GRPOTrainer(model, reward_funcs, args, train_dataset, ... )`：数据行提供 `prompt`，生成结果提供 token 与 log-probability，`reward_funcs` 返回标量奖励，Trainer 在本地计算组内 advantage、比率/裁剪损失并执行 PyTorch 优化；`rollout_func` 和 `environment_factory` 是可选扩展点。
 
 结论：GRPO 的算法流程可以映射，但该 API 格式不能完全直接用于 Tinker，至少需要适配以下部分：
 
 1. **模型/客户端**：TRL 要求 Hugging Face `PreTrainedModel`、`generate`/`forward` 和本地 optimizer；Tinker 使用远程 `TrainingClient`/`SamplingClient`，不能直接传入 `model` 或复用 Trainer 的 Accelerate/vLLM 状态。
-2. **数据格式**：TRL 使用 `Dataset` 行（至少含 `messages`）；Tinker 使用 `RLDatasetBuilder -> EnvGroupBuilder -> TrajectoryGroup`，环境是单次创建的，不能把 dataset 行直接当作 rollout 输入。
+2. **数据格式**：TRL 使用 `Dataset` 行（至少含 `prompt`）；Tinker 使用 `RLDatasetBuilder -> EnvGroupBuilder -> TrajectoryGroup`，环境是单次创建的，不能把 dataset 行直接当作 rollout 输入。
 3. **奖励接口**：TRL 的 `reward_funcs(prompts, completions, **kwargs) -> list[float]` 是批量回调；Tinker 奖励来自 `Env.step`、`compute_group_rewards` 和轨迹指标，需额外封装环境状态及组级奖励。
 4. **rollout 返回值**：TRL `rollout_func` 必须返回 `prompt_ids`、`completion_ids`、`logprobs` 字典；Tinker 采样结果要组织成 `Transition/Trajectory/TrajectoryGroup`，再由 `assemble_training_data` 生成 `Datum`。
 5. **损失输入**：TRL 直接对 Torch logits 计算 GRPO/IS/PPO；Tinker 的 `forward_backward_async` 接收 `Datum`（`model_input` + `loss_fn_inputs`，如 `target_tokens`、`logprobs`、`advantages`）和 `loss_fn`，且当前流程会移除 `mask` 字段，不能直接传 TRL 的 batch。

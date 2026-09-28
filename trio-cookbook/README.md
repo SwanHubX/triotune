@@ -26,7 +26,7 @@ trainer = GRPOTrainer(
     model_name="Qwen/Qwen3.5-4B",
     reward_funcs=my_reward,
     args=GRPOConfig(num_generations=4, max_steps=100, save_every=10),
-    train_dataset=rows,                     # rows contain a `messages` field
+    train_dataset=rows,                     # rows contain a `prompt` field
 )
 trainer.train()
 ```
@@ -62,11 +62,11 @@ model weights. No checkpoint archive download is needed for this inference.
 The final step, selected metrics, and checkpoint URI are printed to the
 terminal and recorded together as `trainer/final_summary` before the run ends.
 
-Dataset rows are text-only. The `messages` value may be a string, a non-empty
+Prompt rows are text-only. The `prompt` value may be a string, a non-empty
 integer token list, or chat messages such as:
 
 ```python
-{"messages": [
+{"prompt": [
     {"role": "system", "content": "Answer concisely."},
     {"role": "user", "content": "What is 2 + 2?"},
 ]}
@@ -75,9 +75,6 @@ integer token list, or chat messages such as:
 Chat messages are passed through the tokenizer's `apply_chat_template` with a
 generation prompt before sampling. Message content must be a string because
 this first trainer accepts text inputs only.
-
-The default dataset key is `messages`. Use `GRPOConfig(prompt_key="prompt")`
-when reading an existing dataset with a `prompt` column.
 
 The source directory keeps the repository's historical `trio-cookbook` name,
 while the build configuration installs it under the valid Python package name

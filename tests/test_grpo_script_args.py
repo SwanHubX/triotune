@@ -26,7 +26,7 @@ script = _load_script()
 
 
 class ScriptArgumentsTests(unittest.TestCase):
-    def test_prepared_gsm8k_rows_use_messages_column(self) -> None:
+    def test_prepared_gsm8k_rows_use_prompt_column(self) -> None:
         source = Dataset.from_list([{"question": "6 * 7?", "answer": "work #### 42"}])
         with TemporaryDirectory() as directory:
             data_file = Path(directory) / "train.jsonl"
@@ -34,14 +34,14 @@ class ScriptArgumentsTests(unittest.TestCase):
                 script.prepare_gsm8k_dataset(data_file, Path(directory), rebuild=False)
 
             raw_row = json.loads(data_file.read_text(encoding="utf-8"))
-            self.assertIn("messages", raw_row)
-            self.assertNotIn("prompt", raw_row)
+            self.assertIn("prompt", raw_row)
+            self.assertNotIn("messages", raw_row)
             self.assertEqual(script.load_training_rows(data_file, None), [raw_row])
 
-            data_file.write_text(json.dumps({"messages": [1, 2], "answer": "42"}))
-            self.assertEqual(script.load_training_rows(data_file, None)[0]["messages"], [1, 2])
+            data_file.write_text(json.dumps({"prompt": [1, 2], "answer": "42"}))
+            self.assertEqual(script.load_training_rows(data_file, None)[0]["prompt"], [1, 2])
 
-            data_file.write_text(json.dumps({"prompt": raw_row["messages"], "answer": "42"}))
+            data_file.write_text(json.dumps({"messages": raw_row["prompt"], "answer": "42"}))
             with self.assertRaisesRegex(ValueError, "Invalid trainer row"):
                 script.load_training_rows(data_file, None)
 
@@ -81,7 +81,7 @@ class ScriptArgumentsTests(unittest.TestCase):
             patch.object(script, "prepare_gsm8k_dataset"),
             patch.object(
                 script, "load_training_rows",
-                return_value=[{"messages": [{"role": "user", "content": "6 * 7?"}], "answer": "42"}],
+                return_value=[{"prompt": [{"role": "user", "content": "6 * 7?"}], "answer": "42"}],
             ),
             patch.object(script, "GRPOTrainer") as trainer_class,
             patch.object(script, "print", create=True),
@@ -99,7 +99,7 @@ class ScriptArgumentsTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", argv),
             patch.object(script, "prepare_gsm8k_dataset"),
-            patch.object(script, "load_training_rows", return_value=[{"messages": [1], "answer": "42"}]),
+            patch.object(script, "load_training_rows", return_value=[{"prompt": [1], "answer": "42"}]),
             patch.object(script, "GRPOTrainer") as trainer_class,
             patch.object(script, "print", create=True),
         ):

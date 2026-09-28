@@ -186,7 +186,6 @@ class GRPOTrainer:
         self.reward_evaluator = RewardEvaluator(
             reward_funcs,
             self.config.reward_weights,
-            prompt_key=self.config.prompt_key,
         )
         self.state = TrainerState()
         self._decode = self._make_decode(self._tokenizer)
@@ -334,11 +333,11 @@ class GRPOTrainer:
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
         for index, row in enumerate(rows):
-            # 数据行默认使用 messages 字段，值可以是文本、token ID 或对话消息。
-            if self.config.prompt_key not in row:
-                raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
+            # TRL-compatible dataset rows use the fixed ``prompt`` column.
+            if "prompt" not in row:
+                raise KeyError(f"Dataset row {index} is missing 'prompt'.")
             rendered = render_prompt(
-                row[self.config.prompt_key],
+                row["prompt"],
                 self._tokenizer,
                 add_generation_prompt=self.config.add_generation_prompt,
                 chat_template_kwargs=self.config.chat_template_kwargs,
