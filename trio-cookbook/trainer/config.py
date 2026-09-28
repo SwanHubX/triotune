@@ -40,6 +40,7 @@ class GRPOConfig:
     skip_zero_advantage: bool = True
     save_every: int = 0
     seed: int | None = None
+    prompt_key: str = "messages"
     add_generation_prompt: bool = True
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     mode: str = "disabled"
@@ -88,6 +89,8 @@ class GRPOConfig:
             raise ValueError("tags must be a list of non-empty strings when provided.")
         if self.reward_epsilon <= 0 or not math.isfinite(self.reward_epsilon):
             raise ValueError("reward_epsilon must be finite and positive.")
+        if not self.prompt_key.strip():
+            raise ValueError("prompt_key must not be empty.")
         reserved = {"tokenize", "add_generation_prompt"}.intersection(self.chat_template_kwargs)
         if reserved:
             raise ValueError(

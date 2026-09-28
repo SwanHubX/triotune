@@ -25,11 +25,11 @@ class DatasetRowTests(unittest.TestCase):
         self.trainer.state = TrainerState()
         self.trainer._tokenizer = _Tokenizer()
 
-    def test_prompt_column_accepts_text_tokens_and_chat(self) -> None:
+    def test_default_messages_accepts_text_tokens_and_chat(self) -> None:
         rows = [
-            {"prompt": "question"},
-            {"prompt": [1, 2]},
-            {"prompt": [{"role": "user", "content": "question"}]},
+            {"messages": "question"},
+            {"messages": [1, 2]},
+            {"messages": [{"role": "user", "content": "question"}]},
         ]
 
         groups = self.trainer._groups(rows)
@@ -40,9 +40,16 @@ class DatasetRowTests(unittest.TestCase):
             ["question", "decoded tokens", "chat template"],
         )
 
-    def test_missing_prompt_column_is_rejected(self) -> None:
-        with self.assertRaisesRegex(KeyError, "prompt"):
-            self.trainer._groups([{"messages": "question"}])
+    def test_default_rejects_old_prompt_column(self) -> None:
+        with self.assertRaisesRegex(KeyError, "messages"):
+            self.trainer._groups([{"prompt": "question"}])
+
+    def test_custom_prompt_key_reads_old_column(self) -> None:
+        self.trainer.config = GRPOConfig(prompt_key="prompt")
+
+        groups = self.trainer._groups([{"prompt": "question"}])
+
+        self.assertEqual(groups[0].prompt, "question")
 
 
 if __name__ == "__main__":

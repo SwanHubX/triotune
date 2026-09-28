@@ -95,7 +95,7 @@ def prepare_gsm8k_dataset(data_file: Path, cache_dir: Path, *, rebuild: bool) ->
                 if not isinstance(question, str) or not isinstance(source_answer, str):
                     raise TypeError(f"GSM8K row {index} must contain string question and answer")
                 row = {
-                    "prompt": build_prompt(question),
+                    "messages": build_prompt(question),
                     "answer": extract_reference_answer(source_answer),
                     "question": question,
                 }
@@ -113,22 +113,22 @@ def load_training_rows(data_file: Path, max_examples: int | None) -> list[dict[s
             if not line.strip():
                 continue
             row = json.loads(line)
-            prompt = row.get("prompt") if isinstance(row, dict) else None
-            valid_prompt = (
-                isinstance(prompt, str)
+            messages = row.get("messages") if isinstance(row, dict) else None
+            valid_messages = (
+                isinstance(messages, str)
                 or (
-                    isinstance(prompt, list)
-                    and bool(prompt)
+                    isinstance(messages, list)
+                    and bool(messages)
                     and (
                         all(
                             isinstance(token, Integral) and not isinstance(token, bool)
-                            for token in prompt
+                            for token in messages
                         )
-                        or all(isinstance(message, dict) for message in prompt)
+                        or all(isinstance(message, dict) for message in messages)
                     )
                 )
             )
-            if not isinstance(row, dict) or not valid_prompt or not isinstance(row.get("answer"), str):
+            if not isinstance(row, dict) or not valid_messages or not isinstance(row.get("answer"), str):
                 raise ValueError(f"Invalid trainer row at {data_file}:{line_number}")
             rows.append(row)
             if max_examples is not None and len(rows) >= max_examples:

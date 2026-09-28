@@ -11,12 +11,12 @@
 一条 JSON 对象，文件至少包含一条有效记录。例如：
 
 ```jsonl
-{"prompt":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
+{"messages":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
 ```
 
-- `prompt`（必填）：非空列表。推荐使用对话消息，每条消息含字符串类型的 `role`
+- `messages`（必填）：非空列表。推荐使用对话消息，每条消息含字符串类型的 `role`
   和 `content`；也可以使用非空的整数 token ID 列表。此脚本的读取校验不接受
-  裸字符串 `prompt`。
+  裸字符串 `messages`。
 - `answer`（必填）：字符串形式的参考数值答案，例如 `"42"`。奖励函数提取生成文本
   中最后一个 `\boxed{}` 的内容，去掉千位逗号、首尾空白和末尾句点后比较；提示词
   应要求模型用 `\boxed{}` 作答。
@@ -34,6 +34,8 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
 
 `--prepare-only` 检查外层字段类型；对话消息或 token 列表的具体内容在训练时进一步
 校验。
+已有的旧格式数据文件需要将 `prompt` 字段改名为 `messages`；默认生成文件可用
+`--rebuild-data` 重新生成。
 
 ## gms8k 案例
 
