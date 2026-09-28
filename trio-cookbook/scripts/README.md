@@ -3,6 +3,36 @@
 本目录存放可直接运行的 PyTRIO 训练案例。命令默认从仓库根目录
 `trio-cookbook/` 执行，并使用 `uv` 管理项目环境。
 
+## 输入数据集格式
+
+`grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
+一条 JSON 对象，文件至少包含一条有效记录。例如：
+
+```jsonl
+{"prompt":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
+```
+
+- `prompt`（必填）：非空列表。推荐使用对话消息，每条消息含字符串类型的 `role`
+  和 `content`；也可以使用非空的整数 token ID 列表。此脚本的读取校验不接受
+  裸字符串 `prompt`。
+- `answer`（必填）：字符串形式的参考数值答案，例如 `"42"`。奖励函数提取生成文本
+  中最后一个 `\boxed{}` 的内容，去掉千位逗号、首尾空白和末尾句点后比较；提示词
+  应要求模型用 `\boxed{}` 作答。
+- `question`（可选）：原始问题文本，用作 SwanLab 最终推理样例的标题；省略时使用
+  渲染后的 `prompt`。其他字段可保留在数据行中。
+
+已存在的 `--data-file` 会直接读取；文件不存在或指定 `--rebuild-data` 时，脚本会
+下载 `openai/gsm8k` 并在该路径生成数据，因此不要对自定义文件使用
+`--rebuild-data`。可先检查读取的记录数：
+
+```bash
+uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
+  --data-file path/to/train.jsonl --prepare-only
+```
+
+`--prepare-only` 检查外层字段类型；对话消息或 token 列表的具体内容在训练时进一步
+校验。
+
 ## gms8k 案例
 
 该脚本使用 GSM8K 数据集运行 GRPO 训练。首次执行会将数据集缓存到
