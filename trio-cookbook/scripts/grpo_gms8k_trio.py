@@ -253,21 +253,7 @@ def main() -> None:
         train_dataset=rows,
         lora_rank=args.lora_rank,
     )
-    state = trainer.train()
-    print(f"Training finished at step {state.global_step}")
-    summary_keys = (
-        "train/loss",
-        "reward/mean",
-        "policy/entropy",
-        "policy/kl_sample_train",
-        "optim/lr",
-        "optim/grad_norm",
-        "time/step",
-    )
-    summary = {key: state.metrics[key] for key in summary_keys if key in state.metrics}
-    print("Final metrics: " + json.dumps(summary, sort_keys=True))
-    if state.checkpoint_path is not None:
-        print(f"Latest checkpoint: {state.checkpoint_path}")
+    trainer.train()
 
 
 if __name__ == "__main__":

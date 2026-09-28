@@ -33,8 +33,9 @@ trainer.train()
 
 When `save_every` is greater than zero, the trainer calls PyTRIO
 `TrainingClient.save_state()` after every configured number of completed steps.
-The returned checkpoint URI is available as `TrainerState.checkpoint_path` and
-contains both model weights and optimizer state.
+It also saves the final step if training ends between intervals. The returned
+checkpoint URI is available as `TrainerState.checkpoint_path` and contains
+both model weights and optimizer state.
 
 SwanLab logging is disabled by default. Enable it through `GRPOConfig` when
 experiment tracking is needed:
@@ -49,9 +50,15 @@ args = GRPOConfig(
 ```
 
 The trainer logs aggregate reward, learning rate, loss, sampled-policy entropy,
-sample-to-train KL, timing, datum counts, skipped groups, checkpoint events,
-and remote gradient norm when PyTRIO provides it. A terminal progress bar shows
+sample-to-train KL, timing, datum counts, skipped groups, and remote gradient
+norm when PyTRIO provides it. A terminal progress bar shows
 the core metrics for synchronous and asynchronous training.
+At the end of a SwanLab run, `checkpoint/path` records the final saved URI as
+text when checkpointing is enabled. `sample/text` shows one inference result
+for each of up to four prompts from the last training batch, using the final
+model weights. No checkpoint archive download is needed for this inference.
+The final step, selected metrics, and checkpoint URI are printed to the
+terminal and recorded together as `trainer/final_summary` before the run ends.
 
 Prompt rows are text-only. The `prompt` value may be a string, a non-empty
 integer token list, or chat messages such as:
