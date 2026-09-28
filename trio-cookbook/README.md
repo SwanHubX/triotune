@@ -79,3 +79,8 @@ this first trainer accepts text inputs only.
 The source directory keeps the repository's historical `trio-cookbook` name,
 while the build configuration installs it under the valid Python package name
 `trio_cookbook`.
+
+The GSM8K recipe uses a [TOML configuration](configs/grpo_gms8k.toml) and a
+shell launcher. From the repository root, run
+`bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only` to inspect the
+data before training; omit `--prepare-only` to start the configured run.
