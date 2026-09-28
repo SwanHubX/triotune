@@ -1,11 +1,13 @@
 # 训练脚本
 
-本目录存放可直接运行的 PyTRIO 训练案例。命令默认从仓库根目录
-`trio-cookbook/` 执行，并使用 `uv` 管理项目环境。
+本目录存放训练启动脚本；训练案例实现位于
+[grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py)。
+命令默认从仓库根目录执行，并使用 `uv` 管理项目环境。启动脚本会切换到仓库根目录，
+再读取 `trio-cookbook/configs/` 下的参数文件。
 
 ## 输入数据集格式
 
-`grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
+`recipes/grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
 一条 JSON 对象，文件至少包含一条有效记录。例如：
 
 ```jsonl
@@ -26,7 +28,7 @@
 `--rebuild-data`。可先检查读取的记录数：
 
 ```bash
-uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
+bash trio-cookbook/scripts/train_grpo_gms8k.sh \
   --data-file path/to/train.jsonl --prepare-only
 ```
 
@@ -40,32 +42,37 @@ uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
 
 ### 启动训练
 
-下面的命令运行 100 个训练 step，每个 batch 包含 4 个问题，每个问题采样
-8 个 completion，并关闭 SwanLab 日志：
+编辑 [grpo_gms8k.toml](../configs/grpo_gms8k.toml) 配置模型、数据路径、GRPO 超参数
+和 SwanLab。默认配置运行 100 个训练 step，每个 batch 包含 4 个问题，每个问题
+采样 8 个 completion，SwanLab 日志关闭。从仓库根目录运行：
 
 ```bash
-uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
-  --steps 100 \
-  --batch-size 4 \
-  --group-size 8 \
-  --mode disabled
+bash trio-cookbook/scripts/train_grpo_gms8k.sh
 ```
 
-`--mode` 控制 SwanLab 日志模式，可选 `disabled`、`online`、`local` 和
-`offline`；启用后，训练结束时会以文本记录最终 checkpoint 地址，并展示最后
-一批中最多 4 个问题的最终模型推理结果。训练本身仍由 PyTRIO 客户端执行。
-`--workspace` 可指定 SwanLab 组织或工作空间；默认不指定，由 SwanLab 决定，
-通常为当前用户。`--tag`（也可写为 `--tags`）可重复传入多个实验标签，例如：
+临时试跑可通过启动脚本覆盖步数、batch 和 group 大小，其他超参数直接修改
+TOML。`--config` 可以指定另一个参数文件；配置中的相对数据路径以仓库根目录为准。
+若不在配置中设置 `grpo.save_every`，默认在最后一个训练 step 保存 checkpoint。
 
 ```bash
-uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
+bash trio-cookbook/scripts/train_grpo_gms8k.sh \
+  --steps 10 --batch-size 2 --group-size 4
+```
+
+`swanlab.mode` 可选 `disabled`、`online`、`local` 和 `offline`。可在配置中
+设置 `workspace` 与 `tags`，也可临时通过命令行覆盖；`--tag`（别名 `--tags`）
+可以重复使用：
+
+```bash
+bash trio-cookbook/scripts/train_grpo_gms8k.sh \
   --mode online --workspace my-organization --tag grpo --tag gsm8k
 ```
 
-最终步数、核心指标和 checkpoint 地址会在 SwanLab 结束前打印到终端，
-同时记录为 `trainer/final_summary` 文本。需要重新下载并生成数据时，
-追加 `--rebuild-data`。完整参数可以运行：
+启用 SwanLab 后，训练结束时会以文本记录最终 checkpoint 地址，并展示最后
+一批中最多 4 个问题的最终模型推理结果。最终步数、核心指标和 checkpoint
+地址会在 SwanLab 结束前打印到终端，同时记录为 `trainer/final_summary` 文本。
+需要重新下载并生成数据时，追加 `--rebuild-data`。查看脚本支持的覆盖参数：
 
 ```bash
-uv run python trio-cookbook/scripts/grpo_gms8k_trio.py --help
+bash trio-cookbook/scripts/train_grpo_gms8k.sh --help
 ```

@@ -1,22 +1,15 @@
-"""Train GSM8K with the reusable :class:`GRPOTrainer` API.
+"""Prepare GSM8K data and train GRPO using a TOML recipe configuration.
 
-The first run downloads ``openai/gsm8k`` into ``.cache/`` and writes the
-trainer-ready rows to ``data/gsm8k_train.jsonl``. Use
-``--prepare-only`` to inspect that file before creating any PyTRIO clients.
-
-Example:
-
-    uv run python trio-cookbook/scripts/grpo_gms8k_trio.py --prepare-only
-    uv run python trio-cookbook/scripts/grpo_gms8k_trio.py \
-        --steps 10 --batch-size 4 --group-size 8 --mode disabled
+Launch this recipe with ``bash trio-cookbook/scripts/train_grpo_gms8k.sh``.
+Use ``--prepare-only`` to inspect the JSONL data before creating PyTRIO clients.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +19,7 @@ from trio_cookbook import GRPOConfig, GRPOTrainer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CACHE_DIR = REPOSITORY_ROOT / ".cache" / "huggingface"
-DEFAULT_DATA_FILE = REPOSITORY_ROOT / "data" / "gsm8k_train.jsonl"
+DEFAULT_CONFIG = REPOSITORY_ROOT / "trio-cookbook" / "configs" / "grpo_gms8k.toml"
 
 QUESTION_SUFFIX = "Provide a numerical answer without units, written inside \\boxed{}."
 FEWSHOT_PREFIX = [
@@ -58,34 +50,6 @@ def group_size(value: str) -> int:
     parsed = positive_int(value)
     if parsed < 2:
         raise argparse.ArgumentTypeError("GRPO group size must be at least 2")
-    return parsed
-
-
-def nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return parsed
-
-
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be finite and positive")
-    return parsed
-
-
-def probability(value: str) -> float:
-    parsed = positive_float(value)
-    if parsed > 1:
-        raise argparse.ArgumentTypeError("value must be <= 1")
-    return parsed
-
-
-def beta_value(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed) or not 0 <= parsed < 1:
-        raise argparse.ArgumentTypeError("value must be finite and in [0, 1)")
     return parsed
 
 
@@ -184,39 +148,47 @@ def boxed_answer_reward(
     return rewards
 
 
+def resolve_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else REPOSITORY_ROOT / path).resolve()
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    with path.expanduser().open("rb") as source:
+        settings = tomllib.load(source)
+    required = {
+        "model": ("name", "lora_rank"),
+        "data": ("file", "cache_dir"),
+        "grpo": ("num_generations", "max_steps"),
+    }
+    for section, fields in required.items():
+        values = settings.get(section)
+        if not isinstance(values, dict):
+            raise ValueError(f"Config {path} must contain a [{section}] section")
+        for field in fields:
+            if field not in values:
+                raise ValueError(f"Config {path} is missing [{section}].{field}")
+    if not isinstance(settings.get("swanlab", {}), dict):
+        raise ValueError(f"Config {path} must contain a [swanlab] table when provided")
+    return settings
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GSM8K through trio_cookbook.GRPOTrainer")
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--lora-rank", type=positive_int, default=32)
-    parser.add_argument("--steps", type=positive_int, default=10)
-    parser.add_argument("--batch-size", type=positive_int, default=4)
-    parser.add_argument("--group-size", type=group_size, default=4)
-    parser.add_argument("--max-tokens", type=positive_int, default=1024)
-    parser.add_argument("--temperature", type=positive_float, default=1.0)
-    parser.add_argument("--top-p", type=probability, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--learning-rate", type=positive_float, default=4e-5)
-    parser.add_argument("--beta1", type=beta_value, default=0.9)
-    parser.add_argument("--beta2", type=beta_value, default=0.95)
-    parser.add_argument(
-        "--save-every",
-        type=nonnegative_int,
-        help="checkpoint interval; defaults to the final configured step",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("disabled", "online", "local", "offline"),
-        default="disabled",
-    )
-    parser.add_argument("--project", default="trio-cookbook-test")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--steps", type=positive_int, help="override grpo.max_steps")
+    parser.add_argument("--batch-size", type=positive_int, help="override grpo.batch_size")
+    parser.add_argument("--group-size", type=group_size, help="override grpo.num_generations")
+    parser.add_argument("--mode", choices=("disabled", "online", "local", "offline"))
+    parser.add_argument("--project")
     parser.add_argument("--workspace", help="SwanLab workspace or organization")
     parser.add_argument(
         "--tag", "--tags", dest="tags", action="append", metavar="TAG",
         help="SwanLab tag; repeat for multiple tags",
     )
-    parser.add_argument("--run-name", default="grpo-trainer-gsm8k")
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
+    parser.add_argument("--run-name")
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--data-file", type=Path)
     parser.add_argument("--max-examples", type=positive_int)
     parser.add_argument("--rebuild-data", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
@@ -225,40 +197,44 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data_file = args.data_file.expanduser().resolve()
-    cache_dir = args.cache_dir.expanduser().resolve()
+    settings = load_config(args.config)
+    data = settings["data"]
+    data_file = resolve_path(args.data_file or data["file"])
+    cache_dir = resolve_path(args.cache_dir or data["cache_dir"])
+    max_examples = data.get("max_examples") if args.max_examples is None else args.max_examples
+    if max_examples is not None and (
+        isinstance(max_examples, bool) or not isinstance(max_examples, int) or max_examples < 1
+    ):
+        raise ValueError("data.max_examples must be a positive integer")
 
     prepare_gsm8k_dataset(data_file, cache_dir, rebuild=args.rebuild_data)
-    rows = load_training_rows(data_file, args.max_examples)
+    rows = load_training_rows(data_file, max_examples)
     print(f"Prepared {len(rows)} GRPO rows at {data_file}")
     if args.prepare_only:
         return
 
-    config = GRPOConfig(
-        num_generations=args.group_size,
-        max_completion_length=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        batch_size=args.batch_size,
-        max_steps=args.steps,
-        learning_rate=args.learning_rate,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        save_every=args.steps if args.save_every is None else args.save_every,
-        seed=args.seed,
-        chat_template_kwargs={"enable_thinking": False},
-        mode=args.mode,
-        project=args.project,
-        workspace=args.workspace,
-        tags=args.tags,
-        run_name=args.run_name,
-    )
+    grpo = dict(settings["grpo"])
+    for flag, field in (
+        ("steps", "max_steps"),
+        ("batch_size", "batch_size"),
+        ("group_size", "num_generations"),
+    ):
+        if (value := getattr(args, flag)) is not None:
+            grpo[field] = value
+    grpo.setdefault("save_every", grpo.get("max_steps") or 0)
+
+    swanlab_options = dict(settings.get("swanlab", {}))
+    for field in ("mode", "project", "workspace", "run_name", "tags"):
+        if (value := getattr(args, field)) is not None:
+            swanlab_options[field] = value
+
+    config = GRPOConfig(**grpo, **swanlab_options)
     trainer = GRPOTrainer(
-        model_name=args.base_model,
+        model_name=settings["model"]["name"],
         reward_funcs=boxed_answer_reward,
         args=config,
         train_dataset=rows,
-        lora_rank=args.lora_rank,
+        lora_rank=settings["model"]["lora_rank"],
     )
     trainer.train()
 
