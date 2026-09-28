@@ -40,7 +40,7 @@ class GRPOConfig:
     skip_zero_advantage: bool = True
     save_every: int = 0
     seed: int | None = None
-    prompt_key: str = "prompt"
+    prompt_key: str = "messages"
     add_generation_prompt: bool = True
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     mode: str = "disabled"
