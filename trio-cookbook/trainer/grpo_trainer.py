@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -20,7 +21,7 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from ..utils.client import call, call_async, optimizer_params, submit_async, wait, wait_async
+from ..utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
 from .advantages import group_advantages
 from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
@@ -30,11 +31,36 @@ from .prompts import render_prompt
 from .types import GRPOBatch, GRPOResult
 
 
+FINAL_SUMMARY_KEYS = (
+    "train/loss",
+    "reward/mean",
+    "policy/entropy",
+    "policy/kl_sample_train",
+    "optim/lr",
+    "optim/grad_norm",
+    "time/step",
+)
+
+
 def _is_per_prompt_metric(name: str) -> bool:
     """Return whether a metric belongs to one prompt rather than the batch."""
 
     _, separator, metric_name = name.partition("/")
     return bool(separator) and metric_name.startswith(("reward/", "advantage/"))
+
+
+def _swanlab_metric_name(name: str) -> str:
+    """Map trainer metrics to the namespaces exposed in SwanLab."""
+
+    if name.startswith("train/"):
+        return "trainer/" + name.removeprefix("train/")
+    return name
+
+
+def _is_checkpoint_metric(name: str) -> bool:
+    """Return whether a metric describes checkpoint handling."""
+
+    return name == "time/checkpoint" or name.startswith("checkpoint/")
 
 
 def _tensor_values(value: Any) -> list[float] | None:
@@ -173,6 +199,8 @@ class GRPOTrainer:
         return swanlab.init(
             mode=self.config.mode,
             project=self.config.project,
+            workspace=self.config.workspace,
+            tags=self.config.tags,
             name=self.config.run_name or f"{model_slug}-grpo",
             log_dir=self.config.log_dir,
             config={
@@ -185,20 +213,106 @@ class GRPOTrainer:
     def _log_swanlab(self, result: GRPOResult) -> None:
         if self._swanlab_run is None:
             return
-        payload: dict[str, float] = {
-            str(key): float(value)
-            for key, value in result.metrics.items()
-            if not _is_per_prompt_metric(str(key)) and math.isfinite(float(value))
-        }
+        payload: dict[str, float] = {}
+        for key, value in result.metrics.items():
+            name = str(key)
+            if _is_per_prompt_metric(name) or _is_checkpoint_metric(name):
+                continue
+            number = float(value)
+            if math.isfinite(number):
+                payload[_swanlab_metric_name(name)] = number
         payload.update(
             {
                 "trainer/step": float(result.step),
                 "trainer/num_datums": float(result.num_datums),
                 "trainer/skipped_groups": float(result.skipped_groups),
-                "checkpoint/saved": float(result.checkpoint_path is not None),
             }
         )
         self._swanlab_run.log(payload, step=result.step)
+
+    def _log_final_checkpoint(self) -> None:
+        if self._swanlab_run is not None and self.state.checkpoint_path is not None:
+            self._swanlab_run.log_text(
+                key="checkpoint/path",
+                data=self.state.checkpoint_path,
+                step=self.state.global_step,
+            )
+
+    def _report_final_state(self) -> None:
+        summary = {
+            key: self.state.metrics[key]
+            for key in FINAL_SUMMARY_KEYS
+            if key in self.state.metrics
+        }
+        lines = [
+            f"Training finished at step {self.state.global_step}",
+            "Final metrics: " + json.dumps(summary, sort_keys=True),
+        ]
+        if self.state.checkpoint_path is not None:
+            lines.append(f"Latest checkpoint: {self.state.checkpoint_path}")
+
+        for line in lines:
+            tqdm.write(line)
+        if self._swanlab_run is not None:
+            self._swanlab_run.log_text(
+                key="trainer/final_summary",
+                data="\n".join(lines),
+                step=self.state.global_step,
+            )
+
+    @staticmethod
+    def _sample_text(response: Any, decode: Callable[[list[int]], str]) -> str:
+        sequences = response.sequences
+        if not sequences:
+            raise ValueError("Final inference returned no sequences.")
+        sequence = sequences[0]
+        return sequence.text if sequence.text is not None else decode(sequence.tokens)
+
+    def _write_final_samples(self, groups: Sequence[GRPOBatch], responses: Sequence[Any]) -> None:
+        texts = []
+        for group, response in zip(groups, responses, strict=True):
+            question = group.row.get("question")
+            title = question if isinstance(question, str) and question else group.prompt
+            texts.append(swanlab.Text(self._sample_text(response, self._decode), caption=title))
+        self._swanlab_run.log_text(key="sample/text", data=texts, step=self.state.global_step)
+
+    def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._swanlab_run is None or not rows:
+            return
+        client = self._new_sampling_client()
+        params = sampling_params(self.config, trio.SamplingParams)
+        groups = self._groups(rows[:4])
+        responses = [
+            call(
+                client,
+                "sample",
+                prompt=group.sampling_prompt,
+                num_samples=1,
+                sampling_params=params,
+            )
+            for group in groups
+        ]
+        self._write_final_samples(groups, responses)
+
+    async def _log_final_samples_async(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._swanlab_run is None or not rows:
+            return
+        client = await self._new_sampling_client_async()
+        params = sampling_params(self.config, trio.SamplingParams)
+        groups = self._groups(rows[:4])
+        responses = await asyncio.gather(
+            *(
+                call_async(
+                    client,
+                    "sample",
+                    prompt=group.sampling_prompt,
+                    num_samples=1,
+                    sampling_params=params,
+                )
+                for group in groups
+            )
+        )
+        self._write_final_samples(groups, responses)
 
     def _finish_swanlab(self, state: str = "success", error: str | None = None) -> None:
         if self._swanlab_run is None:
@@ -365,8 +479,10 @@ class GRPOTrainer:
             if metric in result.metrics
         }
 
-    def _save_state(self) -> str | None:
-        if self.config.save_every == 0 or self.state.global_step % self.config.save_every != 0:
+    def _save_state(self, *, final: bool = False) -> str | None:
+        if self.config.save_every == 0 or (
+            not final and self.state.global_step % self.config.save_every != 0
+        ):
             return None
         result = call(
             self._training_client,
@@ -379,8 +495,10 @@ class GRPOTrainer:
         self.state.checkpoint_path = path
         return path
 
-    async def _save_state_async(self) -> str | None:
-        if self.config.save_every == 0 or self.state.global_step % self.config.save_every != 0:
+    async def _save_state_async(self, *, final: bool = False) -> str | None:
+        if self.config.save_every == 0 or (
+            not final and self.state.global_step % self.config.save_every != 0
+        ):
             return None
         result = await call_async(
             self._training_client,
@@ -491,13 +609,20 @@ class GRPOTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train().")
             iterator = iter(self.train_dataset)
+            last_rows: list[Mapping[str, Any]] = []
             while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
                 rows = list(itertools.islice(iterator, self.config.batch_size))
                 if not rows:
                     break
                 result = self.step(rows)
+                last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
+            if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
+                self._save_state(final=True)
+            self._log_final_checkpoint()
+            self._report_final_state()
+            self._log_final_samples(last_rows)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
             raise
@@ -518,13 +643,20 @@ class GRPOTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
             iterator = iter(self.train_dataset)
+            last_rows: list[Mapping[str, Any]] = []
             while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
                 rows = list(itertools.islice(iterator, self.config.batch_size))
                 if not rows:
                     break
                 result = await self.step_async(rows)
+                last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
+            if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
+                await self._save_state_async(final=True)
+            self._log_final_checkpoint()
+            self._report_final_state()
+            await self._log_final_samples_async(last_rows)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
             raise

@@ -45,6 +45,8 @@ class GRPOConfig:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     mode: str = "disabled"
     project: str = "trio-cookbook-grpo"
+    workspace: str | None = None
+    tags: list[str] | None = None
     run_name: str | None = None
     log_dir: str | None = None
 
@@ -76,6 +78,15 @@ class GRPOConfig:
             raise ValueError("mode must be 'disabled', 'online', 'local', or 'offline'.")
         if not self.project.strip():
             raise ValueError("project must not be empty.")
+        if self.workspace is not None and (
+            not isinstance(self.workspace, str) or not self.workspace.strip()
+        ):
+            raise ValueError("workspace must be a non-empty string when provided.")
+        if self.tags is not None and (
+            not isinstance(self.tags, list)
+            or any(not isinstance(tag, str) or not tag.strip() for tag in self.tags)
+        ):
+            raise ValueError("tags must be a list of non-empty strings when provided.")
         if self.reward_epsilon <= 0 or not math.isfinite(self.reward_epsilon):
             raise ValueError("reward_epsilon must be finite and positive.")
         if not self.prompt_key.strip():

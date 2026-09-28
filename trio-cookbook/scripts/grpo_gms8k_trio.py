@@ -209,6 +209,11 @@ def parse_args() -> argparse.Namespace:
         default="disabled",
     )
     parser.add_argument("--project", default="trio-cookbook-test")
+    parser.add_argument("--workspace", help="SwanLab workspace or organization")
+    parser.add_argument(
+        "--tag", "--tags", dest="tags", action="append", metavar="TAG",
+        help="SwanLab tag; repeat for multiple tags",
+    )
     parser.add_argument("--run-name", default="grpo-trainer-gsm8k")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
@@ -244,6 +249,8 @@ def main() -> None:
         chat_template_kwargs={"enable_thinking": False},
         mode=args.mode,
         project=args.project,
+        workspace=args.workspace,
+        tags=args.tags,
         run_name=args.run_name,
     )
     trainer = GRPOTrainer(
@@ -253,21 +260,7 @@ def main() -> None:
         train_dataset=rows,
         lora_rank=args.lora_rank,
     )
-    state = trainer.train()
-    print(f"Training finished at step {state.global_step}")
-    summary_keys = (
-        "train/loss",
-        "reward/mean",
-        "policy/entropy",
-        "policy/kl_sample_train",
-        "optim/lr",
-        "optim/grad_norm",
-        "time/step",
-    )
-    summary = {key: state.metrics[key] for key in summary_keys if key in state.metrics}
-    print("Final metrics: " + json.dumps(summary, sort_keys=True))
-    if state.checkpoint_path is not None:
-        print(f"Latest checkpoint: {state.checkpoint_path}")
+    trainer.train()
 
 
 if __name__ == "__main__":
