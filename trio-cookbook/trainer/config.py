@@ -42,6 +42,7 @@ class GRPOConfig:
     seed: int | None = None
     prompt_key: str = "messages"
     add_generation_prompt: bool = True
+    stop: bool = True
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     mode: str = "disabled"
     project: str = "trio-cookbook-grpo"
@@ -91,6 +92,8 @@ class GRPOConfig:
             raise ValueError("reward_epsilon must be finite and positive.")
         if not self.prompt_key.strip():
             raise ValueError("prompt_key must not be empty.")
+        if not isinstance(self.stop, bool):
+            raise TypeError("stop must be a boolean.")
         reserved = {"tokenize", "add_generation_prompt"}.intersection(self.chat_template_kwargs)
         if reserved:
             raise ValueError(

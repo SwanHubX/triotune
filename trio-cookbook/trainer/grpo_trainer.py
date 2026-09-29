@@ -280,7 +280,7 @@ class GRPOTrainer:
         if self._swanlab_run is None or not rows:
             return
         client = self._new_sampling_client()
-        params = sampling_params(self.config, trio.SamplingParams)
+        params = sampling_params(self.config, trio.SamplingParams, stop=self._stop_sequences())
         groups = self._groups(rows[:4])
         responses = [
             call(
@@ -298,7 +298,7 @@ class GRPOTrainer:
         if self._swanlab_run is None or not rows:
             return
         client = await self._new_sampling_client_async()
-        params = sampling_params(self.config, trio.SamplingParams)
+        params = sampling_params(self.config, trio.SamplingParams, stop=self._stop_sequences())
         groups = self._groups(rows[:4])
         responses = await asyncio.gather(
             *(
@@ -331,6 +331,17 @@ class GRPOTrainer:
     async def _new_sampling_client_async(self) -> Any:
         return await call_async(self._training_client, "save_weights_and_get_sampling_client")
 
+    def _stop_sequences(self) -> list[str] | None:
+        if not self.config.stop:
+            return None
+        return list(
+            dict.fromkeys(
+                value
+                for value in (getattr(self._tokenizer, "eos_token", None), "<|im_end|>")
+                if isinstance(value, str) and value
+            )
+        )
+
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
         for index, row in enumerate(rows):
@@ -358,11 +369,21 @@ class GRPOTrainer:
 
     def _sample_groups(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
         # 同步生成一批 prompt 的 rollout，也就是为每个 prompt 采样多个回答
-        adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
+        adapter = SamplingAdapter(
+            client,
+            params_factory=trio.SamplingParams,
+            decode=self._decode,
+            stop=self._stop_sequences(),
+        )
         return [adapter.sample(group, self.config) for group in groups]
 
     async def _sample_groups_async(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
-        adapter = SamplingAdapter(client, params_factory=trio.SamplingParams, decode=self._decode)
+        adapter = SamplingAdapter(
+            client,
+            params_factory=trio.SamplingParams,
+            decode=self._decode,
+            stop=self._stop_sequences(),
+        )
         return list(
             await asyncio.gather(
                 *(adapter.sample_async(group, self.config) for group in groups)

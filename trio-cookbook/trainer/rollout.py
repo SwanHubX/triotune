@@ -58,10 +58,11 @@ def parse_sample(raw: Any, *, prompt_tokens: list[int], decode: Callable[[list[i
 
 
 class SamplingAdapter:
-    def __init__(self, client: Any, *, params_factory: Any = None, decode: Callable[[list[int]], str] | None = None):
+    def __init__(self, client: Any, *, params_factory: Any = None, decode: Callable[[list[int]], str] | None = None, stop: list[str] | None = None):
         self.client = client
         self.params_factory = params_factory
         self.decode = decode
+        self.stop = stop
 
     def sample(self, group: GRPOBatch, config: Any) -> GRPOBatch:
         prompt = group.sampling_prompt if group.sampling_prompt is not None else group.prompt
@@ -73,7 +74,7 @@ class SamplingAdapter:
             "sample",
             prompt=prompt,
             num_samples=config.num_generations,
-            sampling_params=sampling_params(config, self.params_factory),
+            sampling_params=sampling_params(config, self.params_factory, stop=self.stop),
         )
         samples = [parse_sample(value, prompt_tokens=group.prompt_tokens, decode=self.decode) for value in _sequence_values(raw)]
         if len(samples) != config.num_generations:
@@ -89,7 +90,7 @@ class SamplingAdapter:
             "sample",
             prompt=group.sampling_prompt if group.sampling_prompt is not None else group.prompt,
             num_samples=config.num_generations,
-            sampling_params=sampling_params(config, self.params_factory),
+            sampling_params=sampling_params(config, self.params_factory, stop=self.stop),
         )
         samples = [parse_sample(value, prompt_tokens=group.prompt_tokens, decode=self.decode) for value in _sequence_values(raw)]
         if len(samples) != config.num_generations:

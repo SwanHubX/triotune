@@ -57,9 +57,30 @@ A 有 48 个 step 产生 `loss_mean`/`policy/kl_sample_train`，52 个 step 因�
 
 ## 结论
 
-1. **算法正确性**：没有证据表明两次运行使用了不同的 GRPO advantage、Datum 对齐或 importance-sampling 公式；reward 平均值差不到 1%。
-2. **主要可见误差**：A 生成更长（均值 +11.31%，1024 截断 step +10），从而 rollout、train 和总 step 时间更高；优先核对 stop 序列及运行时工作区源码。
-3. **训练曲线误差**：A/B 有效更新 step 为 48/39，loss 只在不同 batch 上统计；其差异主要由 rollout 随机性和源码状态不可追溯造成，不能直接归因于 loss 数学。
-4. **固定开销**：框架 reward 适配层约增加 0.35 ms/step；这是真实代码开销，但相对于每 step 20–30 秒的 rollout 不构成总耗时主因。
+1. 关于 `time/reward` 相差如此之大的原因是：牺牲了少量本地 reward 调用性能，换取了 reward 接口的可扩展性、校验能力和统一日志能力。
+
+![](./images/grpo_gms8k1.png)
+
+   - 同时支持同步和异步 reward 函数
+   - 支持多个 reward 函数及 reward_weights 加权
+
+具体表现为：每个 step 都通过 asyncio.run() 创建/关闭事件循环->构造 prompts、completions、completion_ids 和其他数据列->经过通用 reward 函数适配层，再进行结果校验、聚合和分组
+
+这些抽象确实产生了额外开销；但在复杂或异步 reward 场景下是必要的。
+
+2. 本次实验A有随机种子 `seed` 的限制，因此训练会话初始化以及推理采样的时候都是固定的，但是B没有设置，不过从结果上来看差距不大，因此认为框架可行
+
+3. `rollout/completion_length_mean`差的稍微有点多
+
+![](./images/grpo_gms8k2.png)
+
+原因是生成停止条件不同，其次是采样随机性差异在训练过程中累积放大。
+
+A没有设置stop，completion 可能继续生成到更长，更多序列达到 max_tokens=1024；
+
+B现通过 get_stop_sequences() 传入了 eos_token 和 <|im_end|>，遇到结束标记会更早截断。
+
+**因此需要调整输入参数，让A具备提前截断的能力。**
+
 
 本次仅更新本文件，没有修改训练代码、配置或日志文件。
