@@ -51,6 +51,7 @@ class ScriptArgumentsTests(unittest.TestCase):
         self.assertEqual(settings["model"]["name"], "Qwen/Qwen3.5-9B")
         self.assertEqual(settings["data"]["file"], "data/gsm8k_train.jsonl")
         self.assertEqual(settings["grpo"]["max_steps"], 100)
+        self.assertIs(settings["grpo"]["stop"], True)
         self.assertEqual(settings["grpo"]["chat_template_kwargs"], {"enable_thinking": False})
 
     def test_swanlab_options_default_to_none(self) -> None:

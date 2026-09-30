@@ -14,28 +14,26 @@
 {"messages":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
 ```
 
-- `messages`（必填）：非空列表。推荐使用对话消息，每条消息含字符串类型的 `role`
-  和 `content`；也可以使用非空的整数 token ID 列表。此脚本的读取校验不接受
-  裸字符串 `messages`。
+- `messages`（必填）：字符串、非空的整数 token ID 列表，或非空的对话消息列表；
+  对话消息的 `role` 和 `content` 应为字符串。
 - `answer`（必填）：字符串形式的参考数值答案，例如 `"42"`。奖励函数提取生成文本
   中最后一个 `\boxed{}` 的内容，去掉千位逗号、首尾空白和末尾句点后比较；提示词
   应要求模型用 `\boxed{}` 作答。
 - `question`（可选）：原始问题文本，用作 SwanLab 最终推理样例的标题；省略时使用
   渲染后的提示词。其他字段可保留在数据行中。
 
-已存在的 `--data-file` 会直接读取；文件不存在或指定 `--rebuild-data` 时，脚本会
-下载 `openai/gsm8k` 并在该路径生成数据，因此不要对自定义文件使用
-`--rebuild-data`。可先检查读取的记录数：
+启动脚本固定传入 `--rebuild-data`，每次都会从 `openai/gsm8k` 重新生成数据并
+覆盖目标文件。使用自定义数据时，直接运行训练入口，不要传 `--rebuild-data`：
 
 ```bash
-bash trio-cookbook/scripts/train_grpo_gms8k.sh \
+uv run python trio-cookbook/recipes/grpo_gms8k_trio.py \
+  --config trio-cookbook/configs/grpo_gms8k.toml \
   --data-file path/to/train.jsonl --prepare-only
 ```
 
 `--prepare-only` 检查外层字段类型；对话消息或 token 列表的具体内容在训练时进一步
 校验。
-已有的旧格式数据文件需要将 `prompt` 字段改名为 `messages`；默认生成文件可用
-`--rebuild-data` 重新生成。
+已有的旧格式自定义数据文件需要将 `prompt` 字段改名为 `messages`。
 
 ## gms8k 案例
 
@@ -46,7 +44,7 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
 
 编辑 [grpo_gms8k.toml](../configs/grpo_gms8k.toml) 配置模型、数据路径、GRPO 超参数
 和 SwanLab。默认配置运行 100 个训练 step，每个 batch 包含 4 个问题，每个问题
-采样 8 个 completion，SwanLab 日志关闭。从仓库根目录运行：
+采样 8 个 completion，SwanLab 日志为 `online` 模式。从仓库根目录运行：
 
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh
@@ -70,10 +68,11 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
   --mode online --workspace my-organization --tag grpo --tag gsm8k
 ```
 
-启用 SwanLab 后，训练结束时会以文本记录最终 checkpoint 地址，并展示最后
-一批中最多 4 个问题的最终模型推理结果。最终步数、核心指标和 checkpoint
-地址会在 SwanLab 结束前打印到终端，同时记录为 `trainer/final_summary` 文本。
-需要重新下载并生成数据时，追加 `--rebuild-data`。查看脚本支持的覆盖参数：
+`grpo.output_dir = true` 时，训练结束后会将最终 checkpoint 地址记录为
+SwanLab 的 `checkpoint/path` 文本；默认值为 `false`。启用 SwanLab 后，还会
+展示最后一批中最多 4 个问题的最终模型推理结果。最终步数和核心指标会在
+SwanLab 结束前打印到终端，并记录为 `trainer/final_summary` 文本。
+启动脚本每次都会重新生成数据。查看脚本支持的覆盖参数：
 
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --help

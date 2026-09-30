@@ -111,8 +111,11 @@ def sdk_object(name: str, values: dict[str, Any], factory: Any = None) -> Any:
     return values
 
 
-def sampling_params(config: Any, factory: Any = None) -> Any:
-    return sdk_object("SamplingParams", config.sampling_params, factory)
+def sampling_params(config: Any, factory: Any = None, *, stop: Any = None) -> Any:
+    values = dict(config.sampling_params)
+    if stop is not None:
+        values["stop"] = stop
+    return sdk_object("SamplingParams", values, factory)
 
 
 def optimizer_params(config: Any, factory: Any = None) -> Any:

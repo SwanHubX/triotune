@@ -1,91 +1,45 @@
-# PyTRIO GRPO trainer
+# PyTRIO GRPO 训练器
 
-This directory is the client-side, text-generation-only GRPO design requested
-for the cookbook.  It deliberately does not import or modify `trl` or the
-original Tinker sources.
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO 训练器和 GSM8K 示例。源码目录名为
+`trio-cookbook`，Python 导入名为 `trio_cookbook`。
 
-The modules follow the useful boundaries from `trl/trl/trainer/grpo_trainer.py`
-while replacing local-model assumptions with PyTRIO public clients:
+## 目录结构
 
-| Module | Responsibility |
-| --- | --- |
-| `config.py` | GRPO-specific sampling/optimizer settings |
-| `rollout.py` | `SamplingClient.sample`, sequence/logprob validation |
-| `rewards.py` | TRL-compatible callable rewards; no local reward model loading |
-| `advantages.py` | group-relative GRPO advantage |
-| `datum.py` | one-token shift and `Datum` validation/materialization |
-| `utils/client.py` | algorithm-independent sync/async PyTRIO future and SDK-object adaptation |
-| `grpo_trainer.py` | synchronous/asynchronous training state machine |
-
-Example:
-
-```python
-from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
-
-trainer = GRPOTrainer(
-    model_name="Qwen/Qwen3.5-4B",
-    reward_funcs=my_reward,
-    args=GRPOConfig(num_generations=4, max_steps=100, save_every=10),
-    train_dataset=rows,                     # rows contain a `messages` field
-)
-trainer.train()
+```text
+trio-cookbook/
+├── configs/          # 训练参数；grpo_gms8k.toml 是 GSM8K 默认配置
+├── recipes/          # 训练入口；框架版 grpo_gms8k_trio.py 和独立版 grpo_gsm8k.py
+├── scripts/          # 启动脚本 train_grpo_gms8k.sh 及使用说明
+├── trainer/          # GRPO 核心：输入、采样、奖励、优势、Datum 和训练循环
+└── utils/            # PyTRIO 客户端及同步/异步适配工具
 ```
 
-When `save_every` is greater than zero, the trainer calls PyTRIO
-`TrainingClient.save_state()` after every configured number of completed steps.
-It also saves the final step if training ends between intervals. The returned
-checkpoint URI is available as `TrainerState.checkpoint_path` and contains
-both model weights and optimizer state.
+训练器模块的详细职责见 [trainer/README.md](trainer/README.md)；脚本参数及独立版示例见
+[scripts/README.md](scripts/README.md)。
 
-SwanLab logging is disabled by default. Enable it through `GRPOConfig` when
-experiment tracking is needed:
+## 数据格式
 
-```python
-args = GRPOConfig(
-    num_generations=4,
-    max_steps=100,
-    mode="online",  # or "local" / "offline"
-    project="my-grpo-project",
-    workspace="my-organization",  # None (default) uses SwanLab's default
-    tags=["grpo", "gsm8k"],       # None (default) uses SwanLab's default
-)
+GSM8K 训练入口读取 JSONL，每行至少包含 `messages` 和字符串 `answer`：
+
+```json
+{"messages":[{"role":"user","content":"What is 2 + 2?"}],"answer":"4"}
 ```
 
-The trainer logs aggregate reward, learning rate, loss, sampled-policy entropy,
-sample-to-train KL, timing, datum counts, skipped groups, and remote gradient
-norm when PyTRIO provides it. A terminal progress bar shows
-the core metrics for synchronous and asynchronous training.
-At the end of a SwanLab run, `checkpoint/path` records the final saved URI as
-text when checkpointing is enabled. `sample/text` shows one inference result
-for each of up to four prompts from the last training batch, using the final
-model weights. No checkpoint archive download is needed for this inference.
-The final step, selected metrics, and checkpoint URI are printed to the
-terminal and recorded together as `trainer/final_summary` before the run ends.
+`messages` 也可以是文本或非空整数 token 列表。直接使用 `GRPOTrainer` 时，可通过
+`GRPOConfig(prompt_key="prompt")` 读取旧数据的 `prompt` 字段；GSM8K 训练入口固定
+校验 `messages`，旧文件需改字段名或用 `--rebuild-data` 重新生成。
 
-Dataset rows are text-only. The `messages` value may be a string, a non-empty
-integer token list, or chat messages such as:
+## 启动命令
 
-```python
-{"messages": [
-    {"role": "system", "content": "Answer concisely."},
-    {"role": "user", "content": "What is 2 + 2?"},
-]}
+在仓库根目录运行（启动脚本使用 `uv`）：
+
+```bash
+# 准备并检查数据，不启动训练
+bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
+
+# 按 configs/grpo_gms8k.toml 启动训练
+bash trio-cookbook/scripts/train_grpo_gms8k.sh
 ```
 
-Chat messages are passed through the tokenizer's `apply_chat_template` with a
-generation prompt before sampling. Message content must be a string because
-this first trainer accepts text inputs only.
-
-The default dataset key is `messages`. Use `GRPOConfig(prompt_key="prompt")`
-when reading an existing dataset with a `prompt` column.
-
-The source directory keeps the repository's historical `trio-cookbook` name,
-while the build configuration installs it under the valid Python package name
-`trio_cookbook`.
-
-The GSM8K recipe uses a [TOML configuration](configs/grpo_gms8k.toml) and a
-shell launcher. From the repository root, run
-`bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only` to inspect the
-data before training; omit `--prepare-only` to start the configured run.
-The standalone [GSM8K GRPO recipe](recipes/grpo_gsm8k.py) can use the same
-prepared JSONL for metric comparisons; see the [script guide](scripts/README.md).
+启动脚本固定传入 `--rebuild-data`，每次都会重新生成并覆盖配置中的数据文件。
+使用自定义数据时，请参考 [脚本说明](scripts/README.md) 直接运行训练入口。

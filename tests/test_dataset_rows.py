@@ -6,6 +6,8 @@ from trio_cookbook.trainer import GRPOConfig, GRPOTrainer, TrainerState
 
 
 class _Tokenizer:
+    eos_token = "<|endoftext|>"
+
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         return [len(text)]
 
@@ -50,6 +52,12 @@ class DatasetRowTests(unittest.TestCase):
         groups = self.trainer._groups([{"prompt": "question"}])
 
         self.assertEqual(groups[0].prompt, "question")
+
+    def test_stop_sequences_follow_config(self) -> None:
+        self.assertEqual(self.trainer._stop_sequences(), ["<|endoftext|>", "<|im_end|>"])
+
+        self.trainer.config = GRPOConfig(stop=False)
+        self.assertIsNone(self.trainer._stop_sequences())
 
 
 if __name__ == "__main__":
