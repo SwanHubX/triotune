@@ -134,16 +134,15 @@ class SwanLabLoggingTests(unittest.TestCase):
         self.assertEqual(run.payload["time/step"], 3.0)
         self.assertEqual(run.step, 3)
 
-    def test_final_checkpoint_prints_without_swanlab(self) -> None:
+    def test_final_checkpoint_is_logged_to_swanlab(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
-        trainer._swanlab_run = None
 
         with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             trainer._log_final_checkpoint()
 
-        terminal.assert_called_once_with("Latest checkpoint: trio://final-checkpoint")
-        self.assertNotIn("checkpoint/path", run.texts)
+        terminal.assert_not_called()
+        self.assertEqual(run.texts["checkpoint/path"], ("trio://final-checkpoint", 1))
 
     def test_final_checkpoint_respects_output_dir_and_missing_path(self) -> None:
         run, sampler = _Run(), _Sampler()
@@ -200,17 +199,14 @@ class SwanLabLoggingTests(unittest.TestCase):
             state = trainer.train()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
-        self.assertNotIn("checkpoint/path", run.texts)
+        self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
         texts, _ = run.texts["sample/text"]
         self.assertEqual(texts[0].caption, "Only question")
         summary, step = run.texts["trainer/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn("Training finished at step 1", summary)
         self.assertIn('"train/loss": 0.25', summary)
-        self.assertEqual(
-            [call.args[0] for call in terminal.call_args_list],
-            [*summary.splitlines(), "Latest checkpoint: trio://grpo-step-00000001"],
-        )
+        self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
         self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
 
 
@@ -250,15 +246,12 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
             state = await trainer.train_async()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
-        self.assertNotIn("checkpoint/path", run.texts)
+        self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
         self.assertIn("sample/text", run.texts)
         summary, step = run.texts["trainer/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn('"train/loss": 0.25', summary)
-        self.assertEqual(
-            [call.args[0] for call in terminal.call_args_list],
-            [*summary.splitlines(), "Latest checkpoint: trio://grpo-step-00000001"],
-        )
+        self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
         self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
 
 

@@ -68,10 +68,10 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
   --mode online --workspace my-organization --tag grpo --tag gsm8k
 ```
 
-`grpo.output_dir = true` 时，训练结束后会在终端打印最终 checkpoint 地址；
-默认值为 `false`。启用 SwanLab 后，还会展示最后一批中最多 4 个问题的最终
-模型推理结果。最终步数和核心指标会在 SwanLab 结束前打印到终端，
-并记录为 `trainer/final_summary` 文本。
+`grpo.output_dir = true` 时，训练结束后会将最终 checkpoint 地址记录为
+SwanLab 的 `checkpoint/path` 文本；默认值为 `false`。启用 SwanLab 后，还会
+展示最后一批中最多 4 个问题的最终模型推理结果。最终步数和核心指标会在
+SwanLab 结束前打印到终端，并记录为 `trainer/final_summary` 文本。
 启动脚本每次都会重新生成数据。查看脚本支持的覆盖参数：
 
 ```bash
