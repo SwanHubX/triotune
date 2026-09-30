@@ -100,6 +100,13 @@ COMPARISON_METRIC_KEYS = (
     "trainer/skipped_groups",
     "optim/lr",
     "optim/grad_norm",
+    "time/rollout",
+    "time/reward",
+    "time/train",
+    "time/step",
+    "loss_sum",
+    "loss_mean",
+    "token_count",
 )
 
 
@@ -158,6 +165,15 @@ class RewardBreakdown:
             "reward/block/mean": self.block,
             "reward/exact/mean": self.exact,
         }
+
+
+@dataclass(slots=True)
+class UnscoredRolloutSample:
+    """一条尚未计算数独奖励的采样回答。"""
+
+    tokens: list[int]
+    logprobs: list[float]
+    text: str
 
 
 @dataclass(slots=True)
@@ -464,16 +480,14 @@ def get_stop_sequences(tokenizer: Any) -> list[str]:
     return list(dict.fromkeys(value for value in candidates if isinstance(value, str) and value))
 
 
-def run_rollout_group(
+def sample_rollout_group(
     sampling_client: Any,
     tokenizer: Any,
     prompt_tokens: list[int],
-    question: str,
-    ground_truth: str,
     sampling_params: trio.SamplingParams,
     group_size: int,
-) -> list[RolloutSample]:
-    """为一道题采样多个回答、评分并计算组内中心化 advantage。"""
+) -> list[UnscoredRolloutSample]:
+    """为一道题采样一组尚未评分的回答。"""
 
     result = sampling_client.sample(
         prompt=trio.ModelInput.from_ints(prompt_tokens),
@@ -483,7 +497,7 @@ def run_rollout_group(
     ).result()
     if len(result.sequences) != group_size:
         raise ValueError(f"Expected {group_size} samples, got {len(result.sequences)}")
-    raw_samples: list[tuple[list[int], list[float], str, RewardBreakdown]] = []
+    samples: list[UnscoredRolloutSample] = []
     for sequence in result.sequences:
         tokens = list(sequence.tokens)
         logprobs = [float(value) for value in sequence.logprobs]
@@ -496,22 +510,56 @@ def run_rollout_group(
         text = sequence.text
         if text is None:
             text = tokenizer.decode(tokens, skip_special_tokens=True)
-        rewards = score_sudoku_response(text, question, ground_truth)
-        raw_samples.append((tokens, logprobs, text, rewards))
+        samples.append(UnscoredRolloutSample(tokens, logprobs, text))
 
-    if len(raw_samples) < 2:
+    return samples
+
+
+def score_rollout_group(
+    samples: list[UnscoredRolloutSample],
+    question: str,
+    ground_truth: str,
+) -> list[RolloutSample]:
+    """计算一组数独奖励及组内中心化 advantage。"""
+
+    if len(samples) < 2:
         raise ValueError("GRPO rollout group must contain at least two samples")
-    mean_reward = sum(item[3].total for item in raw_samples) / len(raw_samples)
+    scored = [
+        (sample, score_sudoku_response(sample.text, question, ground_truth))
+        for sample in samples
+    ]
+    mean_reward = sum(rewards.total for _, rewards in scored) / len(scored)
     return [
         RolloutSample(
-            tokens=tokens,
-            logprobs=logprobs,
-            text=text,
+            tokens=sample.tokens,
+            logprobs=sample.logprobs,
+            text=sample.text,
             rewards=rewards,
             advantage=rewards.total - mean_reward,
         )
-        for tokens, logprobs, text, rewards in raw_samples
+        for sample, rewards in scored
     ]
+
+
+def run_rollout_group(
+    sampling_client: Any,
+    tokenizer: Any,
+    prompt_tokens: list[int],
+    question: str,
+    ground_truth: str,
+    sampling_params: trio.SamplingParams,
+    group_size: int,
+) -> list[RolloutSample]:
+    """兼容入口：依次完成一组采样、评分和 advantage 计算。"""
+
+    samples = sample_rollout_group(
+        sampling_client,
+        tokenizer,
+        prompt_tokens,
+        sampling_params,
+        group_size,
+    )
+    return score_rollout_group(samples, question, ground_truth)
 
 
 def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Datum:
@@ -721,24 +769,30 @@ def main(config: GRPOConfig) -> None:
     try:
         for step in range(effective_steps):
             batch = pick_batch(train_data, step, config.batch_size)
-            sampling_client = training_client.save_weights_and_get_sampling_client()
-            datums: list[trio.Datum] = []
-            step_samples: list[RolloutSample] = []
-            completion_lengths: list[int] = []
-            degenerate_groups = 0
+            step_started = time.perf_counter()
+            prepared = [
+                (row, build_prompt(tokenizer, row["question"]))
+                for row in batch
+            ]
 
-            for row in tqdm(batch, desc=f"GRPO step {step + 1}", unit="prompt"):
-                prompt_tokens = build_prompt(tokenizer, row["question"])
-                samples = run_rollout_group(
+            rollout_started = time.perf_counter()
+            sampling_client = training_client.save_weights_and_get_sampling_client()
+            unscored_groups: list[list[UnscoredRolloutSample]] = []
+            completion_lengths: list[int] = []
+
+            for row, prompt_tokens in tqdm(
+                prepared,
+                desc=f"GRPO step {step + 1}",
+                unit="prompt",
+            ):
+                samples = sample_rollout_group(
                     sampling_client=sampling_client,
                     tokenizer=tokenizer,
                     prompt_tokens=prompt_tokens,
-                    question=row["question"],
-                    ground_truth=row["answer"],
                     sampling_params=sampling_params,
                     group_size=config.group_size,
                 )
-                step_samples.extend(samples)
+                unscored_groups.append(samples)
                 completion_lengths.extend(len(sample.tokens) for sample in samples)
                 if config.print_samples:
                     tqdm.write(
@@ -749,6 +803,21 @@ def main(config: GRPOConfig) -> None:
                         + f"\n数独题目：\n{format_question(row['question'])}"
                         + f"\n模型的第一个回答：\n{samples[0].text}"
                     )
+            rollout_time = time.perf_counter() - rollout_started
+
+            reward_started = time.perf_counter()
+            scored_groups = [
+                score_rollout_group(samples, row["question"], row["answer"])
+                for samples, (row, _) in zip(unscored_groups, prepared, strict=True)
+            ]
+            step_samples = [sample for samples in scored_groups for sample in samples]
+            reward_metrics = mean_reward_metrics(step_samples)
+            reward_time = time.perf_counter() - reward_started
+
+            train_started = time.perf_counter()
+            datums: list[trio.Datum] = []
+            degenerate_groups = 0
+            for samples, (_, prompt_tokens) in zip(scored_groups, prepared, strict=True):
                 if all(sample.advantage == 0.0 for sample in samples):
                     degenerate_groups += 1
                     continue
@@ -762,7 +831,6 @@ def main(config: GRPOConfig) -> None:
                 adam_params=adam_params,
             )
             loss_metrics = numeric_metrics(raw_loss_metrics)
-            reward_metrics = mean_reward_metrics(step_samples)
             rewards = [sample.reward for sample in step_samples]
             mean_reward = sum(rewards) / len(rewards)
             reward_std = math.sqrt(
@@ -798,6 +866,14 @@ def main(config: GRPOConfig) -> None:
                 if grad_norm_key in loss_metrics:
                     metrics["optim/grad_norm"] = float(loss_metrics[grad_norm_key])
                     break
+            metrics.update(
+                {
+                    "time/rollout": rollout_time,
+                    "time/reward": reward_time,
+                    "time/train": time.perf_counter() - train_started,
+                    "time/step": time.perf_counter() - step_started,
+                }
+            )
             if swanlab_run is not None:
                 swanlab_run.log(
                     {key: metrics[key] for key in COMPARISON_METRIC_KEYS if key in metrics}

@@ -83,4 +83,28 @@ B现通过 get_stop_sequences() 传入了 eos_token 和 <|im_end|>，遇到结�
 **因此需要调整输入参数，让A具备提前截断的能力。**
 
 
-本次仅更新本文件，没有修改训练代码、配置或日志文件。
+
+## 4×4 数独实验对比
+
+数独实验同样读取 SwanLab 0.10.1 的本地记录，并选择最近完成的两次 100-step 运行：
+
+| 运行 | 运行时间/ID | 入口 | 关键配置 |
+| --- | --- | --- | --- |
+| A（框架 trainer） | `run-20260930_152543-xdz9w1bd` | `recipes/grpo_sudoku_trio.py` | Qwen3.5-4B、LoRA 8、batch=2、group=6、max=1648、lr=3e-5、seed=42 |
+| B（独立同步脚本） | `run-20260930_134102-atv548d4` | `recipes/grpo_sudoku.py` | 与 A 相同 |
+
+两次运行都使用 simple 难度的 518 条训练数据和 `importance_sampling`。A 的 metadata 记录 commit `6dd4453`，B 记录 `6109d77`；B 运行时数独 recipe 尚未提交，因此本节用于比较实际训练行为，不能作为两个 commit 严格复现的证明。
+
+| 指标 | A | B | A−B |
+| --- | ---: | ---: | ---: |
+| `reward/mean` | 2.950858 | 2.953620 | −0.002762 |
+| `reward/exact/mean` | 82.08% | 83.92% | −1.83 pp |
+| `reward/std` | 0.079248 | 0.063639 | +0.015609 |
+| `rollout/completion_length_mean` | 76.146 | 72.156 | +3.990 token |
+| `rollout/degenerate_fraction` | 76.0% | 82.0% | −6.0 pp |
+| `trainer/num_datums` | 2.88 | 2.16 | +0.72 |
+| 有 `trainer/loss` 的 step 数 | 42 | 30 | +12 |
+| `trainer/loss`（有值 step） | 0.165072 | 0.203661 | −0.038589 |
+| `policy/kl_sample_train`（有值 step） | 0.00025311 | 0.00018280 | +0.00007031 |
+
+两边平均 reward 都达到满分 3.0 的 98% 以上，均值只差约 0.09%，说明框架版与独立版的 prompt、奖励和 GRPO 更新路径整体一致。A 的退化组更少，因此产生了更多有效 Datum 和 optimizer step；相应的 loss、KL 差异主要来自实际采样回答不同，不能解释为同一批数据上的公式误差。

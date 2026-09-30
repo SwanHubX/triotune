@@ -93,6 +93,13 @@ COMPARISON_METRICS = {
     "trainer/tokens": "train/tokens",
     "optim/lr": "optim/lr",
     "optim/grad_norm": "optim/grad_norm",
+    "time/rollout": "time/rollout",
+    "time/reward": "time/reward",
+    "time/train": "time/train",
+    "time/step": "time/step",
+    "loss_sum": "loss_sum",
+    "loss_mean": "loss_mean",
+    "token_count": "token_count",
 }
 
 
