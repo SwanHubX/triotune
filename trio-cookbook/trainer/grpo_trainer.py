@@ -232,16 +232,15 @@ class GRPOTrainer:
 
     def _log_final_checkpoint(self) -> None:
         if (
-            not self.config.output_dir
-            or self._swanlab_run is None
-            or self.state.checkpoint_path is None
+            self.config.output_dir
+            and self._swanlab_run is not None
+            and self.state.checkpoint_path is not None
         ):
-            return
-        self._swanlab_run.log_text(
-            key="checkpoint/path",
-            data=self.state.checkpoint_path,
-            step=self.state.global_step,
-        )
+            self._swanlab_run.log_text(
+                key="checkpoint/path",
+                data=self.state.checkpoint_path,
+                step=self.state.global_step,
+            )
 
     def _report_final_state(self) -> None:
         summary = {
