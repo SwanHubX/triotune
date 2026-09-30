@@ -42,7 +42,7 @@ class _Sampler:
 def _final_trainer(run: _Run, sampler: _Sampler) -> GRPOTrainer:
     trainer = GRPOTrainer.__new__(GRPOTrainer)
     trainer._swanlab_run = run
-    trainer.config = GRPOConfig(max_steps=1, batch_size=5)
+    trainer.config = GRPOConfig(max_steps=1, batch_size=5, output_dir=True)
     trainer.state = TrainerState(global_step=1, checkpoint_path="trio://final-checkpoint")
     trainer._tokenizer = SimpleNamespace(encode=lambda text, **_: [1])
     trainer._decode = lambda tokens: "decoded answer"
@@ -85,6 +85,8 @@ class SwanLabLoggingTests(unittest.TestCase):
             GRPOConfig(tags=["grpo", ""])
         with self.assertRaisesRegex(ValueError, "tags"):
             GRPOConfig(tags="grpo")
+        with self.assertRaisesRegex(TypeError, "output_dir"):
+            GRPOConfig(output_dir="checkpoint")
 
     def test_logs_batch_metrics_without_per_prompt_metrics(self) -> None:
         run = _Run()
@@ -132,15 +134,37 @@ class SwanLabLoggingTests(unittest.TestCase):
         self.assertEqual(run.payload["time/step"], 3.0)
         self.assertEqual(run.step, 3)
 
-    def test_final_checkpoint_and_inference_are_logged_as_text(self) -> None:
+    def test_final_checkpoint_prints_without_swanlab(self) -> None:
+        run, sampler = _Run(), _Sampler()
+        trainer = _final_trainer(run, sampler)
+        trainer._swanlab_run = None
+
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
+            trainer._log_final_checkpoint()
+
+        terminal.assert_called_once_with("Latest checkpoint: trio://final-checkpoint")
+        self.assertNotIn("checkpoint/path", run.texts)
+
+    def test_final_checkpoint_respects_output_dir_and_missing_path(self) -> None:
+        run, sampler = _Run(), _Sampler()
+        trainer = _final_trainer(run, sampler)
+
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
+            trainer.config = GRPOConfig(output_dir=False)
+            trainer._log_final_checkpoint()
+            trainer.config = GRPOConfig(output_dir=True)
+            trainer.state.checkpoint_path = None
+            trainer._log_final_checkpoint()
+
+        terminal.assert_not_called()
+
+    def test_final_inference_is_logged_as_text(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
         rows = [{"messages": f"Prompt {i}", "question": f"Question {i}"} for i in range(5)]
 
-        trainer._log_final_checkpoint()
         trainer._log_final_samples(rows)
 
-        self.assertEqual(run.texts["checkpoint/path"], ("trio://final-checkpoint", 1))
         texts, step = run.texts["sample/text"]
         self.assertEqual(step, 1)
         self.assertEqual(len(texts), 4)
@@ -157,7 +181,7 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_train_saves_and_logs_final_step_after_early_exhaustion(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
-        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3)
+        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3, output_dir=True)
         trainer.state = TrainerState()
         trainer.train_dataset = [{"messages": "Only question"}]
         trainer._training_client = SimpleNamespace(
@@ -176,15 +200,17 @@ class SwanLabLoggingTests(unittest.TestCase):
             state = trainer.train()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
-        self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
+        self.assertNotIn("checkpoint/path", run.texts)
         texts, _ = run.texts["sample/text"]
         self.assertEqual(texts[0].caption, "Only question")
         summary, step = run.texts["trainer/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn("Training finished at step 1", summary)
         self.assertIn('"train/loss": 0.25', summary)
-        self.assertIn("Latest checkpoint: trio://grpo-step-00000001", summary)
-        self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
+        self.assertEqual(
+            [call.args[0] for call in terminal.call_args_list],
+            [*summary.splitlines(), "Latest checkpoint: trio://grpo-step-00000001"],
+        )
         self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
 
 
@@ -203,7 +229,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_train_saves_final_step_after_early_exhaustion(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
-        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3)
+        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3, output_dir=True)
         trainer.state = TrainerState()
         trainer.train_dataset = [{"messages": "Only question"}]
 
@@ -224,12 +250,15 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
             state = await trainer.train_async()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
-        self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
+        self.assertNotIn("checkpoint/path", run.texts)
         self.assertIn("sample/text", run.texts)
         summary, step = run.texts["trainer/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn('"train/loss": 0.25', summary)
-        self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
+        self.assertEqual(
+            [call.args[0] for call in terminal.call_args_list],
+            [*summary.splitlines(), "Latest checkpoint: trio://grpo-step-00000001"],
+        )
         self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
 
 

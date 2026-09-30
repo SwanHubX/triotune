@@ -231,12 +231,8 @@ class GRPOTrainer:
         self._swanlab_run.log(payload, step=result.step)
 
     def _log_final_checkpoint(self) -> None:
-        if self._swanlab_run is not None and self.state.checkpoint_path is not None:
-            self._swanlab_run.log_text(
-                key="checkpoint/path",
-                data=self.state.checkpoint_path,
-                step=self.state.global_step,
-            )
+        if self.config.output_dir and self.state.checkpoint_path is not None:
+            tqdm.write(f"Latest checkpoint: {self.state.checkpoint_path}")
 
     def _report_final_state(self) -> None:
         summary = {
@@ -248,9 +244,6 @@ class GRPOTrainer:
             f"Training finished at step {self.state.global_step}",
             "Final metrics: " + json.dumps(summary, sort_keys=True),
         ]
-        if self.state.checkpoint_path is not None:
-            lines.append(f"Latest checkpoint: {self.state.checkpoint_path}")
-
         for line in lines:
             tqdm.write(line)
         if self._swanlab_run is not None:
@@ -641,8 +634,8 @@ class GRPOTrainer:
                 progress.update(1)
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 self._save_state(final=True)
-            self._log_final_checkpoint()
             self._report_final_state()
+            self._log_final_checkpoint()
             self._log_final_samples(last_rows)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
@@ -675,8 +668,8 @@ class GRPOTrainer:
                 progress.update(1)
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 await self._save_state_async(final=True)
-            self._log_final_checkpoint()
             self._report_final_state()
+            self._log_final_checkpoint()
             await self._log_final_samples_async(last_rows)
         except BaseException as error:
             self._finish_swanlab("crashed", str(error))
