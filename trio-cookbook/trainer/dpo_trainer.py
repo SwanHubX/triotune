@@ -47,7 +47,13 @@ class _Preference:
     rejected: list[int]
 
 
-def _completion_tokens(value: Any, prompt: Any, prompt_tokens: list[int], tokenizer: Any) -> list[int]:
+def _completion_tokens(
+    value: Any,
+    prompt: Any,
+    prompt_tokens: list[int],
+    tokenizer: Any,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
     if isinstance(value, str):
         tokens = tokenizer.encode(value, add_special_tokens=False)
     elif isinstance(value, (list, tuple)) and value and all(
@@ -61,7 +67,12 @@ def _completion_tokens(value: Any, prompt: Any, prompt_tokens: list[int], tokeni
         and all(isinstance(item, Mapping) for item in prompt)
         and all(isinstance(item, Mapping) for item in value)
     ):
-        full = render_prompt(list(prompt) + list(value), tokenizer, add_generation_prompt=False)
+        full = render_prompt(
+            list(prompt) + list(value),
+            tokenizer,
+            add_generation_prompt=False,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         if full.tokens[: len(prompt_tokens)] != prompt_tokens:
             raise ValueError("Chat template does not preserve prompt tokens before the completion.")
         tokens = full.tokens[len(prompt_tokens) :]
@@ -131,7 +142,7 @@ def _loss_fn(reference: Sequence[float], beta: float):
 
 
 class DPOTrainer:
-    """Train a PyTRIO LoRA policy from ``prompt``, ``chosen``, ``rejected`` rows.
+    """Train a PyTRIO LoRA policy from ``messages``, ``chosen``, ``rejected`` rows.
 
     ``model`` and optional ``ref_model`` are PyTRIO base-model IDs. With no
     ``ref_model``, the fixed reference is the unmodified base model. A custom
@@ -184,12 +195,23 @@ class DPOTrainer:
             raise ValueError("A DPO step requires at least one preference pair.")
         pairs = []
         for index, row in enumerate(rows):
-            if not all(key in row for key in ("prompt", "chosen", "rejected")):
-                raise KeyError(f"Dataset row {index} needs prompt, chosen, and rejected.")
-            prompt = render_prompt(row["prompt"], self._tokenizer)
+            prompt_key = self.args.prompt_key
+            if not all(key in row for key in (prompt_key, "chosen", "rejected")):
+                raise KeyError(f"Dataset row {index} needs {prompt_key}, chosen, and rejected.")
+            prompt = render_prompt(
+                row[prompt_key],
+                self._tokenizer,
+                chat_template_kwargs=self.args.chat_template_kwargs,
+            )
             completions = []
             for key in ("chosen", "rejected"):
-                tokens = _completion_tokens(row[key], row["prompt"], prompt.tokens, self._tokenizer)
+                tokens = _completion_tokens(
+                    row[key],
+                    row[prompt_key],
+                    prompt.tokens,
+                    self._tokenizer,
+                    self.args.chat_template_kwargs,
+                )
                 eos = getattr(self._tokenizer, "eos_token_id", None)
                 if self.args.add_eos_token:
                     if not isinstance(eos, Integral) or isinstance(eos, bool):

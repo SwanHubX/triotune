@@ -1,0 +1,31 @@
+[model]
+name = "Qwen/Qwen3.5-4B"
+lora_rank = 32
+
+[data]
+file = "data/hh_rlhf_train.jsonl"
+cache_dir = ".cache/modelscope/hh-rlhf"
+repo = "Anthropic/hh-rlhf"
+revision = "master"
+subsets = ["helpful-base"]
+split = "train"
+sample_size = 1000
+seed = 42
+
+[dpo]
+beta = 0.1
+batch_size = 2
+max_steps = 500
+max_length = 2048
+learning_rate = 1e-5
+seed = 42
+add_eos_token = false
+
+[dpo.chat_template_kwargs]
+enable_thinking = false
+
+[swanlab]
+mode = "local"
+project = "trio-cookbook-dpo"
+run_name = "hh-rlhf"
+tags = ["dpo", "hh-rlhf", "modelscope"]

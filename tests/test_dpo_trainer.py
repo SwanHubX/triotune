@@ -19,9 +19,18 @@ class _Tokenizer:
 
 
 class _ChatTokenizer(_Tokenizer):
+    def __init__(self) -> None:
+        self.thinking_values: list[bool] = []
+
     def apply_chat_template(
-        self, messages: list[dict[str, str]], *, tokenize: bool, add_generation_prompt: bool
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool = True,
     ) -> str | list[int]:
+        self.thinking_values.append(enable_thinking)
         text = "".join(f"{message['role']}:{message['content']};" for message in messages)
         if add_generation_prompt:
             text += "assistant:"
@@ -124,7 +133,7 @@ class DPOTrainerTests(unittest.TestCase):
 
     def test_step_aligns_pair_and_scores_only_completion(self) -> None:
         trainer = self.trainer()
-        result = trainer.step([{"prompt": "P", "chosen": "A", "rejected": "B"}])
+        result = trainer.step([{"messages": "P", "chosen": "A", "rejected": "B"}])
 
         self.assertEqual(result.step, 1)
         self.assertEqual(result.num_pairs, 1)
@@ -138,21 +147,28 @@ class DPOTrainerTests(unittest.TestCase):
         trainer = self.trainer()
         self.service.training.fail_forward = True
         with self.assertRaisesRegex(RuntimeError, "forward failed"):
-            trainer.step([{"prompt": "P", "chosen": "A", "rejected": "B"}])
+            trainer.step([{"messages": "P", "chosen": "A", "rejected": "B"}])
         self.assertEqual(self.service.training.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
 
     def test_rejects_missing_fields_and_overlong_pairs(self) -> None:
         trainer = self.trainer(max_length=2)
         with self.assertRaises(KeyError):
-            trainer.step([{"prompt": "P", "chosen": "A"}])
+            trainer.step([{"messages": "P", "chosen": "A"}])
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
+            trainer.step([{"messages": "P", "chosen": "A", "rejected": "B"}])
+        with self.assertRaisesRegex(KeyError, "messages"):
             trainer.step([{"prompt": "P", "chosen": "A", "rejected": "B"}])
         self.assertEqual(self.service.training.optim_calls, 0)
 
+    def test_legacy_prompt_field_requires_explicit_configuration(self) -> None:
+        trainer = self.trainer(prompt_key="prompt")
+        result = trainer.step([{"prompt": "P", "chosen": "A", "rejected": "B"}])
+        self.assertEqual(result.step, 1)
+
     def test_train_saves_final_checkpoint_and_finishes_swanlab(self) -> None:
         trainer = self.trainer()
-        trainer.train_dataset = [{"prompt": "P", "chosen": "A", "rejected": "B"}]
+        trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
         state = trainer.train()
         self.assertEqual(state.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.service.training.save_calls, 1)
@@ -161,13 +177,13 @@ class DPOTrainerTests(unittest.TestCase):
 
     def test_async_step_uses_async_clients(self) -> None:
         trainer = self.trainer(save_every=1)
-        result = asyncio.run(trainer.step_async([{"prompt": "P", "chosen": "A", "rejected": "B"}]))
+        result = asyncio.run(trainer.step_async([{"messages": "P", "chosen": "A", "rejected": "B"}]))
         self.assertEqual(result.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.service.training.optim_calls, 1)
 
     def test_async_train_saves_final_checkpoint(self) -> None:
         trainer = self.trainer()
-        trainer.train_dataset = [{"prompt": "P", "chosen": "A", "rejected": "B"}]
+        trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
         state = asyncio.run(trainer.train_async())
         self.assertEqual(state.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.run.finished, "success")
@@ -200,15 +216,20 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(datum.loss_fn_inputs["target_tokens"].data, [-100, 12, 13])
 
     def test_chat_completions_follow_rendered_prompt_prefix(self) -> None:
-        trainer = self.trainer()
-        trainer._tokenizer = _ChatTokenizer()
+        trainer = DPOTrainer(
+            "test-model",
+            args=DPOConfig(chat_template_kwargs={"enable_thinking": False}),
+        )
+        tokenizer = _ChatTokenizer()
+        trainer._tokenizer = tokenizer
         pairs = trainer._preferences([{
-            "prompt": [{"role": "user", "content": "P"}],
+            "messages": [{"role": "user", "content": "P"}],
             "chosen": [{"role": "assistant", "content": "A"}],
             "rejected": [{"role": "assistant", "content": "B"}],
         }])
         self.assertEqual(pairs[0].chosen, [ord("A"), ord(";"), 255])
         self.assertEqual(pairs[0].rejected, [ord("B"), ord(";"), 255])
+        self.assertEqual(tokenizer.thinking_values, [False] * 6)
 
 
 if __name__ == "__main__":

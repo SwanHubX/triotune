@@ -67,13 +67,13 @@ trainer.train()
 
 ## DPO 训练
 
-DPO 需要本机安装 PyTorch 以计算成对损失和梯度：`uv sync --extra dpo`。数据集每行包含 `prompt`、`chosen`、`rejected`；`prompt` 支持文本、token ID 或聊天消息，回答支持文本、token ID，或与聊天 prompt 匹配的消息列表。聊天模板生成的完整对话必须以前缀 prompt 的 token 开头，否则会明确报错，避免训练目标错位。
+DPO 需要本机安装 PyTorch 以计算成对损失和梯度：`uv sync --extra dpo`。数据集每行包含 `messages`、`chosen`、`rejected`；`messages` 支持文本、token ID 或聊天消息，回答支持文本、token ID，或与聊天消息匹配的末轮 assistant 消息列表。聊天模板生成的完整对话必须以输入消息的 token 为前缀，否则会明确报错，避免训练目标错位。
 
 ```python
 from trio_cookbook.trainer import DPOConfig, DPOTrainer
 
 rows = [
-    {"prompt": "What is 2 + 2?", "chosen": "4", "rejected": "5"},
+    {"messages": "What is 2 + 2?", "chosen": "4", "rejected": "5"},
 ]
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
@@ -85,3 +85,5 @@ print(state.checkpoint_path)
 ```
 
 默认参考策略是未经 LoRA 更新的同一基座模型；`ref_model` 可指定另一个 PyTRIO 基座模型，但须使用相同 token ID 语义。DPO 每步记录损失、偏好奖励与准确率、优化指标到 SwanLab，并在训练结束保存 PyTRIO checkpoint。`step()`、`step_async()`、`train_async()` 也可单独使用。`max_length` 超限时抛错，不会静默截断偏好数据。
+聊天数据可通过 `DPOConfig(chat_template_kwargs={"enable_thinking": False})` 向 tokenizer 的聊天模板传参。
+旧数据如使用 `prompt` 列，可显式设置 `DPOConfig(prompt_key="prompt")`；默认列名为 `messages`。

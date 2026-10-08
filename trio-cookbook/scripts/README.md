@@ -1,7 +1,25 @@
 # 训练脚本
 
-本目录存放训练启动脚本；训练案例实现位于
-[grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py)。
+## HH-RLHF DPO 案例
+
+从 ModelScope 的 `Anthropic/hh-rlhf` 下载 `helpful-base/train.jsonl.gz` 到
+`.cache/modelscope/hh-rlhf/`，将共同对话前文写入 `messages`、末轮回复写入
+`chosen`/`rejected`，生成 `data/hh_rlhf_train.jsonl` 后交给 PyTRIO `DPOTrainer` 训练。配置见
+[dpo_rlhf.toml](../configs/dpo_rlhf.toml)。
+
+```bash
+bash trio-cookbook/scripts/train_dpo_rlhf.sh --prepare-only
+bash trio-cookbook/scripts/train_dpo_rlhf.sh --steps 10 --batch-size 2
+```
+
+启动脚本使用 `uv run --extra dpo` 安装本地 DPO 损失所需的 PyTorch。
+如只需预处理数据，可直接运行
+`uv run python trio-cookbook/recipes/dpo_rlhf_trio.py --prepare-only`。
+`--rebuild-data` 重新从已缓存的原始文件生成数据，`--force-download` 重新下载原始文件。
+训练会跳过超过 `dpo.max_length` 的样本，并循环使用有效样本直到达到配置的步数。
+
+本目录存放训练启动脚本；以下为
+[grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) 的使用说明。
 命令默认从仓库根目录执行，并使用 `uv` 管理项目环境。启动脚本会切换到仓库根目录，
 再读取 `trio-cookbook/configs/` 下的参数文件。
 
