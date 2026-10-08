@@ -141,6 +141,33 @@ def _loss_fn(reference: Sequence[float], beta: float):
     return loss
 
 
+def _swanlab_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+    """Group DPO charts without changing result metric keys."""
+    names = {
+        "optim/lr": "train/learning_rate",
+        "optim/grad_norm": "train/grad_norm",
+        "rewards/chosen": "reward/reward_chosen",
+        "rewards/rejected": "reward/reward_rejected",
+        "rewards/margins": "reward/reward_margin",
+        "rewards/accuracies": "reward/reward_accuracy",
+        "logps/chosen": "train/logp_chosen",
+        "logps/rejected": "train/logp_rejected",
+        "data/tokens": "train/tokens",
+        "data/total_tokens": "train/total_tokens",
+        "data/total_pairs": "train/total_pairs",
+        "token_count": "train/backend_token_count",
+    }
+    payload = {}
+    for name, value in metrics.items():
+        if name == "grad_norm" and "optim/grad_norm" in metrics:
+            continue
+        key = names.get(name)
+        if key is None:
+            key = name if name.startswith(("train/", "time/")) else f"train/{name.replace('/', '_')}"
+        payload[key] = value
+    return payload
+
+
 class DPOTrainer:
     """Train a PyTRIO LoRA policy from ``messages``, ``chosen``, ``rejected`` rows.
 
@@ -173,10 +200,12 @@ class DPOTrainer:
         self._reference_client = self._service_client.create_sampling_client(base_model=self.ref_model)
         self._tokenizer = self._training_client.get_tokenizer()
         self.state = DPOState()
+        self._total_tokens = 0
+        self._total_pairs = 0
+        self._metric_window: dict[str, tuple[float, int]] = {}
         self._run = None
-        if self.args.mode != "disabled":
+        if self.args.report_to == "swanlab":
             self._run = swanlab.init(
-                mode=self.args.mode,
                 project=self.args.project,
                 workspace=self.args.workspace,
                 tags=self.args.tags,
@@ -268,6 +297,10 @@ class DPOTrainer:
         metrics = {"optim/lr": self.args.learning_rate}
         for response in (forward, optim):
             for name, value in getattr(response, "metrics", {}).items():
+                # PyTRIO's custom backward reports a linear surrogate loss here,
+                # while train/loss is the actual pairwise DPO objective.
+                if name in {"loss_sum", "loss_mean", "scalar/loss_sum", "scalar/loss_mean"}:
+                    continue
                 if isinstance(value, (int, float)) and math.isfinite(value):
                     metrics[name] = float(value)
         if "grad_norm" in metrics:
@@ -279,18 +312,37 @@ class DPOTrainer:
             self._run.finish(state=state, error=error)
             self._run = None
 
+    def _log_swanlab(self, metrics: dict[str, float], count: int) -> None:
+        if self._run is None:
+            return
+        for name, value in {**_swanlab_metrics(metrics), "train/pairs": count}.items():
+            total, samples = self._metric_window.get(name, (0.0, 0))
+            self._metric_window[name] = (total + value, samples + 1)
+        if self.state.global_step % self.args.logging_step == 0:
+            self._flush_swanlab()
+
+    def _flush_swanlab(self) -> None:
+        if self._run is None:
+            return
+        payload = {name: total / samples for name, (total, samples) in self._metric_window.items()}
+        self._metric_window.clear()
+        if payload:
+            self._run.log({**payload, "train/step": self.state.global_step}, step=self.state.global_step)
+
     def _finish_step(self, metrics: dict[str, float], count: int, started: float) -> DPOResult:
         self.state.global_step += 1
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
             self._save_state()
+            metrics["time/save"] = time.perf_counter() - save_started
         metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = count / metrics["time/step"]
+        self._total_tokens += int(metrics["data/tokens"])
+        self._total_pairs += count
         self.state.metrics = metrics
         result = DPOResult(self.state.global_step, metrics, count, self.state.checkpoint_path)
-        if self._run is not None:
-            self._run.log(
-                {**metrics, "trainer/step": self.state.global_step, "trainer/num_pairs": count},
-                step=self.state.global_step,
-            )
+        self._log_swanlab(metrics, count)
         return result
 
     def _save_state(self) -> str:
@@ -315,42 +367,67 @@ class DPOTrainer:
         started = time.perf_counter()
         pairs = self._preferences(rows)
         datums = self._datums(pairs)
+        prepared = time.perf_counter()
         reference = self._reference_scores(pairs)
+        referenced = time.perf_counter()
         forward = call(
             self._training_client,
             "forward_backward_custom",
             datums,
             _loss_fn(reference, self.args.beta),
         )
+        forwarded = time.perf_counter()
         optim = call(self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams))
-        return self._finish_step(self._metrics(forward, optim), len(pairs), started)
+        optimized = time.perf_counter()
+        metrics = self._metrics(forward, optim)
+        metrics.update({
+            "data/tokens": sum(datum.model_input.length for datum in datums),
+            "time/prepare": prepared - started,
+            "time/reference": referenced - prepared,
+            "time/forward_backward": forwarded - referenced,
+            "time/optim": optimized - forwarded,
+        })
+        return self._finish_step(metrics, len(pairs), started)
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> DPOResult:
         started = time.perf_counter()
         pairs = self._preferences(rows)
         datums = self._datums(pairs)
+        prepared = time.perf_counter()
         reference = await self._reference_scores_async(pairs)
+        referenced = time.perf_counter()
         forward = await call_async(
             self._training_client,
             "forward_backward_custom",
             datums,
             _loss_fn(reference, self.args.beta),
         )
+        forwarded = time.perf_counter()
         optim = await call_async(
             self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams)
         )
+        optimized = time.perf_counter()
+        metrics = self._metrics(forward, optim)
+        metrics.update({
+            "data/tokens": sum(datum.model_input.length for datum in datums),
+            "time/prepare": prepared - started,
+            "time/reference": referenced - prepared,
+            "time/forward_backward": forwarded - referenced,
+            "time/optim": optimized - forwarded,
+        })
         self.state.global_step += 1
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
             await self._save_state_async()
-        metrics = self._metrics(forward, optim)
+            metrics["time/save"] = time.perf_counter() - save_started
         metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = len(pairs) / metrics["time/step"]
+        self._total_tokens += int(metrics["data/tokens"])
+        self._total_pairs += len(pairs)
         self.state.metrics = metrics
         result = DPOResult(self.state.global_step, metrics, len(pairs), self.state.checkpoint_path)
-        if self._run is not None:
-            self._run.log(
-                {**metrics, "trainer/step": self.state.global_step, "trainer/num_pairs": len(pairs)},
-                step=self.state.global_step,
-            )
+        self._log_swanlab(metrics, len(pairs))
         return result
 
     @staticmethod
@@ -369,9 +446,26 @@ class DPOTrainer:
                 step=self.state.global_step,
             )
 
+    def _log_training_summary(self, started: float) -> None:
+        if not self.state.global_step:
+            return
+        elapsed = time.perf_counter() - started
+        summary = {
+            "time/train_runtime": elapsed,
+            "time/train_steps_per_second": self.state.global_step / elapsed,
+            "time/train_tokens_per_second": self._total_tokens / elapsed,
+            "time/train_pairs_per_second": self._total_pairs / elapsed,
+            "data/total_tokens": self._total_tokens,
+            "data/total_pairs": self._total_pairs,
+        }
+        self.state.metrics.update(summary)
+        if self._run is not None:
+            self._run.log(_swanlab_metrics(summary), step=self.state.global_step)
+
     def train(self) -> DPOState:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
+        started = time.perf_counter()
         iterator = iter(self.train_dataset)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
         try:
@@ -386,7 +480,9 @@ class DPOTrainer:
                 not self.args.save_every or self.state.global_step % self.args.save_every
             ):
                 self._save_state()
+            self._flush_swanlab()
             self._log_final_checkpoint()
+            self._log_training_summary(started)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise
@@ -399,6 +495,7 @@ class DPOTrainer:
     async def train_async(self) -> DPOState:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train_async().")
+        started = time.perf_counter()
         iterator = iter(self.train_dataset)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
         try:
@@ -413,7 +510,9 @@ class DPOTrainer:
                 not self.args.save_every or self.state.global_step % self.args.save_every
             ):
                 await self._save_state_async()
+            self._flush_swanlab()
             self._log_final_checkpoint()
+            self._log_training_summary(started)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise

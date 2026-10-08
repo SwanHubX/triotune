@@ -66,7 +66,17 @@ class _TrainingClient:
         self.loss_fn = loss_fn
         if self.fail_forward:
             raise RuntimeError("forward failed")
-        return SimpleNamespace(metrics={"train/loss": 0.5, "rewards/accuracies": 1.0})
+        return SimpleNamespace(metrics={
+            "train/loss": 0.5,
+            "rewards/accuracies": 1.0,
+            "rewards/margins": 0.3,
+            "rewards/chosen": 0.2,
+            "rewards/rejected": -0.1,
+            "loss_sum": -1.0,
+            "loss_mean": -0.25,
+            "scalar/loss_mean": -0.25,
+            "token_count": 4,
+        })
 
     async def forward_backward_custom_async(self, datums: list[object], loss_fn: object) -> SimpleNamespace:
         await asyncio.sleep(0)
@@ -129,7 +139,33 @@ class DPOTrainerTests(unittest.TestCase):
         self.addCleanup(swanlab_patch.stop)
 
     def trainer(self, **config: object) -> DPOTrainer:
+        config.setdefault("report_to", "swanlab")
         return DPOTrainer("test-model", args=DPOConfig(**config))
+
+    def test_none_report_to_uses_terminal_progress_without_swanlab(self) -> None:
+        self.assertIsNone(DPOConfig().report_to)
+        with (
+            patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init,
+            patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress,
+        ):
+            trainer = self.trainer(report_to=None, max_steps=1)
+            trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
+            trainer.train()
+
+        init.assert_not_called()
+        progress.return_value.set_postfix.assert_called_once()
+        progress.return_value.update.assert_called_once_with(1)
+
+    def test_rejects_unsupported_report_targets(self) -> None:
+        for target in ("disabled", "online", "local", "offline"):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "report_to"):
+                DPOConfig(report_to=target)
+
+    def test_logging_step_must_be_positive_integer(self) -> None:
+        self.assertEqual(DPOConfig().logging_step, 1)
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "logging_step"):
+                DPOConfig(logging_step=value)
 
     def test_step_aligns_pair_and_scores_only_completion(self) -> None:
         trainer = self.trainer()
@@ -142,6 +178,65 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual([datum.loss_fn_inputs["target_tokens"].data for datum in self.service.training.datums], [[65, 255], [66, 255]])
         self.assertEqual(self.service.training.optim_calls, 1)
         self.assertEqual(self.run.logs[0][1], 1)
+
+    def test_step_logs_dpo_loss_and_measured_work_without_surrogate_loss(self) -> None:
+        result = self.trainer(save_every=1).step([{"messages": "P", "chosen": "A", "rejected": "B"}])
+        metrics = result.metrics
+        self.assertEqual(metrics["train/loss"], 0.5)
+        self.assertEqual(metrics["data/tokens"], 4)
+        self.assertEqual(metrics["optim/grad_norm"], 0.2)
+        self.assertNotIn("loss_sum", metrics)
+        self.assertNotIn("loss_mean", metrics)
+        self.assertNotIn("scalar/loss_mean", metrics)
+        payload = self.run.logs[0][0]
+        self.assertEqual({name.split("/", 1)[0] for name in payload}, {"train", "reward", "time"})
+        self.assertEqual(payload["train/loss"], 0.5)
+        self.assertEqual(payload["reward/reward_accuracy"], 1.0)
+        self.assertEqual(payload["reward/reward_margin"], 0.3)
+        self.assertEqual(payload["reward/reward_chosen"], 0.2)
+        self.assertEqual(payload["reward/reward_rejected"], -0.1)
+        self.assertEqual(payload["train/learning_rate"], 5e-6)
+        self.assertEqual(payload["train/grad_norm"], 0.2)
+        self.assertEqual(payload["train/backend_token_count"], 4)
+        self.assertEqual(payload["train/step"], 1)
+        self.assertEqual(payload["train/pairs"], 1)
+        self.assertNotIn("loss_sum", payload)
+        for key in ("time/prepare", "time/reference", "time/forward_backward", "time/optim", "time/save"):
+            self.assertGreaterEqual(metrics[key], 0)
+        self.assertGreater(metrics["time/step"], 0)
+        self.assertAlmostEqual(
+            metrics["time/tokens_per_second"], metrics["data/tokens"] / metrics["time/step"]
+        )
+        self.assertAlmostEqual(metrics["time/pairs_per_second"], 1 / metrics["time/step"])
+
+    def test_logging_step_averages_all_training_scalars_and_flushes_last_interval(self) -> None:
+        trainer = self.trainer(logging_step=2, max_steps=3)
+        trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}] * 3
+        forward = self.service.training.forward_backward_custom
+        losses = iter((0.2, 0.4, 0.6))
+
+        def forward_with_varying_loss(datums: list[object], loss_fn: object) -> SimpleNamespace:
+            result = forward(datums, loss_fn)
+            result.metrics["train/loss"] = next(losses)
+            return result
+
+        self.service.training.forward_backward_custom = forward_with_varying_loss
+        trainer.train()
+
+        self.assertEqual([step for _, step in self.run.logs], [2, 3, 3])
+        first, final_interval, summary = [payload for payload, _ in self.run.logs]
+        self.assertAlmostEqual(first["train/loss"], 0.3)
+        self.assertEqual(first["reward/reward_accuracy"], 1.0)
+        self.assertEqual(first["train/pairs"], 1.0)
+        self.assertEqual(first["train/step"], 2)
+        self.assertAlmostEqual(final_interval["train/loss"], 0.6)
+        self.assertEqual(final_interval["train/step"], 3)
+        self.assertIn("time/train_runtime", summary)
+
+    def test_swanlab_mode_initializes_run_without_sdk_mode_override(self) -> None:
+        with patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init:
+            self.trainer()
+        self.assertNotIn("mode", init.call_args.kwargs)
 
     def test_forward_failure_does_not_optimize_or_advance_step(self) -> None:
         trainer = self.trainer()
@@ -174,19 +269,35 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(self.service.training.save_calls, 1)
         self.assertEqual(self.run.finished, "success")
         self.assertEqual(self.run.texts, [("checkpoint/path", state.checkpoint_path)])
+        self.assertEqual(
+            {name.split("/", 1)[0] for name in self.run.logs[-1][0]}, {"train", "time"}
+        )
+        self.assertEqual(state.metrics["data/total_tokens"], 4)
+        self.assertEqual(state.metrics["data/total_pairs"], 1)
+        self.assertGreater(state.metrics["time/train_runtime"], 0)
+        self.assertGreater(state.metrics["time/train_steps_per_second"], 0)
+        self.assertGreater(state.metrics["time/train_pairs_per_second"], 0)
 
     def test_async_step_uses_async_clients(self) -> None:
         trainer = self.trainer(save_every=1)
         result = asyncio.run(trainer.step_async([{"messages": "P", "chosen": "A", "rejected": "B"}]))
         self.assertEqual(result.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.service.training.optim_calls, 1)
+        self.assertEqual(result.metrics["data/tokens"], 4)
+        self.assertIn("time/save", result.metrics)
+        self.assertNotIn("loss_mean", result.metrics)
+        self.assertEqual(
+            {name.split("/", 1)[0] for name in self.run.logs[0][0]}, {"train", "reward", "time"}
+        )
 
     def test_async_train_saves_final_checkpoint(self) -> None:
-        trainer = self.trainer()
+        trainer = self.trainer(logging_step=10)
         trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
         state = asyncio.run(trainer.train_async())
         self.assertEqual(state.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.run.finished, "success")
+        self.assertEqual(state.metrics["data/total_tokens"], 4)
+        self.assertEqual([step for _, step in self.run.logs], [1, 1])
 
     @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "DPO extra is not installed")
     def test_pairwise_loss_and_completion_gradients(self) -> None:

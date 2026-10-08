@@ -17,6 +17,8 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh --steps 10 --batch-size 2
 `uv run python trio-cookbook/recipes/dpo_rlhf_trio.py --prepare-only`。
 `--rebuild-data` 重新从已缓存的原始文件生成数据，`--force-download` 重新下载原始文件。
 训练会跳过超过 `dpo.max_length` 的样本，并循环使用有效样本直到达到配置的步数。
+HH-RLHF DPO 的 SwanLab 图表使用 `train/`（损失、优化指标和数据量）、`reward/`（偏好奖励与准确率）和 `time/`（耗时和吞吐量）三个分组。
+`[swanlab].logging_step` 控制 DPO 与 GRPO 训练标量的记录间隔；当前示例配置为每步记录。设为 10 时每 10 步记录一次，并在训练结束时补记最后不足 10 步的区间。
 
 本目录存放训练启动脚本；以下为
 [grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) 的使用说明。
@@ -77,13 +79,14 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh \
   --steps 10 --batch-size 2 --group-size 4
 ```
 
-`swanlab.mode` 可选 `disabled`、`online`、`local` 和 `offline`。可在配置中
+`swanlab.report_to = "swanlab"` 启用 SwanLab；配置和命令行都省略 `report_to` 时，
+训练信息仅显示在终端。命令行只接受 `--report-to swanlab`。可在配置中
 设置 `workspace` 与 `tags`，也可临时通过命令行覆盖；`--tag`（别名 `--tags`）
 可以重复使用：
 
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh \
-  --mode online --workspace my-organization --tag grpo --tag gsm8k
+  --report-to swanlab --workspace my-organization --tag grpo --tag gsm8k
 ```
 
 `grpo.output_dir = true` 时，训练结束后会将最终 checkpoint 地址记录为

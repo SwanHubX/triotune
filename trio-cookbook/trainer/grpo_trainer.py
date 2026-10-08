@@ -23,11 +23,11 @@ from tqdm import tqdm
 
 from ..utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
 from .advantages import group_advantages
-from .grpo_config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
+from .grpo_config import GRPOConfig
+from .prompts import render_prompt
 from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter
-from .prompts import render_prompt
 from .types import GRPOBatch, GRPOResult
 
 
@@ -189,15 +189,15 @@ class GRPOTrainer:
             prompt_key=self.config.prompt_key,
         )
         self.state = TrainerState()
+        self._metric_window: dict[str, tuple[float, int]] = {}
         self._decode = self._make_decode(self._tokenizer)
         self._swanlab_run = self._init_swanlab_run(lora_rank)
 
     def _init_swanlab_run(self, lora_rank: int) -> Any | None:
-        if self.config.mode == "disabled":
+        if self.config.report_to is None:
             return None
         model_slug = self.model_name.rsplit("/", 1)[-1].replace("/", "-")
         return swanlab.init(
-            mode=self.config.mode,
             project=self.config.project,
             workspace=self.config.workspace,
             tags=self.config.tags,
@@ -223,12 +223,25 @@ class GRPOTrainer:
                 payload[_swanlab_metric_name(name)] = number
         payload.update(
             {
-                "trainer/step": float(result.step),
                 "trainer/num_datums": float(result.num_datums),
                 "trainer/skipped_groups": float(result.skipped_groups),
             }
         )
-        self._swanlab_run.log(payload, step=result.step)
+        if not hasattr(self, "_metric_window"):
+            self._metric_window = {}
+        for name, value in payload.items():
+            total, samples = self._metric_window.get(name, (0.0, 0))
+            self._metric_window[name] = (total + value, samples + 1)
+        if result.step % self.config.logging_step == 0:
+            self._flush_swanlab(result.step)
+
+    def _flush_swanlab(self, step: int) -> None:
+        if self._swanlab_run is None or not hasattr(self, "_metric_window"):
+            return
+        payload = {name: total / samples for name, (total, samples) in self._metric_window.items()}
+        self._metric_window.clear()
+        if payload:
+            self._swanlab_run.log({**payload, "trainer/step": float(step)}, step=step)
 
     def _log_final_checkpoint(self) -> None:
         if (
@@ -642,6 +655,7 @@ class GRPOTrainer:
                 progress.update(1)
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 self._save_state(final=True)
+            self._flush_swanlab(self.state.global_step)
             self._report_final_state()
             self._log_final_checkpoint()
             self._log_final_samples(last_rows)
@@ -676,6 +690,7 @@ class GRPOTrainer:
                 progress.update(1)
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 await self._save_state_async(final=True)
+            self._flush_swanlab(self.state.global_step)
             self._report_final_state()
             self._log_final_checkpoint()
             await self._log_final_samples_async(last_rows)

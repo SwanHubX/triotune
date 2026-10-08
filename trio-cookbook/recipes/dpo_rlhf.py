@@ -505,6 +505,30 @@ def start_swanlab(args: argparse.Namespace, dataset_size: int):
     )
 
 
+def swanlab_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Group standalone DPO charts by training, rewards, and timing."""
+    names = {
+        "dpo/loss": "train/loss",
+        "dpo/accuracy": "reward/reward_accuracy",
+        "dpo/margin": "reward/reward_margin",
+        "dpo/chosen_reward": "reward/reward_chosen",
+        "dpo/rejected_reward": "reward/reward_rejected",
+        "data/pairs": "train/pairs",
+        "data/datums": "train/datums",
+        "data/tokens": "train/tokens",
+        "data/total_pairs": "train/total_pairs",
+        "data/total_tokens": "train/total_tokens",
+        "trainer/token_count": "train/backend_token_count",
+    }
+    payload = {}
+    for name, value in metrics.items():
+        key = names.get(name)
+        if key is None:
+            key = name if name.startswith(("train/", "time/")) else f"train/{name.replace('/', '_')}"
+        payload[key] = value
+    return payload
+
+
 def main(args: argparse.Namespace) -> None:
     """同步 DPO 训练主入口。"""
     random.seed(args.seed)
@@ -533,21 +557,26 @@ def main(args: argparse.Namespace) -> None:
         eps=args.adam_eps,
     )
     run = start_swanlab(args, len(dataset))
+    train_started = time.perf_counter()
+    total_tokens = 0
+    total_pairs = 0
 
     try:
         for step in range(args.steps):
-            step_start = time.time()
+            step_start = time.perf_counter()
             data = build_step_batch(dataset, tokenizer, step, args)
             if not data:
                 raise RuntimeError(
                     "No valid DPO pairs were built. Increase --max-length or --sample-size."
                 )
+            prepared = time.perf_counter()
 
             # reference logprobs 先算好，再作为闭包输入本地 DPO loss。
             reference_logprobs = compute_reference_logprob_seqs(
                 reference_client,
                 data,
             )
+            referenced = time.perf_counter()
             fwd_bwd = training_client.forward_backward_custom(
                 data,
                 make_dpo_loss_fn(reference_logprobs, args.dpo_beta),
@@ -556,23 +585,34 @@ def main(args: argparse.Namespace) -> None:
             fwd_bwd_result = fwd_bwd.result()
             optim.result()
 
-            elapsed = time.time() - step_start
+            updated = time.perf_counter()
+            elapsed = updated - step_start
+            num_tokens = sum(datum.model_input.length for datum in data)
+            num_pairs = len(data) // 2
+            total_tokens += num_tokens
+            total_pairs += num_pairs
             metrics = {
-                "data/pairs": len(data) // 2,
+                "data/pairs": num_pairs,
                 "data/datums": len(data),
-                "data/tokens": sum(datum.model_input.length for datum in data),
+                "data/tokens": num_tokens,
                 "train/learning_rate": args.learning_rate,
                 "time/step_elapsed_time": elapsed,
+                "time/prepare": prepared - step_start,
+                "time/reference": referenced - prepared,
+                "time/update": updated - referenced,
+                "time/tokens_per_second": num_tokens / elapsed,
+                "time/pairs_per_second": num_pairs / elapsed,
             }
-            # 后端指标加 trainer/ 前缀，本地 DPO 指标保持 dpo/ 前缀。
+            # 后端代理 loss 不等于本地计算的 DPO loss。
             metrics.update(
                 {
                     key if key.startswith("dpo/") else f"trainer/{key}": float(value)
                     for key, value in dict(fwd_bwd_result.metrics).items()
+                    if key not in {"loss_sum", "loss_mean", "scalar/loss_sum", "scalar/loss_mean"}
                 }
             )
             if run is not None:
-                swanlab.log(metrics, step=step)
+                swanlab.log(swanlab_metrics(metrics), step=step)
 
             print(
                 f"step {step:03d}/{args.steps} | pairs {metrics['data/pairs']} | "
@@ -581,10 +621,24 @@ def main(args: argparse.Namespace) -> None:
                 f"time {elapsed:.2f}s"
             )
 
+        save_started = time.perf_counter()
         save_result = training_client.save_weights_for_sampler(args.save_weights_name).result()
+        elapsed = time.perf_counter() - train_started
         print(f"Saved weights: {save_result.path}")
         if run is not None:
-            swanlab.log({"save/weights_path": swanlab.Text(save_result.path)}, step=args.steps)
+            summary = {
+                "time/save": time.perf_counter() - save_started,
+                "time/train_runtime": elapsed,
+                "time/train_steps_per_second": args.steps / elapsed,
+                "time/train_tokens_per_second": total_tokens / elapsed,
+                "time/train_pairs_per_second": total_pairs / elapsed,
+                "data/total_tokens": total_tokens,
+                "data/total_pairs": total_pairs,
+            }
+            swanlab.log({
+                **swanlab_metrics(summary),
+                "train/weights_path": swanlab.Text(save_result.path),
+            }, step=args.steps)
     finally:
         if run is not None:
             swanlab.finish()

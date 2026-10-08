@@ -11,12 +11,14 @@ class _Run:
     def __init__(self) -> None:
         self.payload: dict[str, float] | None = None
         self.step: int | None = None
+        self.logs: list[tuple[dict[str, float], int]] = []
         self.texts: dict[str, tuple[object, int]] = {}
         self.events: list[str] = []
 
     def log(self, payload: dict[str, float], *, step: int) -> None:
         self.payload = payload
         self.step = step
+        self.logs.append((payload, step))
 
     def log_text(self, *, key: str, data: object, step: int) -> None:
         self.texts[key] = (data, step)
@@ -59,24 +61,43 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_init_passes_workspace_and_tags_to_swanlab(self) -> None:
         trainer = GRPOTrainer.__new__(GRPOTrainer)
         trainer.model_name = "Qwen/Qwen3.5-9B"
-        trainer.config = GRPOConfig(mode="online", workspace="my-organization", tags=["grpo", "gsm8k"])
+        trainer.config = GRPOConfig(report_to="swanlab", workspace="my-organization", tags=["grpo", "gsm8k"])
 
         with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
             trainer._init_swanlab_run(lora_rank=32)
 
         self.assertEqual(init.call_args.kwargs["workspace"], "my-organization")
         self.assertEqual(init.call_args.kwargs["tags"], ["grpo", "gsm8k"])
+        self.assertNotIn("mode", init.call_args.kwargs)
 
     def test_swanlab_workspace_and_tags_default_to_none(self) -> None:
         trainer = GRPOTrainer.__new__(GRPOTrainer)
         trainer.model_name = "Qwen/Qwen3.5-9B"
-        trainer.config = GRPOConfig(mode="online")
+        trainer.config = GRPOConfig(report_to="swanlab")
 
         with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
             trainer._init_swanlab_run(lora_rank=32)
 
         self.assertIsNone(init.call_args.kwargs["workspace"])
         self.assertIsNone(init.call_args.kwargs["tags"])
+
+    def test_none_report_to_uses_terminal_only(self) -> None:
+        trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer.config = GRPOConfig()
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
+            self.assertIsNone(trainer._init_swanlab_run(lora_rank=32))
+        init.assert_not_called()
+
+    def test_rejects_unsupported_report_targets(self) -> None:
+        for target in ("disabled", "online", "local", "offline"):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "report_to"):
+                GRPOConfig(report_to=target)
+
+    def test_logging_step_must_be_positive_integer(self) -> None:
+        self.assertEqual(GRPOConfig().logging_step, 1)
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "logging_step"):
+                GRPOConfig(logging_step=value)
 
     def test_rejects_empty_workspace_and_tags(self) -> None:
         with self.assertRaisesRegex(ValueError, "workspace"):
@@ -92,6 +113,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         run = _Run()
         trainer = GRPOTrainer.__new__(GRPOTrainer)
         trainer._swanlab_run = run
+        trainer.config = GRPOConfig()
         result = GRPOResult(
             step=3,
             metrics={
@@ -133,6 +155,27 @@ class SwanLabLoggingTests(unittest.TestCase):
         self.assertNotIn("checkpoint/saved", run.payload)
         self.assertEqual(run.payload["time/step"], 3.0)
         self.assertEqual(run.step, 3)
+
+    def test_logging_step_averages_all_scalars_and_flushes_final_partial_window(self) -> None:
+        run = _Run()
+        trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer._swanlab_run = run
+        trainer.config = GRPOConfig(logging_step=2)
+        for step, loss in ((1, 0.2), (2, 0.4), (3, 0.6)):
+            trainer._log_swanlab(GRPOResult(
+                step=step,
+                metrics={"train/loss": loss, "reward/mean": loss + 1, "time/step": 2.0},
+                num_datums=step * 2,
+            ))
+            self.assertEqual(len(run.logs), step // 2)
+        trainer._flush_swanlab(3)
+
+        self.assertEqual([step for _, step in run.logs], [2, 3])
+        self.assertAlmostEqual(run.logs[0][0]["trainer/loss"], 0.3)
+        self.assertAlmostEqual(run.logs[0][0]["reward/mean"], 1.3)
+        self.assertEqual(run.logs[0][0]["trainer/num_datums"], 3.0)
+        self.assertEqual(run.logs[0][0]["trainer/step"], 2.0)
+        self.assertAlmostEqual(run.logs[1][0]["trainer/loss"], 0.6)
 
     def test_final_checkpoint_is_logged_to_swanlab(self) -> None:
         run, sampler = _Run(), _Sampler()
@@ -180,7 +223,7 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_train_saves_and_logs_final_step_after_early_exhaustion(self) -> None:
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
-        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3, output_dir=True)
+        trainer.config = GRPOConfig(max_steps=3, batch_size=1, save_every=3, output_dir=True, logging_step=10)
         trainer.state = TrainerState()
         trainer.train_dataset = [{"messages": "Only question"}]
         trainer._training_client = SimpleNamespace(
@@ -191,7 +234,9 @@ class SwanLabLoggingTests(unittest.TestCase):
             trainer.state.global_step += 1
             trainer.state.metrics = {"train/loss": 0.25, "reward/mean": 0.75}
             trainer._save_state()
-            return GRPOResult(step=trainer.state.global_step)
+            result = GRPOResult(step=trainer.state.global_step, metrics=trainer.state.metrics)
+            trainer._log_swanlab(result)
+            return result
 
         trainer.step = step
 
@@ -199,6 +244,8 @@ class SwanLabLoggingTests(unittest.TestCase):
             state = trainer.train()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
+        self.assertEqual(run.step, 1)
+        self.assertEqual(run.payload["trainer/loss"], 0.25)
         self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
         texts, _ = run.texts["sample/text"]
         self.assertEqual(texts[0].caption, "Only question")

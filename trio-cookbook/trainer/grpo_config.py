@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(slots=True)
@@ -39,12 +39,13 @@ class GRPOConfig:
     reward_epsilon: float = 1e-4
     skip_zero_advantage: bool = True
     save_every: int = 0
+    logging_step: int = 1
     seed: int | None = None
     prompt_key: str = "messages"
     add_generation_prompt: bool = True
     stop: bool = True
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
-    mode: str = "disabled"
+    report_to: Literal["swanlab"] | None = None
     project: str = "trio-cookbook-grpo"
     workspace: str | None = None
     tags: list[str] | None = None
@@ -75,8 +76,10 @@ class GRPOConfig:
             raise ValueError("scale_rewards must be 'none', 'group', or 'batch'.")
         if self.save_every < 0:
             raise ValueError("save_every must be >= 0.")
-        if self.mode not in {"disabled", "online", "local", "offline"}:
-            raise ValueError("mode must be 'disabled', 'online', 'local', or 'offline'.")
+        if isinstance(self.logging_step, bool) or not isinstance(self.logging_step, int) or self.logging_step < 1:
+            raise ValueError("logging_step must be a positive integer.")
+        if self.report_to is not None and self.report_to != "swanlab":
+            raise ValueError("report_to must be 'swanlab' or None.")
         if not self.project.strip():
             raise ValueError("project must not be empty.")
         if self.workspace is not None and (

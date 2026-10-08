@@ -15,7 +15,7 @@ seed = 42
 [dpo]
 beta = 0.1
 batch_size = 2
-max_steps = 500
+max_steps = 50
 max_length = 2048
 learning_rate = 1e-5
 seed = 42
@@ -25,7 +25,9 @@ add_eos_token = false
 enable_thinking = false
 
 [swanlab]
-mode = "local"
-project = "trio-cookbook-dpo"
+report_to = "swanlab"
+logging_step = 1
+project = "dpo-cookbook-hhrlhf"
+workspace = "pytrio"
 run_name = "hh-rlhf"
 tags = ["dpo", "hh-rlhf", "modelscope"]

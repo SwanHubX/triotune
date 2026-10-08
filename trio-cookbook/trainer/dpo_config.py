@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(slots=True)
@@ -24,7 +24,8 @@ class DPOConfig:
     add_eos_token: bool = True
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     save_every: int = 0
-    mode: str = "local"
+    logging_step: int = 1
+    report_to: Literal["swanlab"] | None = None
     project: str = "trio-cookbook-dpo"
     workspace: str | None = None
     tags: list[str] | None = None
@@ -48,12 +49,14 @@ class DPOConfig:
             raise ValueError("beta1 and beta2 must be in [0, 1).")
         if self.save_every < 0:
             raise ValueError("save_every must be nonnegative.")
+        if isinstance(self.logging_step, bool) or not isinstance(self.logging_step, int) or self.logging_step < 1:
+            raise ValueError("logging_step must be a positive integer.")
         if not isinstance(self.prompt_key, str) or not self.prompt_key.strip():
             raise ValueError("prompt_key must be a non-empty string.")
         if {"tokenize", "add_generation_prompt"}.intersection(self.chat_template_kwargs):
             raise ValueError("chat_template_kwargs cannot override tokenize or add_generation_prompt.")
-        if self.mode not in {"disabled", "online", "local", "offline"}:
-            raise ValueError("mode must be disabled, online, local, or offline.")
+        if self.report_to is not None and self.report_to != "swanlab":
+            raise ValueError("report_to must be 'swanlab' or None.")
         if not isinstance(self.project, str) or not self.project.strip():
             raise ValueError("project must be a non-empty string.")
 

@@ -45,7 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-size", type=positive_int)
     parser.add_argument("--data-file", type=Path)
     parser.add_argument("--cache-dir", type=Path)
-    parser.add_argument("--mode", choices=("disabled", "online", "local", "offline"))
+    parser.add_argument("--report-to", choices=("swanlab",))
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--rebuild-data", action="store_true")
     parser.add_argument("--force-download", action="store_true")
@@ -250,8 +250,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.batch_size is not None:
         dpo["batch_size"] = args.batch_size
     swanlab = dict(settings.get("swanlab", {}))
-    if args.mode is not None:
-        swanlab["mode"] = args.mode
+    if args.report_to is not None:
+        swanlab["report_to"] = args.report_to
     trainer = DPOTrainer(
         model=settings["model"]["name"],
         args=DPOConfig(**dpo, **swanlab),

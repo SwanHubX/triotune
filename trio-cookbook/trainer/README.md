@@ -64,6 +64,8 @@ trainer.train()
 ```
 
 异步场景可以调用 `step_async()` 或 `train_async()`。训练器要求每个 GRPO 组至少包含两个 completion；`loss_fn` 当前支持 `importance_sampling`，模型加载、采样和优化由 PyTRIO 客户端负责。
+`GRPOConfig(report_to="swanlab")` 启用 SwanLab；默认 `report_to=None`，训练进度和最终指标只显示在终端。
+`GRPOConfig(logging_step=10)` 每 10 个训练步向 SwanLab 记录一次整组训练标量；区间内按指标取均值，训练结束时记录不足 10 步的最后一组。默认值 1 表示每步记录。终端进度、checkpoint、最终文本和样本记录不受此间隔控制。
 
 ## DPO 训练
 
@@ -77,13 +79,17 @@ rows = [
 ]
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
-    args=DPOConfig(beta=0.1, batch_size=1, max_steps=1, mode="local"),
+    args=DPOConfig(beta=0.1, batch_size=1, max_steps=1, report_to="swanlab"),
     train_dataset=rows,
 )
 state = trainer.train()
 print(state.checkpoint_path)
 ```
 
-默认参考策略是未经 LoRA 更新的同一基座模型；`ref_model` 可指定另一个 PyTRIO 基座模型，但须使用相同 token ID 语义。DPO 每步记录损失、偏好奖励与准确率、优化指标到 SwanLab，并在训练结束保存 PyTRIO checkpoint。`step()`、`step_async()`、`train_async()` 也可单独使用。`max_length` 超限时抛错，不会静默截断偏好数据。
+默认参考策略是未经 LoRA 更新的同一基座模型；`ref_model` 可指定另一个 PyTRIO 基座模型，但须使用相同 token ID 语义。`report_to="swanlab"` 将每步损失、偏好奖励与准确率、优化指标记录到 SwanLab；默认 `report_to=None`，训练进度与核心指标只显示在终端。训练结束后保存 PyTRIO checkpoint。`step()`、`step_async()`、`train_async()` 也可单独使用。`max_length` 超限时抛错，不会静默截断偏好数据。
+`train/loss` 是偏好对上 `-log sigmoid(奖励差)` 的均值，其中奖励已包含 `β` 系数；`rewards/accuracies` 是 chosen 奖励高于 rejected 的比例，`rewards/margins` 是两者的平均差值，`logps/chosen` 和 `logps/rejected` 是策略对回复的平均序列 logprob。PyTRIO 返回的 `loss_sum`、`loss_mean` 是自定义梯度的后端代理损失，不作为 DPO 指标记录。
+`data/tokens` 统计本步所有 chosen/rejected 模型输入的 token 数，包含两次使用的 prompt；`time/prepare`、`time/reference`、`time/forward_backward`、`time/optim` 分别测量样本准备、参考打分、策略前反向和优化更新，周期性保存时另有 `time/save`。`time/step` 包含整个训练步；`time/tokens_per_second` 和 `time/pairs_per_second` 分别用本步 token 数和偏好对数除以该耗时。`train()` 结束时记录总耗时、总步数/偏好对数/token 数及相应的每秒吞吐量；总耗时包含最终 checkpoint 保存。远端接口没有提供可信的 FLOPs 计数；DPO 的参考 logprob 差也不等于完整分布的 KL 散度，因此不记录 `total_flos` 或 `kl`。
+SwanLab 训练标量使用 `train/`、`reward/` 和 `time/` 三个分组：结果对象中的 `rewards/accuracies`、`rewards/margins`、`rewards/chosen`、`rewards/rejected` 分别显示为 `reward/reward_accuracy`、`reward/reward_margin`、`reward/reward_chosen`、`reward/reward_rejected`；`logps/chosen` 显示为 `train/logp_chosen`，`optim/lr` 显示为 `train/learning_rate`。最终 checkpoint 路径单独记录为 `checkpoint/path` 文本。`DPOResult.metrics` 和 `DPOState.metrics` 保留原键名，便于现有代码读取。
+`DPOConfig(logging_step=10)` 每 10 个训练步向 SwanLab 记录一次整组训练标量；区间内按指标取均值，训练结束时记录不足 10 步的最后一组。默认值 1 表示每步记录。终端进度、checkpoint 文本和训练结束的总耗时/吞吐量汇总不受此间隔控制。
 聊天数据可通过 `DPOConfig(chat_template_kwargs={"enable_thinking": False})` 向 tokenizer 的聊天模板传参。
 旧数据如使用 `prompt` 列，可显式设置 `DPOConfig(prompt_key="prompt")`；默认列名为 `messages`。
