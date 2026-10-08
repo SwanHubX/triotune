@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | [`__init__.py`](./__init__.py) | `GRPOTrainer`、`DPOTrainer`、配置、类型和渲染函数 | 定义模块的公开导出，提供稳定的导入入口。 |
 | [`advantages.py`](./advantages.py) | `group_advantages` | 对一个完整的 GRPO completion 组计算均值、标准差、centered advantage 和退化组指标。支持不缩放和组内标准差缩放。 |
-| [`config.py`](./config.py) | `GRPOConfig` | 保存采样、优化、奖励缩放、数据输入和 SwanLab 配置；在初始化时校验数值范围和不兼容选项，并生成采样器和 Adam 参数。 |
+| [`grpo_config.py`](./grpo_config.py) | `GRPOConfig` | 保存采样、优化、奖励缩放、数据输入和 SwanLab 配置；在初始化时校验数值范围和不兼容选项，并生成采样器和 Adam 参数。 |
 | [`dpo_config.py`](./dpo_config.py) | `DPOConfig` | 配置 DPO 系数、批大小、长度、优化、checkpoint 和 SwanLab。 |
 | [`dpo_trainer.py`](./dpo_trainer.py) | `DPOTrainer`、`DPOState`、`DPOResult` | 用 PyTRIO 的参考采样器和自定义反向接口训练偏好对。 |
 | [`datum.py`](./datum.py) | `build_aligned_datum`、`validate_datum`、`to_client_datum` | 将 prompt token、completion token、旧策略 log-probability 和 advantage 对齐为训练字段，检查长度和有限值，再物化为 PyTRIO 或兼容客户端的 `Datum`。 |

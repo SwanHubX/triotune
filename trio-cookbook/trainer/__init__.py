@@ -1,6 +1,6 @@
 """Text-only GRPO and DPO trainers backed by PyTRIO."""
 
-from .config import GRPOConfig
+from .grpo_config import GRPOConfig
 from .dpo_config import DPOConfig
 from .dpo_trainer import DPOResult, DPOState, DPOTrainer
 from .grpo_trainer import GRPOTrainer, TrainerState

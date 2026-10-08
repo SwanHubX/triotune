@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from ..utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
 from .advantages import group_advantages
-from .config import GRPOConfig
+from .grpo_config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
 from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter

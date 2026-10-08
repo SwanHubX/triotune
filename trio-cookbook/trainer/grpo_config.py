@@ -1,4 +1,4 @@
-"""GRPO configuration.
+"""Configuration for the PyTRIO-backed GRPO trainer.
 
 This is deliberately smaller than ``trl.GRPOConfig``.  TRL's configuration
 also contains local Transformers/Accelerate/vLLM switches; those would be
