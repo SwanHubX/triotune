@@ -7,7 +7,6 @@
 | A（框架 trainer） | `run-20260928_154652-cu89k24d` | `recipes/grpo_gms8k_trio.py --config .../grpo_gms8k.toml` | Qwen3.5-9B、LoRA 32、batch=4、group=8、max=1024、100 steps、lr=4e-5、`importance_sampling`、seed=42 |
 | B（独立同步脚本） | `run-20260928_164802-cjhau8h5` | `recipes/grpo_gsm8k.py --steps 100 ...` | 与 A 相同（metadata 中记录的模型、batch、group、max、lr、loss、seed 均一致） |
 
-两个 metadata 都记录了 commit `f27632d011deb3d7e9857f8b59607f98d5afcb87`。需要注意，B 运行期间仓库可能存在尚未提交的工作区改动；`d556133`（独立脚本指标对齐）在 B 启动后才提交，SwanLab metadata 不会记录这种 dirty-worktree 状态。因此，下面把“日志能直接证明的事实”和“由代码推断的原因”分开描述。
 
 ## 核心指标
 
