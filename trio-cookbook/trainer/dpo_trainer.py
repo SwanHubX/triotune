@@ -1,0 +1,593 @@
+"""DPO training with PyTRIO clients for model execution.
+
+Preference pairs are scored against a fixed reference sampler. PyTRIO's
+``forward_backward_custom`` evaluates policy logprobs remotely, computes the
+pairwise loss locally, and sends its gradients back to the training service.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import math
+import time
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from numbers import Integral
+from typing import Any
+
+import pytrio as trio
+import swanlab
+from tqdm import tqdm
+
+from ..utils.client import call, call_async, optimizer_params
+from .dpo_config import DPOConfig
+from .prompts import RenderedPrompt, render_prompt
+
+
+@dataclass(slots=True)
+class DPOState:
+    global_step: int = 0
+    metrics: dict[str, float] = field(default_factory=dict)
+    checkpoint_path: str | None = None
+
+
+@dataclass(slots=True)
+class DPOResult:
+    step: int
+    metrics: dict[str, float]
+    num_pairs: int
+    checkpoint_path: str | None = None
+
+
+@dataclass(slots=True)
+class _Preference:
+    prompt: list[int]
+    chosen: list[int]
+    rejected: list[int]
+
+
+def _completion_tokens(
+    value: Any,
+    prompt: Any,
+    prompt_tokens: list[int],
+    tokenizer: Any,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
+    if isinstance(value, str):
+        tokens = tokenizer.encode(value, add_special_tokens=False)
+    elif isinstance(value, (list, tuple)) and value and all(
+        isinstance(item, Integral) and not isinstance(item, bool) for item in value
+    ):
+        tokens = value
+    elif (
+        isinstance(prompt, (list, tuple))
+        and isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(item, Mapping) for item in prompt)
+        and all(isinstance(item, Mapping) for item in value)
+    ):
+        full = render_prompt(
+            list(prompt) + list(value),
+            tokenizer,
+            add_generation_prompt=False,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if full.tokens[: len(prompt_tokens)] != prompt_tokens:
+            raise ValueError("Chat template does not preserve prompt tokens before the completion.")
+        tokens = full.tokens[len(prompt_tokens) :]
+    else:
+        raise TypeError("chosen and rejected must be text, token IDs, or chat completion messages.")
+    tokens = list(tokens)
+    if not tokens or any(not isinstance(token, Integral) or isinstance(token, bool) for token in tokens):
+        raise ValueError("A preference completion must contain integer token IDs.")
+    return [int(token) for token in tokens]
+
+
+def _datum(prompt: list[int], completion: list[int]) -> Any:
+    """Mask prompt labels and align completion labels with next-token logits."""
+
+    tokens = prompt + completion
+    return trio.Datum(
+        model_input=trio.ModelInput.from_ints(tokens[:-1]),
+        loss_fn_inputs={"target_tokens": [-100] * (len(prompt) - 1) + completion},
+    )
+
+
+def _reference_logprob(values: Sequence[float | None], prompt_length: int, total_length: int) -> float:
+    if len(values) != total_length:
+        raise ValueError("Reference sampler returned the wrong number of token logprobs.")
+    completion_values = values[prompt_length:]
+    if not completion_values or any(value is None or not math.isfinite(value) for value in completion_values):
+        raise ValueError("Reference sampler returned missing or non-finite completion logprobs.")
+    return sum(float(value) for value in completion_values if value is not None)
+
+
+def _loss_fn(reference: Sequence[float], beta: float):
+    """Return PyTRIO's local custom-loss callback for ordered chosen/rejected pairs."""
+
+    def loss(datums: list[Any], logprobs: list[Any]) -> tuple[Any, dict[str, float]]:
+        import torch
+        import torch.nn.functional as F
+
+        if len(logprobs) != len(datums) or len(logprobs) != len(reference) or len(logprobs) % 2:
+            raise ValueError("DPO requires aligned chosen/rejected datums and reference scores.")
+        scores = []
+        for datum, token_logprobs in zip(datums, logprobs, strict=True):
+            labels = datum.loss_fn_inputs["target_tokens"].data
+            if len(labels) != token_logprobs.numel():
+                raise ValueError("Policy logprobs and target tokens are not aligned.")
+            mask = torch.tensor([token != -100 for token in labels], device=token_logprobs.device)
+            scores.append(token_logprobs.reshape(-1)[mask].sum())
+        policy_chosen = torch.stack(scores[::2])
+        policy_rejected = torch.stack(scores[1::2])
+        reference_chosen = policy_chosen.new_tensor(reference[::2])
+        reference_rejected = policy_chosen.new_tensor(reference[1::2])
+        chosen_rewards = beta * (policy_chosen - reference_chosen)
+        rejected_rewards = beta * (policy_rejected - reference_rejected)
+        margins = chosen_rewards - rejected_rewards
+        objective = F.softplus(-margins).mean()
+        metrics = {
+            "train/loss": objective.item(),
+            "rewards/chosen": chosen_rewards.detach().mean().item(),
+            "rewards/rejected": rejected_rewards.detach().mean().item(),
+            "rewards/margins": margins.detach().mean().item(),
+            "rewards/accuracies": (margins.detach() > 0).float().mean().item(),
+            "logps/chosen": policy_chosen.detach().mean().item(),
+            "logps/rejected": policy_rejected.detach().mean().item(),
+        }
+        return objective, metrics
+
+    return loss
+
+
+def _swanlab_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+    """Group DPO charts without changing result metric keys."""
+    names = {
+        "optim/lr": "train/learning_rate",
+        "optim/grad_norm": "train/grad_norm",
+        "rewards/chosen": "reward/reward_chosen",
+        "rewards/rejected": "reward/reward_rejected",
+        "rewards/margins": "reward/reward_margin",
+        "rewards/accuracies": "reward/reward_accuracy",
+        "logps/chosen": "train/logp_chosen",
+        "logps/rejected": "train/logp_rejected",
+        "data/tokens": "train/tokens",
+        "data/total_tokens": "train/total_tokens",
+        "data/total_pairs": "train/total_pairs",
+        "token_count": "train/backend_token_count",
+    }
+    payload = {}
+    for name, value in metrics.items():
+        if name == "grad_norm" and "optim/grad_norm" in metrics:
+            continue
+        key = names.get(name)
+        if key is None:
+            key = name if name.startswith(("train/", "time/")) else f"train/{name.replace('/', '_')}"
+        payload[key] = value
+    return payload
+
+
+class DPOTrainer:
+    """Train a PyTRIO LoRA policy from ``messages``, ``chosen``, ``rejected`` rows.
+
+    ``model`` and optional ``ref_model`` are PyTRIO base-model IDs. With no
+    ``ref_model``, the fixed reference is the unmodified base model. A custom
+    reference must use the same tokenizer vocabulary as the trained model.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        ref_model: str | None = None,
+        args: DPOConfig | None = None,
+        train_dataset: Iterable[Mapping[str, Any]] | None = None,
+        *,
+        lora_rank: int = 32,
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a PyTRIO base-model ID.")
+        if ref_model is not None and (not isinstance(ref_model, str) or not ref_model.strip()):
+            raise ValueError("ref_model must be a PyTRIO base-model ID when provided.")
+        self.model = model.strip()
+        self.ref_model = ref_model.strip() if ref_model is not None else self.model
+        self.args = args or DPOConfig()
+        self.train_dataset = train_dataset
+        self._service_client = trio.ServiceClient()
+        self._training_client = self._service_client.create_lora_training_client(
+            base_model=self.model, rank=lora_rank, seed=self.args.seed
+        )
+        self._reference_client = self._service_client.create_sampling_client(base_model=self.ref_model)
+        self._tokenizer = self._training_client.get_tokenizer()
+        self.state = DPOState()
+        self._total_tokens = 0
+        self._total_pairs = 0
+        self._metric_window: dict[str, tuple[float, int]] = {}
+        self._run = None
+        if self.args.report_to == "swanlab":
+            self._run = swanlab.init(
+                project=self.args.project,
+                workspace=self.args.workspace,
+                tags=self.args.tags,
+                name=self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-dpo",
+                log_dir=self.args.log_dir,
+                config={
+                    "model": self.model,
+                    "ref_model": self.ref_model,
+                    "lora_rank": lora_rank,
+                    **asdict(self.args),
+                },
+            )
+
+    def _preferences(self, rows: Sequence[Mapping[str, Any]]) -> list[_Preference]:
+        if not rows:
+            raise ValueError("A DPO step requires at least one preference pair.")
+        pairs = []
+        for index, row in enumerate(rows):
+            prompt_key = self.args.prompt_key
+            if not all(key in row for key in (prompt_key, "chosen", "rejected")):
+                raise KeyError(f"Dataset row {index} needs {prompt_key}, chosen, and rejected.")
+            prompt = render_prompt(
+                row[prompt_key],
+                self._tokenizer,
+                chat_template_kwargs=self.args.chat_template_kwargs,
+            )
+            completions = []
+            for key in ("chosen", "rejected"):
+                tokens = _completion_tokens(
+                    row[key],
+                    row[prompt_key],
+                    prompt.tokens,
+                    self._tokenizer,
+                    self.args.chat_template_kwargs,
+                )
+                eos = getattr(self._tokenizer, "eos_token_id", None)
+                if self.args.add_eos_token:
+                    if not isinstance(eos, Integral) or isinstance(eos, bool):
+                        raise ValueError("add_eos_token requires tokenizer.eos_token_id.")
+                    if tokens[-1] != eos:
+                        tokens.append(eos)
+                if (
+                    self.args.max_length is not None
+                    and len(prompt.tokens) + len(tokens) > self.args.max_length
+                ):
+                    raise ValueError(f"Dataset row {index} {key} exceeds max_length={self.args.max_length}.")
+                completions.append(tokens)
+            pairs.append(_Preference(prompt.tokens, *completions))
+        return pairs
+
+    def _datums(self, pairs: Sequence[_Preference]) -> list[Any]:
+        return [
+            _datum(pair.prompt, completion)
+            for pair in pairs
+            for completion in (pair.chosen, pair.rejected)
+        ]
+
+    def _reference_scores(self, pairs: Sequence[_Preference]) -> list[float]:
+        scores = []
+        for pair in pairs:
+            for completion in (pair.chosen, pair.rejected):
+                tokens = pair.prompt + completion
+                values = call(self._reference_client, "compute_logprobs", trio.ModelInput.from_ints(tokens))
+                scores.append(_reference_logprob(values, len(pair.prompt), len(tokens)))
+        return scores
+
+    async def _reference_scores_async(self, pairs: Sequence[_Preference]) -> list[float]:
+        requests = [
+            (pair.prompt, completion)
+            for pair in pairs
+            for completion in (pair.chosen, pair.rejected)
+        ]
+        values = await asyncio.gather(
+            *(
+                call_async(
+                    self._reference_client,
+                    "compute_logprobs",
+                    trio.ModelInput.from_ints(prompt + completion),
+                )
+                for prompt, completion in requests
+            )
+        )
+        return [
+            _reference_logprob(result, len(prompt), len(prompt) + len(completion))
+            for (prompt, completion), result in zip(requests, values, strict=True)
+        ]
+
+    def _metrics(self, forward: Any, optim: Any) -> dict[str, float]:
+        metrics = {"optim/lr": self.args.learning_rate}
+        for response in (forward, optim):
+            for name, value in getattr(response, "metrics", {}).items():
+                # PyTRIO's custom backward reports a linear surrogate loss here,
+                # while train/loss is the actual pairwise DPO objective.
+                if name in {"loss_sum", "loss_mean", "scalar/loss_sum", "scalar/loss_mean"}:
+                    continue
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    metrics[name] = float(value)
+        if "grad_norm" in metrics:
+            metrics["optim/grad_norm"] = metrics["grad_norm"]
+        return metrics
+
+    def _finish_run(self, state: str, error: str | None = None) -> None:
+        if self._run is not None:
+            self._run.finish(state=state, error=error)
+            self._run = None
+
+    def _log_swanlab(self, metrics: dict[str, float], count: int) -> None:
+        if self._run is None:
+            return
+        for name, value in {**_swanlab_metrics(metrics), "train/pairs": count}.items():
+            total, samples = self._metric_window.get(name, (0.0, 0))
+            self._metric_window[name] = (total + value, samples + 1)
+        if self.state.global_step % self.args.logging_step == 0:
+            self._flush_swanlab()
+
+    def _flush_swanlab(self) -> None:
+        if self._run is None:
+            return
+        payload = {name: total / samples for name, (total, samples) in self._metric_window.items()}
+        self._metric_window.clear()
+        if payload:
+            self._run.log({**payload, "train/step": self.state.global_step}, step=self.state.global_step)
+
+    def _finish_step(self, metrics: dict[str, float], count: int, started: float) -> DPOResult:
+        self.state.global_step += 1
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
+            self._save_state()
+            metrics["time/save"] = time.perf_counter() - save_started
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = count / metrics["time/step"]
+        self._total_tokens += int(metrics["data/tokens"])
+        self._total_pairs += count
+        self.state.metrics = metrics
+        result = DPOResult(self.state.global_step, metrics, count, self.state.checkpoint_path)
+        self._log_swanlab(metrics, count)
+        return result
+
+    def _save_state(self) -> str:
+        saved = call(self._training_client, "save_state", name=f"dpo-step-{self.state.global_step:08d}")
+        path = getattr(saved, "path", None)
+        if not isinstance(path, str) or not path:
+            raise TypeError("PyTRIO save_state() returned no checkpoint path.")
+        self.state.checkpoint_path = path
+        return path
+
+    async def _save_state_async(self) -> str:
+        saved = await call_async(
+            self._training_client, "save_state", name=f"dpo-step-{self.state.global_step:08d}"
+        )
+        path = getattr(saved, "path", None)
+        if not isinstance(path, str) or not path:
+            raise TypeError("PyTRIO save_state_async() returned no checkpoint path.")
+        self.state.checkpoint_path = path
+        return path
+
+    def step(self, rows: Sequence[Mapping[str, Any]]) -> DPOResult:
+        started = time.perf_counter()
+        pairs = self._preferences(rows)
+        datums = self._datums(pairs)
+        prepared = time.perf_counter()
+        reference = self._reference_scores(pairs)
+        referenced = time.perf_counter()
+        forward = call(
+            self._training_client,
+            "forward_backward_custom",
+            datums,
+            _loss_fn(reference, self.args.beta),
+        )
+        forwarded = time.perf_counter()
+        optim = call(self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams))
+        optimized = time.perf_counter()
+        metrics = self._metrics(forward, optim)
+        metrics.update({
+            "data/tokens": sum(datum.model_input.length for datum in datums),
+            "time/prepare": prepared - started,
+            "time/reference": referenced - prepared,
+            "time/forward_backward": forwarded - referenced,
+            "time/optim": optimized - forwarded,
+        })
+        return self._finish_step(metrics, len(pairs), started)
+
+    async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> DPOResult:
+        started = time.perf_counter()
+        pairs = self._preferences(rows)
+        datums = self._datums(pairs)
+        prepared = time.perf_counter()
+        reference = await self._reference_scores_async(pairs)
+        referenced = time.perf_counter()
+        forward = await call_async(
+            self._training_client,
+            "forward_backward_custom",
+            datums,
+            _loss_fn(reference, self.args.beta),
+        )
+        forwarded = time.perf_counter()
+        optim = await call_async(
+            self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams)
+        )
+        optimized = time.perf_counter()
+        metrics = self._metrics(forward, optim)
+        metrics.update({
+            "data/tokens": sum(datum.model_input.length for datum in datums),
+            "time/prepare": prepared - started,
+            "time/reference": referenced - prepared,
+            "time/forward_backward": forwarded - referenced,
+            "time/optim": optimized - forwarded,
+        })
+        self.state.global_step += 1
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
+            await self._save_state_async()
+            metrics["time/save"] = time.perf_counter() - save_started
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = len(pairs) / metrics["time/step"]
+        self._total_tokens += int(metrics["data/tokens"])
+        self._total_pairs += len(pairs)
+        self.state.metrics = metrics
+        result = DPOResult(self.state.global_step, metrics, len(pairs), self.state.checkpoint_path)
+        self._log_swanlab(metrics, len(pairs))
+        return result
+
+    @staticmethod
+    def _progress_postfix(result: DPOResult) -> dict[str, str]:
+        return {
+            key: f"{value:.4f}"
+            for key, value in result.metrics.items()
+            if key in {"train/loss", "rewards/accuracies"}
+        }
+
+    def _log_final_checkpoint(self) -> None:
+        if self._run is not None and self.state.checkpoint_path is not None:
+            self._run.log_text(
+                key="checkpoint/path",
+                data=self.state.checkpoint_path,
+                step=self.state.global_step,
+            )
+
+    def _final_sample_prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[RenderedPrompt]:
+        return [
+            render_prompt(
+                row[self.args.prompt_key],
+                self._tokenizer,
+                chat_template_kwargs=self.args.chat_template_kwargs,
+            )
+            for row in rows[:4]
+        ]
+
+    def _final_sampling_params(self, prompt_length: int) -> Any:
+        max_tokens = 128
+        if self.args.max_length is not None:
+            max_tokens = min(max_tokens, self.args.max_length - prompt_length)
+        return trio.SamplingParams(max_tokens=max_tokens, seed=self.args.seed)
+
+    def _write_final_samples(self, prompts: Sequence[RenderedPrompt], responses: Sequence[Any]) -> None:
+        texts = []
+        for prompt, response in zip(prompts, responses, strict=True):
+            if not response.sequences:
+                raise ValueError("Final inference returned no sequences.")
+            sequence = response.sequences[0]
+            completion = sequence.text
+            if completion is None:
+                completion = self._tokenizer.decode(sequence.tokens, skip_special_tokens=True)
+            texts.append(swanlab.Text(completion, caption=prompt.text))
+        self._run.log_text(key="sample/text", data=texts, step=self.state.global_step)
+
+    def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._run is None or not rows:
+            return
+        client = call(self._training_client, "save_weights_and_get_sampling_client")
+        prompts = self._final_sample_prompts(rows)
+        responses = [
+            call(
+                client,
+                "sample",
+                prompt=trio.ModelInput.from_ints(prompt.tokens),
+                num_samples=1,
+                sampling_params=self._final_sampling_params(len(prompt.tokens)),
+            )
+            for prompt in prompts
+        ]
+        self._write_final_samples(prompts, responses)
+
+    async def _log_final_samples_async(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._run is None or not rows:
+            return
+        client = await call_async(self._training_client, "save_weights_and_get_sampling_client")
+        prompts = self._final_sample_prompts(rows)
+        responses = await asyncio.gather(
+            *(
+                call_async(
+                    client,
+                    "sample",
+                    prompt=trio.ModelInput.from_ints(prompt.tokens),
+                    num_samples=1,
+                    sampling_params=self._final_sampling_params(len(prompt.tokens)),
+                )
+                for prompt in prompts
+            )
+        )
+        self._write_final_samples(prompts, responses)
+
+    def _log_training_summary(self, started: float) -> None:
+        if not self.state.global_step:
+            return
+        elapsed = time.perf_counter() - started
+        summary = {
+            "time/train_runtime": elapsed,
+            "time/train_steps_per_second": self.state.global_step / elapsed,
+            "time/train_tokens_per_second": self._total_tokens / elapsed,
+            "time/train_pairs_per_second": self._total_pairs / elapsed,
+            "data/total_tokens": self._total_tokens,
+            "data/total_pairs": self._total_pairs,
+        }
+        self.state.metrics.update(summary)
+        if self._run is not None:
+            self._run.log(_swanlab_metrics(summary), step=self.state.global_step)
+
+    def train(self) -> DPOState:
+        if self.train_dataset is None:
+            raise ValueError("train_dataset is required for train().")
+        started = time.perf_counter()
+        iterator = iter(self.train_dataset)
+        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        last_rows: list[Mapping[str, Any]] = []
+        try:
+            while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
+                rows = list(itertools.islice(iterator, self.args.batch_size))
+                if not rows:
+                    break
+                result = self.step(rows)
+                last_rows = rows
+                progress.set_postfix(self._progress_postfix(result), refresh=False)
+                progress.update(1)
+            if self.state.global_step and (
+                not self.args.save_every or self.state.global_step % self.args.save_every
+            ):
+                self._save_state()
+            self._flush_swanlab()
+            self._log_final_checkpoint()
+            self._log_training_summary(started)
+            self._log_final_samples(last_rows)
+        except BaseException as error:
+            self._finish_run("crashed", str(error))
+            raise
+        else:
+            self._finish_run("success")
+        finally:
+            progress.close()
+        return self.state
+
+    async def train_async(self) -> DPOState:
+        if self.train_dataset is None:
+            raise ValueError("train_dataset is required for train_async().")
+        started = time.perf_counter()
+        iterator = iter(self.train_dataset)
+        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        last_rows: list[Mapping[str, Any]] = []
+        try:
+            while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
+                rows = list(itertools.islice(iterator, self.args.batch_size))
+                if not rows:
+                    break
+                result = await self.step_async(rows)
+                last_rows = rows
+                progress.set_postfix(self._progress_postfix(result), refresh=False)
+                progress.update(1)
+            if self.state.global_step and (
+                not self.args.save_every or self.state.global_step % self.args.save_every
+            ):
+                await self._save_state_async()
+            self._flush_swanlab()
+            self._log_final_checkpoint()
+            self._log_training_summary(started)
+            await self._log_final_samples_async(last_rows)
+        except BaseException as error:
+            self._finish_run("crashed", str(error))
+            raise
+        else:
+            self._finish_run("success")
+        finally:
+            progress.close()
+        return self.state

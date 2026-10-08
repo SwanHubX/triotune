@@ -26,8 +26,9 @@ seed = 42
 enable_thinking = false
 
 [swanlab]
-mode = "online"
-project = "cookbook-grpo-test"
+report_to = "swanlab"
+logging_step = 1
+project = "cookbook-test"
 run_name = "gsm8k"
 workspace = "pytrio"
 tags = ["grpo", "gsm8k"]

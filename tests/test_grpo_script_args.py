@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -53,11 +55,13 @@ class ScriptArgumentsTests(unittest.TestCase):
         self.assertEqual(settings["grpo"]["max_steps"], 100)
         self.assertIs(settings["grpo"]["stop"], True)
         self.assertEqual(settings["grpo"]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertGreaterEqual(settings["swanlab"]["logging_step"], 1)
 
     def test_swanlab_options_default_to_none(self) -> None:
         with patch.object(sys, "argv", ["grpo_gms8k_trio.py"]):
             args = script.parse_args()
 
+        self.assertIsNone(args.report_to)
         self.assertIsNone(args.workspace)
         self.assertIsNone(args.tags)
 
@@ -74,7 +78,7 @@ class ScriptArgumentsTests(unittest.TestCase):
 
     def test_passes_swanlab_options_to_trainer_config(self) -> None:
         argv = [
-            "grpo_gms8k_trio.py", "--mode", "online", "--workspace", "my-organization",
+            "grpo_gms8k_trio.py", "--report-to", "swanlab", "--workspace", "my-organization",
             "--tag", "grpo", "--tag", "gsm8k",
         ]
         with (
@@ -90,8 +94,20 @@ class ScriptArgumentsTests(unittest.TestCase):
             script.main()
 
         config = trainer_class.call_args.kwargs["args"]
+        self.assertEqual(config.report_to, "swanlab")
         self.assertEqual(config.workspace, "my-organization")
         self.assertEqual(config.tags, ["grpo", "gsm8k"])
+        self.assertEqual(config.logging_step, script.load_config(script.DEFAULT_CONFIG)["swanlab"]["logging_step"])
+
+    def test_invalid_report_target_prints_error(self) -> None:
+        for target in ("none", "other"):
+            error = io.StringIO()
+            with self.subTest(target=target), patch.object(
+                sys, "argv", ["grpo_gms8k_trio.py", "--report-to", target]
+            ), redirect_stderr(error), self.assertRaises(SystemExit) as exit_info:
+                script.parse_args()
+            self.assertEqual(exit_info.exception.code, 2)
+            self.assertIn(f"invalid choice: '{target}'", error.getvalue())
 
     def test_cli_overrides_training_settings_and_final_save_interval(self) -> None:
         argv = [

@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=positive_int, help="override grpo.max_steps")
     parser.add_argument("--batch-size", type=positive_int, help="override grpo.batch_size")
     parser.add_argument("--group-size", type=group_size, help="override grpo.num_generations")
-    parser.add_argument("--mode", choices=("disabled", "online", "local", "offline"))
+    parser.add_argument("--report-to", choices=("swanlab",))
     parser.add_argument("--project")
     parser.add_argument("--workspace", help="SwanLab workspace or organization")
     parser.add_argument(
@@ -236,7 +236,7 @@ def main() -> None:
     grpo.setdefault("save_every", grpo.get("max_steps") or 0)
 
     swanlab_options = dict(settings.get("swanlab", {}))
-    for field in ("mode", "project", "workspace", "run_name", "tags"):
+    for field in ("report_to", "project", "workspace", "run_name", "tags"):
         if (value := getattr(args, field)) is not None:
             swanlab_options[field] = value
 
