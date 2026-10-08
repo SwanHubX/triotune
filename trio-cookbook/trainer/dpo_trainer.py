@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from ..utils.client import call, call_async, optimizer_params
 from .dpo_config import DPOConfig
-from .prompts import render_prompt
+from .prompts import RenderedPrompt, render_prompt
 
 
 @dataclass(slots=True)
@@ -446,6 +446,70 @@ class DPOTrainer:
                 step=self.state.global_step,
             )
 
+    def _final_sample_prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[RenderedPrompt]:
+        return [
+            render_prompt(
+                row[self.args.prompt_key],
+                self._tokenizer,
+                chat_template_kwargs=self.args.chat_template_kwargs,
+            )
+            for row in rows[:4]
+        ]
+
+    def _final_sampling_params(self, prompt_length: int) -> Any:
+        max_tokens = 128
+        if self.args.max_length is not None:
+            max_tokens = min(max_tokens, self.args.max_length - prompt_length)
+        return trio.SamplingParams(max_tokens=max_tokens, seed=self.args.seed)
+
+    def _write_final_samples(self, prompts: Sequence[RenderedPrompt], responses: Sequence[Any]) -> None:
+        texts = []
+        for prompt, response in zip(prompts, responses, strict=True):
+            if not response.sequences:
+                raise ValueError("Final inference returned no sequences.")
+            sequence = response.sequences[0]
+            completion = sequence.text
+            if completion is None:
+                completion = self._tokenizer.decode(sequence.tokens, skip_special_tokens=True)
+            texts.append(swanlab.Text(completion, caption=prompt.text))
+        self._run.log_text(key="sample/text", data=texts, step=self.state.global_step)
+
+    def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._run is None or not rows:
+            return
+        client = call(self._training_client, "save_weights_and_get_sampling_client")
+        prompts = self._final_sample_prompts(rows)
+        responses = [
+            call(
+                client,
+                "sample",
+                prompt=trio.ModelInput.from_ints(prompt.tokens),
+                num_samples=1,
+                sampling_params=self._final_sampling_params(len(prompt.tokens)),
+            )
+            for prompt in prompts
+        ]
+        self._write_final_samples(prompts, responses)
+
+    async def _log_final_samples_async(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self._run is None or not rows:
+            return
+        client = await call_async(self._training_client, "save_weights_and_get_sampling_client")
+        prompts = self._final_sample_prompts(rows)
+        responses = await asyncio.gather(
+            *(
+                call_async(
+                    client,
+                    "sample",
+                    prompt=trio.ModelInput.from_ints(prompt.tokens),
+                    num_samples=1,
+                    sampling_params=self._final_sampling_params(len(prompt.tokens)),
+                )
+                for prompt in prompts
+            )
+        )
+        self._write_final_samples(prompts, responses)
+
     def _log_training_summary(self, started: float) -> None:
         if not self.state.global_step:
             return
@@ -468,12 +532,14 @@ class DPOTrainer:
         started = time.perf_counter()
         iterator = iter(self.train_dataset)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        last_rows: list[Mapping[str, Any]] = []
         try:
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
                 rows = list(itertools.islice(iterator, self.args.batch_size))
                 if not rows:
                     break
                 result = self.step(rows)
+                last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
             if self.state.global_step and (
@@ -483,6 +549,7 @@ class DPOTrainer:
             self._flush_swanlab()
             self._log_final_checkpoint()
             self._log_training_summary(started)
+            self._log_final_samples(last_rows)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise
@@ -498,12 +565,14 @@ class DPOTrainer:
         started = time.perf_counter()
         iterator = iter(self.train_dataset)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        last_rows: list[Mapping[str, Any]] = []
         try:
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
                 rows = list(itertools.islice(iterator, self.args.batch_size))
                 if not rows:
                     break
                 result = await self.step_async(rows)
+                last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
             if self.state.global_step and (
@@ -513,6 +582,7 @@ class DPOTrainer:
             self._flush_swanlab()
             self._log_final_checkpoint()
             self._log_training_summary(started)
+            await self._log_final_samples_async(last_rows)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise

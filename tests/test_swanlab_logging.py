@@ -46,6 +46,7 @@ def _final_trainer(run: _Run, sampler: _Sampler) -> GRPOTrainer:
     trainer._swanlab_run = run
     trainer.config = GRPOConfig(max_steps=1, batch_size=5, output_dir=True)
     trainer.state = TrainerState(global_step=1, checkpoint_path="trio://final-checkpoint")
+    trainer._total_input_tokens = 0
     trainer._tokenizer = SimpleNamespace(encode=lambda text, **_: [1])
     trainer._decode = lambda tokens: "decoded answer"
     trainer._new_sampling_client = lambda: sampler
@@ -126,6 +127,11 @@ class SwanLabLoggingTests(unittest.TestCase):
                 "optim/lr": 4e-5,
                 "optim/grad_norm": 1.25,
                 "train/loss": -0.1,
+                "trainer/backend_metric": 0.4,
+                "loss_sum": 2.0,
+                "loss_mean": 0.25,
+                "token_count": 8.0,
+                "scalar/other_metric": 0.6,
                 "policy/entropy": 1.5,
                 "policy/kl_sample_train": 0.02,
                 "time/checkpoint": 0.5,
@@ -145,10 +151,17 @@ class SwanLabLoggingTests(unittest.TestCase):
         self.assertEqual(run.payload["reward/mean"], 0.75)
         self.assertEqual(run.payload["reward/std"], 0.25)
         self.assertEqual(run.payload["reward/boxed_answer_reward/mean"], 0.75)
-        self.assertEqual(run.payload["optim/lr"], 4e-5)
+        self.assertEqual(run.payload["train/learning_rate"], 4e-5)
+        self.assertNotIn("optim/lr", run.payload)
         self.assertEqual(run.payload["optim/grad_norm"], 1.25)
-        self.assertNotIn("train/loss", run.payload)
-        self.assertEqual(run.payload["trainer/loss"], -0.1)
+        self.assertEqual(run.payload["train/loss"], -0.1)
+        self.assertEqual(run.payload["train/backend_metric"], 0.4)
+        self.assertEqual(run.payload["train/other_metric"], 0.6)
+        self.assertEqual(run.payload["train/loss_sum"], 2.0)
+        self.assertEqual(run.payload["train/loss_mean"], 0.25)
+        self.assertEqual(run.payload["train/token_count"], 8.0)
+        self.assertFalse(any(key.startswith("trainer/") for key in run.payload))
+        self.assertTrue(all("/" in key for key in run.payload))
         self.assertEqual(run.payload["policy/entropy"], 1.5)
         self.assertEqual(run.payload["policy/kl_sample_train"], 0.02)
         self.assertNotIn("time/checkpoint", run.payload)
@@ -171,11 +184,11 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer._flush_swanlab(3)
 
         self.assertEqual([step for _, step in run.logs], [2, 3])
-        self.assertAlmostEqual(run.logs[0][0]["trainer/loss"], 0.3)
+        self.assertAlmostEqual(run.logs[0][0]["train/loss"], 0.3)
         self.assertAlmostEqual(run.logs[0][0]["reward/mean"], 1.3)
-        self.assertEqual(run.logs[0][0]["trainer/num_datums"], 3.0)
-        self.assertEqual(run.logs[0][0]["trainer/step"], 2.0)
-        self.assertAlmostEqual(run.logs[1][0]["trainer/loss"], 0.6)
+        self.assertEqual(run.logs[0][0]["train/num_datums"], 3.0)
+        self.assertEqual(run.logs[0][0]["train/step"], 2.0)
+        self.assertAlmostEqual(run.logs[1][0]["train/loss"], 0.6)
 
     def test_final_checkpoint_is_logged_to_swanlab(self) -> None:
         run, sampler = _Run(), _Sampler()
@@ -232,6 +245,7 @@ class SwanLabLoggingTests(unittest.TestCase):
 
         def step(rows: object) -> GRPOResult:
             trainer.state.global_step += 1
+            trainer._total_input_tokens += 4
             trainer.state.metrics = {"train/loss": 0.25, "reward/mean": 0.75}
             trainer._save_state()
             result = GRPOResult(step=trainer.state.global_step, metrics=trainer.state.metrics)
@@ -245,16 +259,21 @@ class SwanLabLoggingTests(unittest.TestCase):
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
         self.assertEqual(run.step, 1)
-        self.assertEqual(run.payload["trainer/loss"], 0.25)
+        self.assertEqual(run.logs[0][0]["train/loss"], 0.25)
+        self.assertGreater(run.payload["time/train_runtime"], 0)
+        self.assertGreater(run.payload["time/train_steps_per_second"], 0)
+        self.assertGreater(run.payload["time/train_tokens_per_second"], 0)
+        self.assertEqual(run.payload["train/total_input_tokens"], 4)
         self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
         texts, _ = run.texts["sample/text"]
         self.assertEqual(texts[0].caption, "Only question")
-        summary, step = run.texts["trainer/final_summary"]
+        summary, step = run.texts["train/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn("Training finished at step 1", summary)
         self.assertIn('"train/loss": 0.25', summary)
+        self.assertIn('"time/train_runtime":', summary)
         self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
-        self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
+        self.assertLess(run.events.index("train/final_summary"), run.events.index("finish"))
 
 
 class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -283,6 +302,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         async def step_async(rows: object) -> GRPOResult:
             trainer.state.global_step += 1
+            trainer._total_input_tokens += 2
             trainer.state.metrics = {"train/loss": 0.25}
             await trainer._save_state_async()
             return GRPOResult(step=trainer.state.global_step)
@@ -293,13 +313,15 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
             state = await trainer.train_async()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
+        self.assertGreater(state.metrics["time/train_runtime"], 0)
+        self.assertEqual(state.metrics["train/total_input_tokens"], 2)
         self.assertEqual(run.texts["checkpoint/path"], (state.checkpoint_path, 1))
         self.assertIn("sample/text", run.texts)
-        summary, step = run.texts["trainer/final_summary"]
+        summary, step = run.texts["train/final_summary"]
         self.assertEqual(step, 1)
         self.assertIn('"train/loss": 0.25', summary)
         self.assertEqual([call.args[0] for call in terminal.call_args_list], summary.splitlines())
-        self.assertLess(run.events.index("trainer/final_summary"), run.events.index("finish"))
+        self.assertLess(run.events.index("train/final_summary"), run.events.index("finish"))
 
 
 if __name__ == "__main__":

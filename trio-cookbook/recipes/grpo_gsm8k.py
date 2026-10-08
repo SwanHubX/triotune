@@ -679,7 +679,19 @@ def main(config: GRPOConfig) -> None:
                 }
             )
             if swanlab_run is not None:
-                swanlab_run.log(log_payload, step=step + 1)
+                swanlab_run.log(
+                    {
+                        (
+                            "train/learning_rate"
+                            if key == "optim/lr"
+                            else f"train/{key.partition('/')[2]}"
+                            if key.startswith(("trainer/", "scalar/"))
+                            else f"train/{key}" if "/" not in key else key
+                        ): value
+                        for key, value in log_payload.items()
+                    },
+                    step=step + 1,
+                )
 
             loss_mean = log_payload.get("trainer/loss")
             loss_mean_text = "n/a" if loss_mean is None else f"{loss_mean:.4f}"

@@ -27,7 +27,7 @@ enable_thinking = false
 [swanlab]
 report_to = "swanlab"
 logging_step = 1
-project = "dpo-cookbook-hhrlhf"
+project = "cookbook-test"
 workspace = "pytrio"
 run_name = "hh-rlhf"
 tags = ["dpo", "hh-rlhf", "modelscope"]

@@ -39,6 +39,9 @@ FINAL_SUMMARY_KEYS = (
     "optim/lr",
     "optim/grad_norm",
     "time/step",
+    "time/train_runtime",
+    "time/train_steps_per_second",
+    "time/train_tokens_per_second",
 )
 
 
@@ -52,8 +55,12 @@ def _is_per_prompt_metric(name: str) -> bool:
 def _swanlab_metric_name(name: str) -> str:
     """Map trainer metrics to the namespaces exposed in SwanLab."""
 
-    if name.startswith("train/"):
-        return "trainer/" + name.removeprefix("train/")
+    if name == "optim/lr":
+        return "train/learning_rate"
+    if name.startswith(("trainer/", "scalar/")):
+        return "train/" + name.partition("/")[2]
+    if "/" not in name:
+        return "train/" + name
     return name
 
 
@@ -189,6 +196,7 @@ class GRPOTrainer:
             prompt_key=self.config.prompt_key,
         )
         self.state = TrainerState()
+        self._total_input_tokens = 0
         self._metric_window: dict[str, tuple[float, int]] = {}
         self._decode = self._make_decode(self._tokenizer)
         self._swanlab_run = self._init_swanlab_run(lora_rank)
@@ -223,8 +231,8 @@ class GRPOTrainer:
                 payload[_swanlab_metric_name(name)] = number
         payload.update(
             {
-                "trainer/num_datums": float(result.num_datums),
-                "trainer/skipped_groups": float(result.skipped_groups),
+                "train/num_datums": float(result.num_datums),
+                "train/skipped_groups": float(result.skipped_groups),
             }
         )
         if not hasattr(self, "_metric_window"):
@@ -241,7 +249,7 @@ class GRPOTrainer:
         payload = {name: total / samples for name, (total, samples) in self._metric_window.items()}
         self._metric_window.clear()
         if payload:
-            self._swanlab_run.log({**payload, "trainer/step": float(step)}, step=step)
+            self._swanlab_run.log({**payload, "train/step": float(step)}, step=step)
 
     def _log_final_checkpoint(self) -> None:
         if (
@@ -269,10 +277,26 @@ class GRPOTrainer:
             tqdm.write(line)
         if self._swanlab_run is not None:
             self._swanlab_run.log_text(
-                key="trainer/final_summary",
+                key="train/final_summary",
                 data="\n".join(lines),
                 step=self.state.global_step,
             )
+
+    def _log_training_summary(self, started: float, initial_step: int, initial_tokens: int) -> None:
+        completed_steps = self.state.global_step - initial_step
+        if completed_steps == 0:
+            return
+        elapsed = time.perf_counter() - started
+        input_tokens = self._total_input_tokens - initial_tokens
+        summary = {
+            "time/train_runtime": elapsed,
+            "time/train_steps_per_second": completed_steps / elapsed,
+            "time/train_tokens_per_second": input_tokens / elapsed,
+            "train/total_input_tokens": float(input_tokens),
+        }
+        self.state.metrics.update(summary)
+        if self._swanlab_run is not None:
+            self._swanlab_run.log(summary, step=self.state.global_step)
 
     @staticmethod
     def _sample_text(response: Any, decode: Callable[[list[int]], str]) -> str:
@@ -483,21 +507,35 @@ class GRPOTrainer:
         optim_method = getattr(self._training_client, "optim_step", None)
         if forward_method is None or optim_method is None:
             raise AttributeError("PyTRIO training_client needs forward_backward() and optim_step().")
+        forward_started = time.perf_counter()
         forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
         forward = wait(forward_future)
+        forward_time = time.perf_counter() - forward_started
+        optim_started = time.perf_counter()
         optim = wait(optim_method(optimizer_params(self.config, trio.AdamParams)))
-        return self._training_metrics(datums, forward, optim)
+        optim_time = time.perf_counter() - optim_started
+        metrics = self._training_metrics(datums, forward, optim)
+        metrics["time/forward_backward"] = forward_time
+        metrics["time/optim"] = optim_time
+        return metrics
 
     async def _train_datums_async(self, datums: list[Any]) -> dict[str, float]:
         if not datums:
             return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
+        forward_started = time.perf_counter()
         forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
         # Do not submit optim_step until forward/backward has completed
         # successfully; this keeps the optimizer boundary failure-safe.
         forward_result = await wait_async(forward)
+        forward_time = time.perf_counter() - forward_started
+        optim_started = time.perf_counter()
         optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, trio.AdamParams))
         optim_result = await wait_async(optim)
-        return self._training_metrics(datums, forward_result, optim_result)
+        optim_time = time.perf_counter() - optim_started
+        metrics = self._training_metrics(datums, forward_result, optim_result)
+        metrics["time/forward_backward"] = forward_time
+        metrics["time/optim"] = optim_time
+        return metrics
 
     @staticmethod
     def _progress_postfix(result: GRPOResult) -> dict[str, str]:
@@ -550,6 +588,7 @@ class GRPOTrainer:
         # 执行一次完整的GRPO训练step
         step_started = time.perf_counter()
         groups = self._groups(rows)
+        prompt_prepare_time = time.perf_counter() - step_started
 
         rollout_started = time.perf_counter()
         sampled = self._sample_groups(groups, self._new_sampling_client())
@@ -561,6 +600,9 @@ class GRPOTrainer:
 
         train_started = time.perf_counter()
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        datum_prepare_time = time.perf_counter() - train_started
+        input_tokens = sum(datum.model_input.length for datum in datums)
+        metrics["train/input_tokens"] = float(input_tokens)
         metrics.update(_rollout_metrics(sampled))
         metrics.update(reward_metrics)
         metrics.update(self._train_datums(datums))
@@ -570,15 +612,20 @@ class GRPOTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = self._save_state()
+        checkpoint_time = time.perf_counter() - checkpoint_started
+        step_time = time.perf_counter() - step_started
         metrics.update(
             {
+                "time/prepare": prompt_prepare_time + datum_prepare_time,
                 "time/rollout": rollout_time,
                 "time/reward": reward_time,
                 "time/train": train_time,
-                "time/checkpoint": time.perf_counter() - checkpoint_started,
-                "time/step": time.perf_counter() - step_started,
+                "time/checkpoint": checkpoint_time,
+                "time/step": step_time,
+                "time/tokens_per_second": input_tokens / step_time,
             }
         )
+        self._total_input_tokens += input_tokens
         self.state.metrics = metrics
         result = GRPOResult(
             self.state.global_step,
@@ -593,6 +640,7 @@ class GRPOTrainer:
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
         step_started = time.perf_counter()
         groups = self._groups(rows)
+        prompt_prepare_time = time.perf_counter() - step_started
 
         rollout_started = time.perf_counter()
         sampled = await self._sample_groups_async(groups, await self._new_sampling_client_async())
@@ -604,6 +652,9 @@ class GRPOTrainer:
 
         train_started = time.perf_counter()
         datums, skipped, metrics = self._build_datums(sampled, reward_groups)
+        datum_prepare_time = time.perf_counter() - train_started
+        input_tokens = sum(datum.model_input.length for datum in datums)
+        metrics["train/input_tokens"] = float(input_tokens)
         metrics.update(_rollout_metrics(sampled))
         metrics.update(reward_metrics)
         metrics.update(await self._train_datums_async(datums))
@@ -613,15 +664,20 @@ class GRPOTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = await self._save_state_async()
+        checkpoint_time = time.perf_counter() - checkpoint_started
+        step_time = time.perf_counter() - step_started
         metrics.update(
             {
+                "time/prepare": prompt_prepare_time + datum_prepare_time,
                 "time/rollout": rollout_time,
                 "time/reward": reward_time,
                 "time/train": train_time,
-                "time/checkpoint": time.perf_counter() - checkpoint_started,
-                "time/step": time.perf_counter() - step_started,
+                "time/checkpoint": checkpoint_time,
+                "time/step": step_time,
+                "time/tokens_per_second": input_tokens / step_time,
             }
         )
+        self._total_input_tokens += input_tokens
         self.state.metrics = metrics
         result = GRPOResult(
             self.state.global_step,
@@ -634,6 +690,9 @@ class GRPOTrainer:
         return result
 
     def train(self) -> TrainerState:
+        started = time.perf_counter()
+        initial_step = self.state.global_step
+        initial_tokens = self._total_input_tokens
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -656,6 +715,7 @@ class GRPOTrainer:
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 self._save_state(final=True)
             self._flush_swanlab(self.state.global_step)
+            self._log_training_summary(started, initial_step, initial_tokens)
             self._report_final_state()
             self._log_final_checkpoint()
             self._log_final_samples(last_rows)
@@ -669,6 +729,9 @@ class GRPOTrainer:
         return self.state
 
     async def train_async(self) -> TrainerState:
+        started = time.perf_counter()
+        initial_step = self.state.global_step
+        initial_tokens = self._total_input_tokens
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -691,6 +754,7 @@ class GRPOTrainer:
             if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
                 await self._save_state_async(final=True)
             self._flush_swanlab(self.state.global_step)
+            self._log_training_summary(started, initial_step, initial_tokens)
             self._report_final_state()
             self._log_final_checkpoint()
             await self._log_final_samples_async(last_rows)

@@ -876,8 +876,18 @@ def main(config: GRPOConfig) -> None:
             )
             if swanlab_run is not None:
                 swanlab_run.log(
-                    {key: metrics[key] for key in COMPARISON_METRIC_KEYS if key in metrics}
-                    | {"trainer/step": float(step + 1)},
+                    {
+                        (
+                            "train/learning_rate"
+                            if key == "optim/lr"
+                            else f"train/{key.partition('/')[2]}"
+                            if key.startswith(("trainer/", "scalar/"))
+                            else f"train/{key}" if "/" not in key else key
+                        ): metrics[key]
+                        for key in COMPARISON_METRIC_KEYS
+                        if key in metrics
+                    }
+                    | {"train/step": float(step + 1)},
                     step=step + 1,
                 )
 

@@ -89,17 +89,22 @@ COMPARISON_METRICS = {
     "rollout/completion_length_min": "rollout/completion_length_min",
     "rollout/completion_length_max": "rollout/completion_length_max",
     "rollout/degenerate_fraction": "rollout/degenerate_fraction",
-    "trainer/loss": "train/loss",
-    "trainer/tokens": "train/tokens",
-    "optim/lr": "optim/lr",
+    "train/loss": "train/loss",
+    "train/tokens": "train/tokens",
+    "train/input_tokens": "train/input_tokens",
+    "train/learning_rate": "optim/lr",
     "optim/grad_norm": "optim/grad_norm",
     "time/rollout": "time/rollout",
     "time/reward": "time/reward",
     "time/train": "time/train",
+    "time/prepare": "time/prepare",
+    "time/forward_backward": "time/forward_backward",
+    "time/optim": "time/optim",
     "time/step": "time/step",
-    "loss_sum": "loss_sum",
-    "loss_mean": "loss_mean",
-    "token_count": "token_count",
+    "time/tokens_per_second": "time/tokens_per_second",
+    "train/loss_sum": "loss_sum",
+    "train/loss_mean": "loss_mean",
+    "train/token_count": "token_count",
 }
 
 
@@ -418,9 +423,9 @@ class SamplePrintingGRPOTrainer(GRPOTrainer):
         }
         payload.update(
             {
-                "trainer/step": float(result.step),
-                "trainer/num_datums": float(result.num_datums),
-                "trainer/skipped_groups": float(result.skipped_groups),
+                "train/step": float(result.step),
+                "train/num_datums": float(result.num_datums),
+                "train/skipped_groups": float(result.skipped_groups),
             }
         )
         self._swanlab_run.log(payload, step=result.step)

@@ -335,7 +335,14 @@ class DirectTrainingTests(unittest.TestCase):
 
         metrics, step = run.logs[0]
         self.assertEqual(step, 1)
-        self.assertEqual(metrics["trainer/loss"], 0.25)
+        self.assertEqual(metrics["train/loss"], 0.25)
+        self.assertEqual(metrics["train/learning_rate"], config.learning_rate)
+        self.assertNotIn("optim/lr", metrics)
+        self.assertFalse(any(key.startswith("trainer/") for key in metrics))
+        self.assertTrue(all("/" in key for key in metrics))
+        self.assertEqual(metrics["train/loss_mean"], 0.25)
+        self.assertEqual(metrics["train/reward"], 0.5)
+        self.assertIn("train/frac_degenerate", metrics)
         self.assertEqual(metrics["optim/grad_norm"], 1.5)
         self.assertAlmostEqual(metrics["policy/kl_sample_train"], 0.0025)
         self.assertEqual(metrics["reward/mean"], 0.5)

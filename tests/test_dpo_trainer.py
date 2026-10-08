@@ -17,6 +17,9 @@ class _Tokenizer:
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         return [ord(character) for character in text]
 
+    def decode(self, tokens: list[int], *, skip_special_tokens: bool = False) -> str:
+        return "".join(chr(token) for token in tokens if not skip_special_tokens or token != 255)
+
 
 class _ChatTokenizer(_Tokenizer):
     def __init__(self) -> None:
@@ -51,12 +54,36 @@ class _ReferenceClient:
         return self.compute_logprobs(model_input)
 
 
+class _SamplingClient:
+    def __init__(self) -> None:
+        self.requests: list[tuple[list[int], object]] = []
+        self.async_calls = 0
+        self.text: str | None = "generated answer"
+        self.sequences: list[object] | None = None
+
+    def sample(self, *, prompt: object, num_samples: int, sampling_params: object) -> SimpleNamespace:
+        self.requests.append((prompt.to_ints(), sampling_params))
+        assert num_samples == 1
+        return SimpleNamespace(sequences=(
+            self.sequences if self.sequences is not None
+            else [SimpleNamespace(text=self.text, tokens=[65, 66])]
+        ))
+
+    async def sample_async(self, **kwargs: object) -> SimpleNamespace:
+        self.async_calls += 1
+        await asyncio.sleep(0)
+        return self.sample(**kwargs)
+
+
 class _TrainingClient:
     def __init__(self) -> None:
         self.datums: list[object] = []
         self.optim_calls = 0
         self.save_calls = 0
         self.fail_forward = False
+        self.sampler = _SamplingClient()
+        self.sampling_client_calls = 0
+        self.async_sampling_client_calls = 0
 
     def get_tokenizer(self) -> _Tokenizer:
         return _Tokenizer()
@@ -98,6 +125,15 @@ class _TrainingClient:
         await asyncio.sleep(0)
         return self.save_state(name=name)
 
+    def save_weights_and_get_sampling_client(self) -> _SamplingClient:
+        self.sampling_client_calls += 1
+        return self.sampler
+
+    async def save_weights_and_get_sampling_client_async(self) -> _SamplingClient:
+        self.async_sampling_client_calls += 1
+        await asyncio.sleep(0)
+        return self.sampler
+
 
 class _ServiceClient:
     def __init__(self) -> None:
@@ -114,13 +150,13 @@ class _ServiceClient:
 class _SwanLabRun:
     def __init__(self) -> None:
         self.logs: list[tuple[object, int]] = []
-        self.texts: list[tuple[str, str]] = []
+        self.texts: list[tuple[str, object]] = []
         self.finished: str | None = None
 
     def log(self, metrics: object, *, step: int) -> None:
         self.logs.append((metrics, step))
 
-    def log_text(self, *, key: str, data: str, step: int) -> None:
+    def log_text(self, *, key: str, data: object, step: int) -> None:
         self.texts.append((key, data))
 
     def finish(self, *, state: str, error: str | None = None) -> None:
@@ -153,6 +189,7 @@ class DPOTrainerTests(unittest.TestCase):
             trainer.train()
 
         init.assert_not_called()
+        self.assertEqual(self.service.training.sampling_client_calls, 0)
         progress.return_value.set_postfix.assert_called_once()
         progress.return_value.update.assert_called_once_with(1)
 
@@ -178,6 +215,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual([datum.loss_fn_inputs["target_tokens"].data for datum in self.service.training.datums], [[65, 255], [66, 255]])
         self.assertEqual(self.service.training.optim_calls, 1)
         self.assertEqual(self.run.logs[0][1], 1)
+        self.assertEqual(self.service.training.sampling_client_calls, 0)
 
     def test_step_logs_dpo_loss_and_measured_work_without_surrogate_loss(self) -> None:
         result = self.trainer(save_every=1).step([{"messages": "P", "chosen": "A", "rejected": "B"}])
@@ -268,7 +306,11 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(state.checkpoint_path, "checkpoint://dpo-step-00000001")
         self.assertEqual(self.service.training.save_calls, 1)
         self.assertEqual(self.run.finished, "success")
-        self.assertEqual(self.run.texts, [("checkpoint/path", state.checkpoint_path)])
+        self.assertEqual(self.run.texts[0], ("checkpoint/path", state.checkpoint_path))
+        self.assertEqual(self.run.texts[1][0], "sample/text")
+        sample = self.run.texts[1][1][0]
+        self.assertEqual((sample.caption, sample.content), ("P", "generated answer"))
+        self.assertEqual(self.service.training.sampler.requests[0][0], [80])
         self.assertEqual(
             {name.split("/", 1)[0] for name in self.run.logs[-1][0]}, {"train", "time"}
         )
@@ -298,6 +340,48 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(self.run.finished, "success")
         self.assertEqual(state.metrics["data/total_tokens"], 4)
         self.assertEqual([step for _, step in self.run.logs], [1, 1])
+        self.assertEqual(self.service.training.async_sampling_client_calls, 1)
+        self.assertEqual(self.service.training.sampler.async_calls, 1)
+        self.assertEqual(self.run.texts[1][0], "sample/text")
+
+    def test_final_samples_cap_at_four_and_decode_missing_text(self) -> None:
+        trainer = self.trainer(max_length=4)
+        trainer.state.global_step = 5
+        self.service.training.sampler.text = None
+        trainer._log_final_samples([{"messages": f"P{i}"} for i in range(5)])
+
+        requests = self.service.training.sampler.requests
+        self.assertEqual(len(requests), 4)
+        self.assertEqual([tokens for tokens, _ in requests], [[80, ord(str(i))] for i in range(4)])
+        self.assertTrue(all(params.max_tokens == 2 for _, params in requests))
+        texts = self.run.texts[0][1]
+        self.assertEqual([(item.caption, item.content) for item in texts], [(f"P{i}", "AB") for i in range(4)])
+
+    def test_final_samples_use_configured_chat_template(self) -> None:
+        trainer = self.trainer(chat_template_kwargs={"enable_thinking": False})
+        tokenizer = _ChatTokenizer()
+        trainer._tokenizer = tokenizer
+        trainer.state.global_step = 1
+
+        trainer._log_final_samples([{"messages": [{"role": "user", "content": "P"}]}])
+
+        self.assertEqual(tokenizer.thinking_values, [False, False])
+        self.assertEqual(self.run.texts[0][1][0].caption, "user:P;assistant:")
+        self.assertEqual(
+            self.service.training.sampler.requests[0][0], tokenizer.encode("user:P;assistant:")
+        )
+
+    def test_final_samples_skip_empty_rows_and_reject_empty_response(self) -> None:
+        trainer = self.trainer()
+        trainer.train_dataset = []
+        trainer.train()
+        self.assertEqual(self.service.training.sampling_client_calls, 0)
+        self.assertEqual(self.run.texts, [])
+
+        trainer = self.trainer()
+        self.service.training.sampler.sequences = []
+        with self.assertRaisesRegex(ValueError, "no sequences"):
+            trainer._log_final_samples([{"messages": "P"}])
 
     @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "DPO extra is not installed")
     def test_pairwise_loss_and_completion_gradients(self) -> None:

@@ -28,7 +28,7 @@ enable_thinking = false
 [swanlab]
 report_to = "swanlab"
 logging_step = 1
-project = "cookbook-grpo-test"
+project = "cookbook-test"
 run_name = "gsm8k"
 workspace = "pytrio"
 tags = ["grpo", "gsm8k"]
