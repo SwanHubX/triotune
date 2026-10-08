@@ -9,14 +9,10 @@
    -log sigmoid(beta * ((log pi_chosen - log ref_chosen)
                         - (log pi_rejected - log ref_rejected))).
 
-训练命令：
-python 01-demo-sync.py \
-    --steps 500 \
-    --batch-size 16 \
-    --sample-size 50000 \
-    --max-length 1024 \
-    --base-model Qwen/Qwen3.5-4B \
-    --swanlab-mode online
+训练命令（默认最多 50 步，与 dpo_rlhf.toml 的主要训练参数一致）：
+uv run --extra dpo python trio-cookbook/recipes/dpo_rlhf.py
+
+只检查本地训练流程时可加 --no-swanlab；首次运行会下载 HH-RLHF 数据。
 
 注意：PyTRIO 的 forward_backward_custom 需要本地安装 torch。
 如果当前环境没有 torch，请先执行：uv add torch
@@ -25,17 +21,19 @@ python 01-demo-sync.py \
 from __future__ import annotations
 
 import argparse
+import gzip
+import json
 import random
 import re
 import shutil
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from datasets import Dataset, concatenate_datasets, load_dataset
 import numpy as np
 import pytrio as trio
 import swanlab
@@ -44,8 +42,9 @@ import torch.nn.functional as F
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# 数据默认缓存到 demo 目录内；首次从 ModelScope 下载，后续直接复用本地文件。
-DEFAULT_DATA_DIR = SCRIPT_DIR / "datasets" / "hh-rlhf"
+ROOT = SCRIPT_DIR.parents[1]
+# 与框架案例使用同一份原始数据缓存及默认训练参数。
+DEFAULT_DATA_DIR = ROOT / ".cache" / "modelscope" / "hh-rlhf"
 DEFAULT_SUBSETS = ["helpful-base"]
 # red-team-attempts 不是 preference modeling 数据，所以不放进可训练子集白名单。
 VALID_SUBSETS = {
@@ -84,13 +83,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", choices=["train", "test"], default="train")
     parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--sample-size", type=int, default=1000, help="随机抽样数量；<=0 表示全用")
+    parser.add_argument("--sample-size", type=int, default=1000, help="有效偏好样本的抽样数量；<=0 表示全用")
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--lora-rank", type=int, default=32)
 
-    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--dpo-beta", type=float, default=0.1)
@@ -102,9 +101,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-weights-name", default="dpo-hh-rlhf-qwen35-4b-sync")
 
     parser.add_argument("--swanlab", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--swanlab-project", default="trio-case")
-    parser.add_argument("--swanlab-name", default="dpo-qwen35-4b-sync")
-    parser.add_argument("--swanlab-workspace", default=None)
+    parser.add_argument("--swanlab-project", default="cookbook-test")
+    parser.add_argument("--swanlab-name", default="hh-rlhf")
+    parser.add_argument("--swanlab-workspace", default="pytrio")
     parser.add_argument(
         "--swanlab-mode",
         choices=["online", "local", "offline", "disabled"],
@@ -154,11 +153,12 @@ def download_if_needed(url: str, local_path: Path, force: bool) -> None:
     tmp_path.replace(local_path)
 
 
-def load_hh_rlhf(args: argparse.Namespace) -> Dataset:
-    """从 ModelScope 下载 HH-RLHF jsonl.gz 到本地，然后用 datasets 读取。"""
-    datasets: list[Dataset] = []
+def load_hh_rlhf(args: argparse.Namespace) -> list[PreferencePair]:
+    """按框架案例的 reservoir 算法从有效 HH-RLHF 偏好对中抽样。"""
+    rng = random.Random(args.seed)
+    sampled: list[PreferencePair] = []
+    seen = 0
     for subset in args.dataset_subsets:
-        # 原始 train/test 由文件路径决定；datasets 这里只是读取本地 jsonl.gz。
         remote_path = f"{subset}/{args.split}.jsonl.gz"
         local_path = args.dataset_dir / remote_path
         download_if_needed(
@@ -166,31 +166,27 @@ def load_hh_rlhf(args: argparse.Namespace) -> Dataset:
             local_path,
             args.force_download,
         )
-        dataset = load_dataset(
-            "json",
-            data_files=str(local_path),
-            split="train",
-            cache_dir=str(args.dataset_dir / ".datasets_cache"),
-        )
-        if not isinstance(dataset, Dataset):
-            raise TypeError(f"Expected Dataset, got {type(dataset)!r}")
-        datasets.append(dataset)
-
-    dataset = datasets[0] if len(datasets) == 1 else concatenate_datasets(datasets)
-    required = {"chosen", "rejected"}
-    if not required.issubset(dataset.column_names):
-        raise ValueError(f"HH-RLHF must contain {required}, got {dataset.column_names}")
-
-    dataset = dataset.shuffle(seed=args.seed)
-    if args.sample_size > 0:
-        dataset = dataset.select(range(min(args.sample_size, len(dataset))))
-    return dataset
+        with gzip.open(local_path, "rt", encoding="utf-8") as source:
+            for line in source:
+                row = json.loads(line)
+                pair = row_to_preference_pair(row) if isinstance(row, dict) else None
+                if pair is None:
+                    continue
+                seen += 1
+                if args.sample_size <= 0 or len(sampled) < args.sample_size:
+                    sampled.append(pair)
+                elif (slot := rng.randrange(seen)) < args.sample_size:
+                    sampled[slot] = pair
+    if not sampled:
+        raise ValueError("No valid HH-RLHF preference pairs were found")
+    rng.shuffle(sampled)
+    return sampled
 
 
 def parse_hh_transcript(text: str) -> list[dict[str, str]] | None:
     """把 HH-RLHF 的 `Human:` / `Assistant:` transcript 解析成 chat messages。"""
     matches = list(TURN_RE.finditer(text))
-    if not matches:
+    if not matches or matches[0].start() != 0 or matches[0].group(1) != "Human":
         return None
 
     messages: list[dict[str, str]] = []
@@ -205,11 +201,13 @@ def parse_hh_transcript(text: str) -> list[dict[str, str]] | None:
     return messages
 
 
-def row_to_preference_pair(row: dict[str, str]) -> PreferencePair | None:
+def row_to_preference_pair(row: dict[str, Any]) -> PreferencePair | None:
     """从 chosen/rejected 完整对话中取共同 prompt 和最终两条 assistant 回复。
 
     DPO 比较的是同一个 prompt 下两个回复谁更好，所以这里会检查前文一致。
     """
+    if not isinstance(row.get("chosen"), str) or not isinstance(row.get("rejected"), str):
+        return None
     chosen_turns = parse_hh_transcript(row["chosen"])
     rejected_turns = parse_hh_transcript(row["rejected"])
     if not chosen_turns or not rejected_turns:
@@ -245,14 +243,22 @@ def encode_messages(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> list[int]:
-    # add_generation_prompt=True 用于 prompt；False 用于已经包含 assistant 回复的完整对话。
-    text = tokenizer.apply_chat_template(
+    # 与框架案例一致，直接使用 chat template 的 token 输出。
+    tokens = tokenizer.apply_chat_template(
         messages,
-        tokenize=False,
+        tokenize=True,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
     )
-    tokens = tokenizer.encode(text, add_special_tokens=False)
+    # Hugging Face 返回 BatchEncoding；直接 list(tokens) 会得到字段名而非 token ID。
+    if isinstance(tokens, Mapping):
+        tokens = tokens["input_ids"]
+    elif hasattr(tokens, "input_ids"):
+        tokens = tokens.input_ids
+    if hasattr(tokens, "tolist"):
+        tokens = tokens.tolist()
+    if len(tokens) == 1 and isinstance(tokens[0], (list, tuple)):
+        tokens = tokens[0]
     if not tokens:
         raise ValueError("Encoded chat template is empty")
     return list(tokens)
@@ -266,7 +272,7 @@ def build_completion_datum(
     max_length: int,
     enable_thinking: bool,
 ) -> trio.Datum | None:
-    """构造只在 assistant 回复 token 上有权重的 cross-entropy Datum。"""
+    """构造与框架案例相同的 prompt 掩码和 completion 标签。"""
     # prompt_tokens 应停在 assistant 开始生成的位置。
     prompt_tokens = encode_messages(
         tokenizer,
@@ -291,22 +297,15 @@ def build_completion_datum(
     if completion_len <= 0 or len(full_tokens) > max_length:
         return None
 
-    # prompt 部分权重为 0，response 部分权重为 1；右移后用 weights[1:] 对齐 target。
-    token_weights = [0.0] * len(prompt_tokens) + [1.0] * completion_len
     input_ids = full_tokens[:-1]
-    target_ids = full_tokens[1:]
-    weights = token_weights[1:]
+    target_ids = [-100] * (len(prompt_tokens) - 1) + full_tokens[len(prompt_tokens) :]
 
-    # DPO loss 只在 response token 上计算，所以 input_ids/target_ids/weights 长度必须一致。
-    if not (len(input_ids) == len(target_ids) == len(weights)):
+    if len(input_ids) != len(target_ids):
         raise ValueError("DPO datum fields must have the same length")
 
     return trio.Datum(
         model_input=trio.ModelInput.from_ints(input_ids),
-        loss_fn_inputs={
-            "target_tokens": np.asarray(target_ids, dtype=np.int64),
-            "weights": np.asarray(weights, dtype=np.float32),
-        },
+        loss_fn_inputs={"target_tokens": np.asarray(target_ids, dtype=np.int64)},
     )
 
 
@@ -337,7 +336,7 @@ def build_pair_datums(
 
 
 def build_step_batch(
-    dataset: Dataset,
+    dataset: list[PreferencePair],
     tokenizer: Any,
     step: int,
     args: argparse.Namespace,
@@ -347,12 +346,8 @@ def build_step_batch(
     start = step * args.batch_size
 
     for index in range(start, start + args.batch_size):
-        # 用取模回绕，允许 steps 超过数据集可切出的 batch 数，方便小样本试跑。
-        row = dataset[index % len(dataset)]
-        pair = row_to_preference_pair(row)
-        if pair is None:
-            continue
-
+        # 框架案例对有效样本循环取 batch；这里使用相同顺序。
+        pair = dataset[index % len(dataset)]
         pair_datums = build_pair_datums(
             tokenizer,
             pair,
@@ -360,7 +355,7 @@ def build_step_batch(
             enable_thinking=args.enable_thinking,
         )
         if pair_datums is None:
-            continue
+            raise ValueError("Training dataset contains an overlong pair after filtering")
 
         # DPO loss 按偶数/奇数下标配对：chosen_0, rejected_0, chosen_1, rejected_1...
         datums.extend(pair_datums)
@@ -369,9 +364,9 @@ def build_step_batch(
 
 def datum_full_tokens(datum: trio.Datum) -> list[int]:
     """从右移后的 Datum 还原完整 token 序列，用于 reference compute_logprobs。"""
-    target_tokens = list(datum.loss_fn_inputs["target_tokens"].data)
-    if not target_tokens:
-        raise ValueError("Datum target_tokens cannot be empty")
+    target_tokens = datum.loss_fn_inputs["target_tokens"].data
+    if not target_tokens or target_tokens[-1] == -100:
+        raise ValueError("Datum must end with a completion token")
     return datum.model_input.to_ints() + [int(target_tokens[-1])]
 
 
@@ -451,14 +446,14 @@ def make_dpo_loss_fn(
             rejected_seq = logprobs_list[index + 1].float()
             device = chosen_seq.device
 
-            chosen_weights = torch.as_tensor(
-                chosen_datum.loss_fn_inputs["weights"].data,
-                dtype=torch.float32,
+            chosen_mask = torch.as_tensor(
+                [token != -100 for token in chosen_datum.loss_fn_inputs["target_tokens"].data],
+                dtype=torch.bool,
                 device=device,
             )
-            rejected_weights = torch.as_tensor(
-                rejected_datum.loss_fn_inputs["weights"].data,
-                dtype=torch.float32,
+            rejected_mask = torch.as_tensor(
+                [token != -100 for token in rejected_datum.loss_fn_inputs["target_tokens"].data],
+                dtype=torch.bool,
                 device=rejected_seq.device,
             )
             chosen_ref_seq = torch.as_tensor(
@@ -472,10 +467,17 @@ def make_dpo_loss_fn(
                 device=rejected_seq.device,
             )
 
-            chosen_logprobs.append(torch.dot(chosen_seq, chosen_weights))
-            rejected_logprobs.append(torch.dot(rejected_seq, rejected_weights))
-            chosen_ref_logprobs.append(torch.dot(chosen_ref_seq, chosen_weights))
-            rejected_ref_logprobs.append(torch.dot(rejected_ref_seq, rejected_weights))
+            if (
+                chosen_seq.numel() != chosen_mask.numel()
+                or rejected_seq.numel() != rejected_mask.numel()
+                or chosen_ref_seq.numel() != chosen_mask.numel()
+                or rejected_ref_seq.numel() != rejected_mask.numel()
+            ):
+                raise ValueError("DPO policy/reference logprobs and labels are not aligned")
+            chosen_logprobs.append(chosen_seq.reshape(-1)[chosen_mask].sum())
+            rejected_logprobs.append(rejected_seq.reshape(-1)[rejected_mask].sum())
+            chosen_ref_logprobs.append(chosen_ref_seq[chosen_mask].sum())
+            rejected_ref_logprobs.append(rejected_ref_seq[rejected_mask].sum())
 
         return compute_dpo_loss(
             chosen_logprobs=chosen_logprobs,
@@ -547,6 +549,23 @@ def main(args: argparse.Namespace) -> None:
     )
     tokenizer = training_client.get_tokenizer()
 
+    # 框架案例会在开始训练前剔除超长偏好对，然后循环使用剩余样本。
+    # 测试桩可以提供自定义数据对象，并由 build_step_batch 自行处理。
+    if dataset and isinstance(dataset[0], PreferencePair):
+        dataset = [
+            pair
+            for pair in dataset
+            if build_pair_datums(
+                tokenizer,
+                pair,
+                max_length=args.max_length,
+                enable_thinking=args.enable_thinking,
+            ) is not None
+        ]
+        if not dataset:
+            raise ValueError("No pairs fit --max-length; increase it or choose another sample")
+        print(f"Training on {len(dataset)} pairs after token-length filtering")
+
     # 本 demo 不从 checkpoint 恢复；DPO reference 直接用未训练的 base model。
     reference_client = service_client.create_sampling_client(base_model=args.base_model)
 
@@ -581,8 +600,8 @@ def main(args: argparse.Namespace) -> None:
                 data,
                 make_dpo_loss_fn(reference_logprobs, args.dpo_beta),
             )
-            optim = training_client.optim_step(adam)
             fwd_bwd_result = fwd_bwd.result()
+            optim = training_client.optim_step(adam)
             optim.result()
 
             updated = time.perf_counter()
