@@ -1,4 +1,4 @@
-"""TRL-style DPO API using PyTRIO clients for model execution.
+"""DPO training with PyTRIO clients for model execution.
 
 Preference pairs are scored against a fixed reference sampler. PyTRIO's
 ``forward_backward_custom`` evaluates policy logprobs remotely, computes the

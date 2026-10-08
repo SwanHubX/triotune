@@ -63,11 +63,6 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-异步场景可以调用 `step_async()` 或 `train_async()`。训练器要求每个 GRPO 组至少包含两个 completion；`loss_fn` 当前支持 `importance_sampling`，模型加载、采样和优化由 PyTRIO 客户端负责。
-`GRPOConfig(report_to="swanlab")` 启用 SwanLab；默认 `report_to=None`，训练进度和最终指标只显示在终端。
-`GRPOConfig(logging_step=10)` 每 10 个训练步向 SwanLab 记录一次整组训练标量；区间内按指标取均值，训练结束时记录不足 10 步的最后一组。默认值 1 表示每步记录。终端进度、checkpoint、最终文本和样本记录不受此间隔控制。
-SwanLab 中训练器指标和无前缀的后端标量都记录在 `train/` 下，例如 `train/loss`、`train/loss_mean`、`train/token_count`、`train/step`、`train/num_datums` 和 `train/skipped_groups`；学习率 `optim/lr` 显示为 `train/learning_rate`，最终摘要文本为 `train/final_summary`。`GRPOResult.metrics` 保留原有键名。
-GRPO 在原有 `time/rollout`、`time/reward`、`time/train` 和 `time/step` 基础上，按实际执行阶段记录 `time/prepare`、`time/forward_backward`、`time/optim`。`train/input_tokens` 统计各训练 Datum 的模型输入 token（同一提示词的多个回复分别计数），`time/tokens_per_second` 用该数量除以整步耗时；训练结束时另记录 `time/train_runtime`、`time/train_steps_per_second` 和 `time/train_tokens_per_second`。GRPO 没有 DPO 的固定参考策略评分或偏好对，因此不记录 `time/reference` 或 pairs/s。
 
 ## DPO 训练
 
@@ -87,5 +82,3 @@ trainer = DPOTrainer(
 state = trainer.train()
 print(state.checkpoint_path)
 ```
-
-启用 SwanLab 且 DPO 训练正常完成至少一步时，`train()` 或 `train_async()` 会用最终权重对最后一批最多 4 个提示词生成回复，并记录到 `sample/text`；单独调用 `step()` 不触发。

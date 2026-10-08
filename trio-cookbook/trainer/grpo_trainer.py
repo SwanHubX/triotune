@@ -1,7 +1,6 @@
 """PyTRIO-native GRPO trainer.
 
-The public shape resembles ``trl.GRPOTrainer`` where it is useful.  Callers
-provide a PyTRIO-supported model name, and the trainer owns the service,
+Callers provide a PyTRIO-supported model name, and the trainer owns the service,
 training, and sampling clients needed by the GRPO loop.  This module currently
 implements group-centered advantages with PyTRIO ``importance_sampling``.
 """
@@ -163,7 +162,7 @@ class GRPOTrainer:
         lora_rank: int = 32,
     ):
         ## Model
-        # TRL Model -> pytrio client
+        # Create the PyTRIO client for the requested base model.
         if not isinstance(model_name, str) or not model_name.strip():
             raise TypeError(
                 "model_name must be a non-empty PyTRIO model name. For the "

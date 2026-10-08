@@ -1,12 +1,4 @@
-"""Configuration for the PyTRIO-backed GRPO trainer.
-
-This is deliberately smaller than ``trl.GRPOConfig``.  TRL's configuration
-also contains local Transformers/Accelerate/vLLM switches; those would be
-misleading for PyTRIO, where the service owns model loading and execution.
-Although configuration objects are often shared utilities, this one is kept
-under ``trainer`` because its fields (group size, reward scaling and the GRPO
-loss contract) are algorithm-specific.
-"""
+"""Configuration for PyTRIO-backed GRPO training."""
 
 from __future__ import annotations
 
@@ -17,7 +9,73 @@ from typing import Any, Literal
 
 @dataclass(slots=True)
 class GRPOConfig:
-    """Configuration for one client-side, text-generation GRPO loop."""
+    """Configure client-side, text-generation GRPO training.
+
+    Parameters:
+        output_dir (`bool`, defaults to `False`):
+            Whether to log the final state checkpoint URI to SwanLab when reporting is enabled.
+        num_generations (`int`, defaults to `8`):
+            Number of completions sampled for each prompt in a GRPO group.
+        max_completion_length (`int`, defaults to `512`):
+            Maximum number of tokens generated per completion.
+        temperature (`float`, defaults to `1.0`):
+            Sampling temperature; higher values make token selection more random.
+        top_p (`float`, defaults to `1.0`):
+            Nucleus-sampling probability threshold; `1.0` considers the full distribution.
+        top_k (`int`, defaults to `-1`):
+            Number of highest-probability tokens kept for sampling; `-1` disables top-k filtering.
+        batch_size (`int`, defaults to `1`):
+            Number of prompts processed per training step.
+        max_steps (`int` or `None`, defaults to `None`):
+            Maximum number of training steps. `None` trains until the dataset is exhausted.
+        learning_rate (`float`, defaults to `4e-5`):
+            Learning rate passed to the remote Adam optimizer.
+        beta1 (`float`, defaults to `0.9`):
+            Adam coefficient for the first-moment estimate.
+        beta2 (`float`, defaults to `0.95`):
+            Adam coefficient for the second-moment estimate.
+        eps (`float`, defaults to `1e-8`):
+            Adam denominator smoothing constant.
+        loss_fn (`str`, defaults to `"importance_sampling"`):
+            Remote training loss function. Only `"importance_sampling"` is currently supported.
+        loss_fn_config (`dict[str, Any]`, defaults to `{}`):
+            Extra configuration passed to the remote loss function.
+        reward_weights (`list[float]` or `None`, defaults to `None`):
+            Weight for each reward function; `None` gives every function weight `1.0`.
+        scale_rewards (`str`, defaults to `"none"`):
+            Advantage scaling: `"none"` centers rewards only, `"group"` divides by each group's standard deviation,
+            and `"batch"` divides by the standard deviation across the entire step.
+        reward_epsilon (`float`, defaults to `1e-4`):
+            Smoothing constant added to the reward standard deviation when scaling advantages.
+        skip_zero_advantage (`bool`, defaults to `True`):
+            Skip groups whose completion advantages are all zero.
+        save_every (`int`, defaults to `0`):
+            Interval between state checkpoints. `0` disables state checkpoint saves.
+        logging_step (`int`, defaults to `1`):
+            Interval for logging averaged training scalars to SwanLab; the final partial interval is also logged.
+        seed (`int` or `None`, defaults to `None`):
+            Seed for the training client and sampling; `None` leaves it unspecified.
+        prompt_key (`str`, defaults to `"messages"`):
+            Dataset column containing each prompt.
+        add_generation_prompt (`bool`, defaults to `True`):
+            Add the assistant-generation prefix when rendering chat messages.
+        stop (`bool`, defaults to `True`):
+            Stop generation at the tokenizer EOS or chat end marker when available.
+        chat_template_kwargs (`dict[str, Any]`, defaults to `{}`):
+            Extra keyword arguments passed to the tokenizer's chat template.
+        report_to (`"swanlab"` or `None`, defaults to `None`):
+            Enable SwanLab reporting, or use terminal progress only when `None`.
+        project (`str`, defaults to `"trio-cookbook-grpo"`):
+            SwanLab project name.
+        workspace (`str` or `None`, defaults to `None`):
+            SwanLab workspace; `None` uses the SDK default.
+        tags (`list[str]` or `None`, defaults to `None`):
+            Tags attached to the SwanLab run.
+        run_name (`str` or `None`, defaults to `None`):
+            SwanLab run name; `None` derives a name from the model.
+        log_dir (`str` or `None`, defaults to `None`):
+            Local directory for SwanLab logs; `None` uses the SDK default.
+    """
 
     output_dir: bool = False
     num_generations: int = 8
