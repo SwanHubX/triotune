@@ -2,8 +2,9 @@
 
 ## 输入数据集格式
 
-`recipes/grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 编码的 JSONL 文件：每个非空行是
-一条 JSON 对象，文件至少包含一条有效记录。例如：
+### GRPO
+
+`grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 JSONL，每行一条记录：
 
 ```jsonl
 {"messages":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
@@ -17,9 +18,19 @@
 - `question`（可选）：原始问题文本，用作 SwanLab 最终推理样例的标题；省略时使用
   渲染后的提示词。其他字段可保留在数据行中。
 
-`--prepare-only` 检查外层字段类型；对话消息或 token 列表的具体内容在训练时进一步
-校验。
+### DPO
 
+`dpo_rlhf_trio.py` 的 `[data].file`（或 `--data-file`）接收 UTF-8 JSONL，
+每行一组偏好数据：
+
+```jsonl
+{"messages":[{"role":"user","content":"你好"}],"chosen":[{"role":"assistant","content":"你好！"}],"rejected":[{"role":"assistant","content":"不想回答。"}]}
+```
+
+`messages` 是共同的对话前文；`chosen` 和 `rejected` 分别是更好和更差的回复，
+三者均为必填。预处理脚本生成的回复字段各含一条 assistant 消息。
+
+以下命令默认从仓库根目录执行，启动脚本会切换到仓库根目录并使用 `uv`。
 
 ## HH-RLHF DPO 案例
 
@@ -37,11 +48,6 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh --prepare-only
 ```bash
 bash trio-cookbook/scripts/train_dpo_rlhf.sh
 ```
-
-本目录存放训练启动脚本；以下为
-[grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) 的使用说明。
-命令默认从仓库根目录执行，并使用 `uv` 管理项目环境。启动脚本会切换到仓库根目录，
-再读取 `trio-cookbook/configs/` 下的参数文件。
 
 ## GSM8K GRPO 案例
 

@@ -14,3 +14,4 @@
 ## 测试结果
 
 1. grpo：[grpo框架测试结果（gms8k案例）](grpo_pytrio-use_eval.md)
+2. dpo：[dpo框架测试结果](dpo_pytrio-use_eval.md)

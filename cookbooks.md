@@ -66,3 +66,11 @@ TRL 的入口是 `GRPOTrainer(model, reward_funcs, args, train_dataset, ... )`�
 4. 仍有边界：同步 `rl_loop` 和 `igpo_loop` 含算法专用控制流；`reinforce.py`、部分 IGPO/score-centering 能力并未全部纳入同一个 `policy_loss` 选择器；异步 RL API 仍标注为 experimental，且不同算法有各自的 log-probability、mask、序列长度和归一化约束。
 
 总体判断：FireWorks 已具备“可复用 RL 编排层 + 多种可插拔 policy-loss”的完整雏形，足以支撑 GRPO/GSPO 及其变体的工程训练；若目标是完全通用的算法平台，还需统一算法注册、数据契约、损失配置校验和同步/异步 recipe 的扩展接口。
+
+
+
+
+# 关于框架自定义的设置
+
+1. 比如优化器类型，现在为了提高训练效率，混合优化器的比较多，可以考虑让用户自定义（看了，不行，直接收 AdamParams）
+2. reward自定义是否能够实现？（可以，主要是grpo可以支持就行）
