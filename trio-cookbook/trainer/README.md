@@ -1,6 +1,6 @@
 # Trainer 模块
 
-`trainer` 包含 PyTRIO 原生 GRPO 和 DPO 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失，通过 PyTRIO 完成远端反向传播。两者均提供同步和异步训练路径。
+`trainer` 包含 PyTRIO 原生 GRPO、DPO 和 SFT 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本。GRPO 和 DPO 提供同步和异步训练路径，SFT 提供同步训练路径。
 
 ## 训练流程
 
@@ -23,6 +23,8 @@
 | [`grpo_config.py`](./grpo_config.py) | `GRPOConfig` | 保存采样、优化、奖励缩放、数据输入和 SwanLab 配置；在初始化时校验数值范围和不兼容选项，并生成采样器和 Adam 参数。 |
 | [`dpo_config.py`](./dpo_config.py) | `DPOConfig` | 配置 DPO 系数、批大小、长度、优化、checkpoint 和 SwanLab。 |
 | [`dpo_trainer.py`](./dpo_trainer.py) | `DPOTrainer`、`DPOState`、`DPOResult` | 用 PyTRIO 的参考采样器和自定义反向接口训练偏好对。 |
+| [`sft_config.py`](./sft_config.py) | `SFTConfig` | 配置批大小、截断、标签掩码、优化器和日志。 |
+| [`sft_trainer.py`](./sft_trainer.py) | `SFTTrainer`、`SFTState` | 将文本或聊天数据转成 next-token 标签，调用 PyTRIO 交叉熵训练并保存状态。 |
 | [`datum.py`](./datum.py) | `build_aligned_datum`、`validate_datum`、`to_client_datum` | 将 prompt token、completion token、旧策略 log-probability 和 advantage 对齐为训练字段，检查长度和有限值，再物化为 PyTRIO 或兼容客户端的 `Datum`。 |
 | [`grpo_trainer.py`](./grpo_trainer.py) | `GRPOTrainer`、`TrainerState` | 训练主编排器。管理客户端、数据行、采样、奖励、advantage、Datum、前向反向、优化、checkpoint、同步/异步训练和 SwanLab 日志。 |
 | [`prompts.py`](./prompts.py) | `RenderedPrompt`、`render_prompt`、`as_prompt_text` | 校验 text-only 输入并调用 tokenizer。聊天消息使用 `apply_chat_template`，整数列表直接作为 token，同时生成采样和奖励需要的文本表示。 |
@@ -77,6 +79,23 @@ rows = [
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
     args=DPOConfig(beta=0.1, batch_size=1, max_steps=1, report_to="swanlab"),
+    train_dataset=rows,
+)
+state = trainer.train()
+print(state.checkpoint_path)
+```
+
+## SFT 训练
+
+`text` 和 `messages` 行默认训练全部 next-token 标签；`prompt`/`completion` 行默认只训练 completion。预分词行可传 `input_ids` 和 `labels`，用 `-100` 屏蔽不参与 loss 的 token。`assistant_only_loss=True` 需要能返回 assistant token mask 的聊天模板。SFT 只支持文本，暂不支持 packing 和多模态数据。
+
+```python
+from trio_cookbook.trainer import SFTConfig, SFTTrainer
+
+rows = [{"prompt": "What is 2 + 2?", "completion": "4"}]
+trainer = SFTTrainer(
+    model="Qwen/Qwen3.5-4B",
+    args=SFTConfig(batch_size=1, max_steps=1, save_every=1),
     train_dataset=rows,
 )
 state = trainer.train()

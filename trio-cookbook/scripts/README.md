@@ -70,3 +70,26 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --help
 ```
+
+## 嬛嬛 SFT 案例
+
+训练数据来自 [huanhuan-chat](https://github.com/KMnO4-zx/huanhuan-chat)，存放在本地 `data/`（该目录不会提交）。先从原项目固定版本下载：
+
+```bash
+mkdir -p data
+curl --fail --location https://raw.githubusercontent.com/KMnO4-zx/huanhuan-chat/2d6c72909d6c3b35e3435cd7ce5658306737bfbd/dataset/train/lora/huanhuan.json --output data/huanhuan.json
+```
+
+配置见 [sft_huanhuan.toml](../configs/sft_huanhuan.toml)。默认使用前 100 条数据、batch size 1、100 step，并记录到 SwanLab：
+
+```bash
+bash trio-cookbook/scripts/train_sft_huanhuan.sh
+```
+
+独立 PyTRIO 版本可用同样参数作对照：
+
+```bash
+uv run python trio-cookbook/recipes/sft_huanhuan.py --steps 100 --batch-size 1 --limit 100 --epochs 1 --save-every 0 --run-name huanhuan-direct-100step-seed42 --swanlab
+```
+
+当前 PyTRIO 服务只支持 Qwen 3.5 系列，因此这个案例沿用原项目的对话数据和角色提示，基础模型改为配置中的 Qwen 3.5 4B。
