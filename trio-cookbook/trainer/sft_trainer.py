@@ -55,7 +55,10 @@ class SFTTrainer:
         if self.args.report_to == "swanlab":
             self._run = swanlab.init(
                 project=self.args.project,
+                workspace=self.args.workspace,
+                tags=self.args.tags,
                 name=self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-sft",
+                log_dir=self.args.log_dir,
                 config={"model": self.model, "lora_rank": lora_rank, **asdict(self.args)},
             )
 

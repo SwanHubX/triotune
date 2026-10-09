@@ -100,6 +100,26 @@ class SFTTrainerTests(unittest.TestCase):
     def trainer(self, **kwargs: object) -> SFTTrainer:
         return SFTTrainer("test-model", args=SFTConfig(**kwargs))
 
+    def test_swanlab_options_and_disabled_reporting(self) -> None:
+        with patch("trio_cookbook.trainer.sft_trainer.swanlab.init") as init:
+            self.trainer()
+            init.assert_not_called()
+            self.trainer(report_to="swanlab")
+            defaults = init.call_args.kwargs
+            for key in ("workspace", "tags", "log_dir"):
+                self.assertIsNone(defaults[key])
+            self.assertEqual(defaults["name"], "test-model-sft")
+
+            self.trainer(
+                report_to="swanlab", workspace="team", tags=["sft", "huanhuan"],
+                run_name="custom-run", log_dir="/tmp/sft-logs",
+            )
+            custom = init.call_args.kwargs
+            self.assertEqual(custom["workspace"], "team")
+            self.assertEqual(custom["tags"], ["sft", "huanhuan"])
+            self.assertEqual(custom["name"], "custom-run")
+            self.assertEqual(custom["log_dir"], "/tmp/sft-logs")
+
     def test_text_and_completion_labels_are_shifted(self) -> None:
         trainer = self.trainer()
         metrics = trainer.step([{"text": "ab"}, {"prompt": "P", "completion": "A"}])
@@ -197,6 +217,26 @@ class SFTRecipeTests(unittest.TestCase):
             overridden = trainer_class.call_args.kwargs["args"]
             self.assertEqual((overridden.max_steps, overridden.batch_size), (2, 2))
             self.assertIsNone(overridden.report_to)
+
+            settings = {
+                "model": {"name": "test-model", "lora_rank": 8},
+                "data": {"file": "data/huanhuan.json", "epochs": 1},
+                "sft": {"batch_size": 1, "max_steps": 1},
+                "swanlab": {
+                    "report_to": "swanlab", "workspace": "team", "tags": ["sft"],
+                    "run_name": "toml-run", "log_dir": "/tmp/sft-logs",
+                },
+            }
+            with (
+                patch.object(sft_huanhuan_trio.tomllib, "load", return_value=settings),
+                patch("sys.argv", ["sft_huanhuan_trio.py"]),
+            ):
+                sft_huanhuan_trio.main()
+            configured = trainer_class.call_args.kwargs["args"]
+            self.assertEqual(configured.workspace, "team")
+            self.assertEqual(configured.tags, ["sft"])
+            self.assertEqual(configured.run_name, "toml-run")
+            self.assertEqual(configured.log_dir, "/tmp/sft-logs")
 
 
 if __name__ == "__main__":

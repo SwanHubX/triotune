@@ -25,7 +25,10 @@ class SFTConfig:
     save_every: int = 0
     report_to: Literal["swanlab"] | None = None
     project: str = "trio-cookbook-sft"
+    workspace: str | None = None
+    tags: list[str] | None = None
     run_name: str | None = None
+    log_dir: str | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1 or (self.max_steps is not None and self.max_steps < 1):

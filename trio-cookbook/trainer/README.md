@@ -89,6 +89,15 @@ print(state.checkpoint_path)
 
 `text` 和 `messages` 行默认训练全部 next-token 标签；`prompt`/`completion` 行默认只训练 completion。预分词行可传 `input_ids` 和 `labels`，用 `-100` 屏蔽不参与 loss 的 token。`assistant_only_loss=True` 需要能返回 assistant token mask 的聊天模板。SFT 只支持文本，暂不支持 packing 和多模态数据。
 
+当 `report_to="swanlab"` 时，`SFTConfig` 的以下字段传给 `swanlab.init`。这些字段默认为 `None`，可在 recipe 的 TOML `[swanlab]` 表中配置。
+
+| 字段 | 作用 |
+| --- | --- |
+| `workspace` | 指定 SwanLab 工作区；`None` 使用 SDK 默认值。 |
+| `tags` | 设置运行标签列表。 |
+| `run_name` | 设置运行名称；`None` 使用 `<模型名>-sft`。 |
+| `log_dir` | 指定本地 SwanLab 日志目录；`None` 使用 SDK 默认值。 |
+
 ```python
 from trio_cookbook.trainer import SFTConfig, SFTTrainer
 

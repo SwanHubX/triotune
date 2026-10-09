@@ -82,6 +82,8 @@ curl --fail --location https://raw.githubusercontent.com/KMnO4-zx/huanhuan-chat/
 
 配置见 [sft_huanhuan.toml](../configs/sft_huanhuan.toml)。默认使用前 100 条数据、batch size 1、100 step，并记录到 SwanLab：
 
+`[swanlab]` 中可设置 `workspace`、`tags`、`run_name` 和 `log_dir`，分别指定工作区、标签、运行名称和本地日志目录。
+
 ```bash
 bash trio-cookbook/scripts/train_sft_huanhuan.sh
 ```

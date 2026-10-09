@@ -25,3 +25,6 @@ enable_thinking = false
 report_to = "swanlab"
 project = "huanhuan-chat-sft"
 run_name = "huanhuan-framework-100step-seed42"
+# workspace = "your-workspace"
+# tags = ["sft", "huanhuan"]
+# log_dir = "swanlog"
