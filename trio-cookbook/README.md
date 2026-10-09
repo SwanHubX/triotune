@@ -57,10 +57,6 @@ DPO 训练数据使用 JSONL，每行包含一组偏好回复：
 - `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
   表示不参与损失。
 
-截断后须保留至少一个有效的 next-token 标签。`assistant_only_loss=True` 还要求
-对话数据及支持 assistant token mask 的聊天模板。嬛嬛 recipe 将原始数据的
-`instruction`、`input`、`output` 转换为 `prompt`/`completion`。
-
 ## 启动命令
 
 在仓库根目录运行（启动脚本使用 `uv`）：
