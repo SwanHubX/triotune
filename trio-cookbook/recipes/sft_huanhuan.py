@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import json
 import math
@@ -46,7 +47,7 @@ def datum(item: dict[str, str], tokenizer: object, max_length: int) -> tuple[tri
     )
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--epochs", type=int, default=3)
@@ -68,10 +69,13 @@ def main() -> None:
     if args.limit is not None:
         rows = rows[: args.limit]
     iterator = iter(itertools.chain.from_iterable(rows for _ in range(args.epochs)))
-    client = trio.ServiceClient().create_lora_training_client(
-        base_model=args.model, rank=args.lora_rank, seed=args.seed
-    )
-    tokenizer = client.get_tokenizer()
+    def create_client():
+        return trio.ServiceClient().create_lora_training_client(
+            base_model=args.model, rank=args.lora_rank, seed=args.seed
+        )
+
+    client = await asyncio.to_thread(create_client)
+    tokenizer = await asyncio.to_thread(client.get_tokenizer)
     optimizer = trio.AdamParams(
         learning_rate=args.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
     )
@@ -96,10 +100,12 @@ def main() -> None:
                 break
             started = time.perf_counter()
             prepared = [datum(item, tokenizer, args.max_length) for item in batch]
-            forward = client.forward_backward(
+            forward_future = await client.forward_backward_async(
                 [entry for entry, _ in prepared], loss_fn="cross_entropy", auto_shift=False
-            ).result()
-            optim = client.optim_step(optimizer).result()
+            )
+            forward = await forward_future
+            optim_future = await client.optim_step_async(optimizer)
+            optim = await optim_future
             metrics = {
                 str(key): float(value)
                 for result in (forward, optim)
@@ -115,13 +121,15 @@ def main() -> None:
             })
             step += 1
             if args.save_every and step % args.save_every == 0:
-                checkpoint = client.save_state(name=f"sft-step-{step:08d}").result().path
+                saved = await client.save_state_async(name=f"sft-step-{step:08d}")
+                checkpoint = (await saved).path
             if run is not None:
                 run.log({**metrics, "train/step": step}, step=step)
             progress.set_postfix({"loss": metrics.get("train/loss")}, refresh=False)
             progress.update(1)
         if step and (not args.save_every or step % args.save_every):
-            checkpoint = client.save_state(name=f"sft-step-{step:08d}").result().path
+            saved = await client.save_state_async(name=f"sft-step-{step:08d}")
+            checkpoint = (await saved).path
         if run is not None:
             if checkpoint is not None:
                 run.log_text(key="checkpoint/path", data=checkpoint, step=step)
@@ -136,4 +144,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

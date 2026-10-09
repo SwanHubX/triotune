@@ -13,7 +13,7 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from ..utils.client import call, optimizer_params
+from ..utils.client import call_async, optimizer_params
 from .prompts import _token_list, render_prompt
 from .sft_config import SFTConfig
 
@@ -31,6 +31,7 @@ class SFTTrainer:
     Prompt-completion rows train on the completion by default; other rows train
     on all next tokens. ``assistant_only_loss`` requires a chat template that
     returns assistant token masks. Packing and multimodal inputs are unsupported.
+    ``step()`` and ``train()`` are coroutines; await them from an event loop.
     """
 
     def __init__(
@@ -149,7 +150,7 @@ class SFTTrainer:
             raise ValueError("The example has no next-token labels after masking/truncation.")
         return tokens, labels
 
-    def step(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+    async def step(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
         if not rows:
             raise ValueError("An SFT step requires at least one row.")
         started = time.perf_counter()
@@ -161,8 +162,8 @@ class SFTTrainer:
             )
             for tokens, labels in examples
         ]
-        forward = call(self._client, "forward_backward", datums, loss_fn="cross_entropy", auto_shift=False)
-        optim = call(self._client, "optim_step", optimizer_params(self.args, trio.AdamParams))
+        forward = await call_async(self._client, "forward_backward", datums, loss_fn="cross_entropy", auto_shift=False)
+        optim = await call_async(self._client, "optim_step", optimizer_params(self.args, trio.AdamParams))
         metrics = {
             str(key): float(value)
             for result in (forward, optim)
@@ -178,17 +179,17 @@ class SFTTrainer:
         })
         self.state.global_step += 1
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
-            self._save_state()
+            await self._save_state()
         self.state.metrics = metrics
         if self._run is not None:
             self._run.log({**metrics, "train/step": self.state.global_step}, step=self.state.global_step)
         return metrics
 
-    def _save_state(self) -> None:
-        saved = call(self._client, "save_state", name=f"sft-step-{self.state.global_step:08d}")
+    async def _save_state(self) -> None:
+        saved = await call_async(self._client, "save_state", name=f"sft-step-{self.state.global_step:08d}")
         self.state.checkpoint_path = saved.path
 
-    def train(self) -> SFTState:
+    async def train(self) -> SFTState:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
         iterator = iter(self.train_dataset)
@@ -198,13 +199,13 @@ class SFTTrainer:
                 rows = list(itertools.islice(iterator, self.args.batch_size))
                 if not rows:
                     break
-                metrics = self.step(rows)
+                metrics = await self.step(rows)
                 progress.set_postfix({"loss": metrics["train/loss"]} if "train/loss" in metrics else {}, refresh=False)
                 progress.update(1)
             if self.state.global_step and (
                 not self.args.save_every or self.state.global_step % self.args.save_every
             ):
-                self._save_state()
+                await self._save_state()
             if self._run is not None:
                 if self.state.checkpoint_path is not None:
                     self._run.log_text(

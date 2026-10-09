@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from trio_cookbook.recipes import sft_huanhuan_trio
+from trio_cookbook.recipes import sft_huanhuan, sft_huanhuan_trio
 from trio_cookbook.trainer import SFTConfig, SFTTrainer
 
 
@@ -22,6 +23,7 @@ class _Tokenizer:
         add_generation_prompt: bool,
         return_dict: bool = False,
         return_assistant_tokens_mask: bool = False,
+        enable_thinking: bool = False,
     ) -> object:
         segments = [f"{message['role']}:{message['content']};" for message in messages]
         text = "".join(segments) + ("assistant:" if add_generation_prompt else "")
@@ -41,6 +43,21 @@ class _NoMaskTokenizer(_Tokenizer):
         if isinstance(output, dict):
             output.pop("assistant_masks")
         return output
+
+
+class _Future:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    async def _resolve(self) -> object:
+        await asyncio.sleep(0)
+        return self.value
+
+    def result(self) -> object:
+        raise AssertionError("The async trainer must not block on result().")
+
+    def __await__(self):
+        return self._resolve().__await__()
 
 
 class _Client:
@@ -68,6 +85,15 @@ class _Client:
         self.saved.append(name)
         return SimpleNamespace(path=f"checkpoint://{name}")
 
+    async def forward_backward_async(self, datums: list[object], **kwargs: object) -> object:
+        return _Future(self.forward_backward(datums, **kwargs))
+
+    async def optim_step_async(self, params: object) -> object:
+        return _Future(self.optim_step(params))
+
+    async def save_state_async(self, *, name: str) -> object:
+        return _Future(self.save_state(name=name))
+
 
 class _Run:
     def __init__(self) -> None:
@@ -85,7 +111,7 @@ class _Run:
         self.finished = True
 
 
-class SFTTrainerTests(unittest.TestCase):
+class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.client = _Client()
         self.run = _Run()
@@ -100,7 +126,34 @@ class SFTTrainerTests(unittest.TestCase):
     def trainer(self, **kwargs: object) -> SFTTrainer:
         return SFTTrainer("test-model", args=SFTConfig(**kwargs))
 
-    def test_swanlab_options_and_disabled_reporting(self) -> None:
+    async def test_waiting_for_forward_yields_and_precedes_optimizer(self) -> None:
+        trainer = self.trainer()
+        submitted, release = asyncio.Event(), asyncio.Event()
+
+        class PendingFuture(_Future):
+            async def _resolve(self) -> object:
+                submitted.set()
+                await release.wait()
+                return self.value
+
+        async def forward(datums: list[object], **kwargs: object) -> object:
+            return PendingFuture(SimpleNamespace(metrics={"loss_mean": 0.5}))
+
+        with patch.object(self.client, "forward_backward_async", side_effect=forward):
+            task = asyncio.create_task(trainer.step([{"text": "ab"}]))
+            try:
+                await asyncio.wait_for(submitted.wait(), timeout=1)
+                self.assertEqual(self.client.optim_calls, 0)
+                self.assertEqual(trainer.state.global_step, 0)
+                release.set()
+                await asyncio.wait_for(task, timeout=1)
+                self.assertEqual(self.client.optim_calls, 1)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_swanlab_options_and_disabled_reporting(self) -> None:
         with patch("trio_cookbook.trainer.sft_trainer.swanlab.init") as init:
             self.trainer()
             init.assert_not_called()
@@ -120,9 +173,9 @@ class SFTTrainerTests(unittest.TestCase):
             self.assertEqual(custom["name"], "custom-run")
             self.assertEqual(custom["log_dir"], "/tmp/sft-logs")
 
-    def test_text_and_completion_labels_are_shifted(self) -> None:
+    async def test_text_and_completion_labels_are_shifted(self) -> None:
         trainer = self.trainer()
-        metrics = trainer.step([{"text": "ab"}, {"prompt": "P", "completion": "A"}])
+        metrics = await trainer.step([{"text": "ab"}, {"prompt": "P", "completion": "A"}])
         self.assertEqual([datum.model_input.to_ints() for datum in self.client.datums],
                          [[97, 98], [80, 65]])
         self.assertEqual([datum.loss_fn_inputs["target_tokens"].data for datum in self.client.datums],
@@ -131,21 +184,21 @@ class SFTTrainerTests(unittest.TestCase):
         self.assertEqual(metrics["train/loss"], 0.5)
         self.assertEqual(self.client.optim_calls, 1)
 
-    def test_assistant_mask_and_pretokenized_labels(self) -> None:
+    async def test_assistant_mask_and_pretokenized_labels(self) -> None:
         trainer = self.trainer(assistant_only_loss=True)
-        trainer.step([{"messages": [
+        await trainer.step([{"messages": [
             {"role": "user", "content": "Q"}, {"role": "assistant", "content": "A"},
         ]}])
         labels = self.client.datums[0].loss_fn_inputs["target_tokens"].data
         self.assertEqual(labels, [-100] * (len("user:Q;") - 1) + [ord(c) for c in "assistant:A;"])
 
         trainer = self.trainer()
-        trainer.step([{"input_ids": [10, 11, 12], "labels": [-100, -100, 12]}])
+        await trainer.step([{"input_ids": [10, 11, 12], "labels": [-100, -100, 12]}])
         self.assertEqual(self.client.datums[0].loss_fn_inputs["target_tokens"].data, [-100, 12])
 
-    def test_chat_completion_only_masks_prompt(self) -> None:
+    async def test_chat_completion_only_masks_prompt(self) -> None:
         trainer = self.trainer()
-        trainer.step([{
+        await trainer.step([{
             "prompt": [{"role": "user", "content": "Q"}],
             "completion": [{"role": "assistant", "content": "A"}],
         }])
@@ -153,30 +206,30 @@ class SFTTrainerTests(unittest.TestCase):
         self.assertEqual(labels[-2:], [ord("A"), ord(";")])
         self.assertTrue(all(token == -100 for token in labels[:-2]))
 
-    def test_invalid_masks_truncation_and_forward_failure(self) -> None:
+    async def test_invalid_masks_truncation_and_forward_failure(self) -> None:
         trainer = self.trainer(max_length=2)
         with self.assertRaisesRegex(ValueError, "no next-token labels"):
-            trainer.step([{"prompt": "PP", "completion": "A"}])
+            await trainer.step([{"prompt": "PP", "completion": "A"}])
         with self.assertRaisesRegex(ValueError, "require labels"):
-            self.trainer(completion_only_loss=True).step([{"input_ids": [10, 11]}])
+            await self.trainer(completion_only_loss=True).step([{"input_ids": [10, 11]}])
         with self.assertRaisesRegex(ValueError, "same length"):
-            self.trainer().step([{"input_ids": [10, 11], "labels": [10]}])
+            await self.trainer().step([{"input_ids": [10, 11], "labels": [10]}])
         self.client.get_tokenizer = lambda: _NoMaskTokenizer()
         with self.assertRaisesRegex(ValueError, "assistant token mask"):
-            self.trainer(assistant_only_loss=True).step([{"messages": [
+            await self.trainer(assistant_only_loss=True).step([{"messages": [
                 {"role": "assistant", "content": "A"},
             ]}])
         self.assertEqual(self.client.optim_calls, 0)
 
         self.client.fail_forward = True
         with self.assertRaisesRegex(RuntimeError, "forward failed"):
-            self.trainer().step([{"text": "ab"}])
+            await self.trainer().step([{"text": "ab"}])
         self.assertEqual(self.client.optim_calls, 0)
 
-    def test_train_saves_and_logs_checkpoint(self) -> None:
+    async def test_train_saves_and_logs_checkpoint(self) -> None:
         trainer = self.trainer(report_to="swanlab", save_every=2, batch_size=1, max_steps=3)
         trainer.train_dataset = [{"text": "ab"}] * 3
-        state = trainer.train()
+        state = await trainer.train()
         self.assertEqual(state.global_step, 3)
         self.assertEqual(self.client.saved, ["sft-step-00000002", "sft-step-00000003"])
         self.assertEqual(self.run.text, ("checkpoint/path", state.checkpoint_path, 3))
@@ -186,23 +239,46 @@ class SFTTrainerTests(unittest.TestCase):
         self.client.saved.clear()
         trainer = self.trainer(max_steps=1)
         trainer.train_dataset = [{"text": "ab"}]
-        self.assertEqual(trainer.train().checkpoint_path, "checkpoint://sft-step-00000001")
+        self.assertEqual((await trainer.train()).checkpoint_path, "checkpoint://sft-step-00000001")
         self.assertEqual(self.client.saved, ["sft-step-00000001"])
 
 
-class SFTRecipeTests(unittest.TestCase):
-    def test_config_defaults_and_cli_overrides(self) -> None:
+class SFTRecipeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_recipe_awaits_sdk_futures(self) -> None:
+        class SDKTokenizer(_Tokenizer):
+            def apply_chat_template(self, *args: object, **kwargs: object) -> object:
+                output = super().apply_chat_template(*args, **kwargs)
+                return {"input_ids": output} if isinstance(output, list) else output
+
+        client = _Client()
+        client.get_tokenizer = lambda: SDKTokenizer()
+        run = _Run()
+        with (
+            patch("pathlib.Path.read_text", return_value='[{"instruction":"Q","input":"","output":"A"}]'),
+            patch.object(sft_huanhuan.trio, "ServiceClient") as service,
+            patch.object(sft_huanhuan.swanlab, "init", return_value=run),
+            patch("sys.argv", ["sft_huanhuan.py", "--steps", "1", "--batch-size", "1", "--swanlab"]),
+            patch("builtins.print"),
+        ):
+            service.return_value.create_lora_training_client.return_value = client
+            await sft_huanhuan.main()
+        self.assertEqual(client.optim_calls, 1)
+        self.assertEqual(client.saved, ["sft-step-00000001"])
+        self.assertEqual(len(run.logs), 1)
+        self.assertTrue(run.finished)
+
+    async def test_config_defaults_and_cli_overrides(self) -> None:
         sample = '[{"instruction":"Q","input":"","output":"A"}]'
         with (
             patch("pathlib.Path.read_text", return_value=sample),
             patch.object(sft_huanhuan_trio, "SFTTrainer") as trainer_class,
             patch("builtins.print"),
         ):
-            trainer_class.return_value.train.return_value = SimpleNamespace(
+            trainer_class.return_value.train = AsyncMock(return_value=SimpleNamespace(
                 global_step=0, checkpoint_path=None, metrics={}
-            )
+            ))
             with patch("sys.argv", ["sft_huanhuan_trio.py"]):
-                sft_huanhuan_trio.main()
+                await sft_huanhuan_trio.main()
             defaults = trainer_class.call_args.kwargs
             self.assertEqual(defaults["model"], "Qwen/Qwen3.5-4B")
             self.assertEqual(defaults["lora_rank"], 8)
@@ -213,7 +289,7 @@ class SFTRecipeTests(unittest.TestCase):
             with patch("sys.argv", [
                 "sft_huanhuan_trio.py", "--steps", "2", "--batch-size", "2", "--no-swanlab"
             ]):
-                sft_huanhuan_trio.main()
+                await sft_huanhuan_trio.main()
             overridden = trainer_class.call_args.kwargs["args"]
             self.assertEqual((overridden.max_steps, overridden.batch_size), (2, 2))
             self.assertIsNone(overridden.report_to)
@@ -231,7 +307,7 @@ class SFTRecipeTests(unittest.TestCase):
                 patch.object(sft_huanhuan_trio.tomllib, "load", return_value=settings),
                 patch("sys.argv", ["sft_huanhuan_trio.py"]),
             ):
-                sft_huanhuan_trio.main()
+                await sft_huanhuan_trio.main()
             configured = trainer_class.call_args.kwargs["args"]
             self.assertEqual(configured.workspace, "team")
             self.assertEqual(configured.tags, ["sft"])

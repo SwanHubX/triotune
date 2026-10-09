@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import json
 import tomllib
@@ -16,7 +17,7 @@ DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "sft_huanhuan.toml"
 SYSTEM_PROMPT = "现在你要扮演皇帝身边的女人--甄嬛"
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--model")
@@ -86,15 +87,16 @@ def main() -> None:
         logging["project"] = args.project
     if args.run_name is not None:
         logging["run_name"] = args.run_name
-    trainer = SFTTrainer(
+    trainer = await asyncio.to_thread(
+        SFTTrainer,
         model=args.model or settings["model"]["name"],
         args=SFTConfig(**sft, **logging),
         train_dataset=itertools.chain.from_iterable(rows for _ in range(epochs)),
         lora_rank=args.lora_rank if args.lora_rank is not None else settings["model"]["lora_rank"],
     )
-    state = trainer.train()
+    state = await trainer.train()
     print(f"steps={state.global_step} checkpoint={state.checkpoint_path} metrics={state.metrics}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

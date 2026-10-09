@@ -88,6 +88,8 @@ bash trio-cookbook/scripts/train_sft_huanhuan.sh
 
 独立 PyTRIO 版本可用同样参数作对照：
 
+两个 SFT recipe 均通过 `asyncio.run` 启动异步训练；模型更新顺序、数据顺序和日志指标保持一致。
+
 ```bash
 uv run python trio-cookbook/recipes/sft_huanhuan.py --steps 100 --batch-size 1 --limit 100 --epochs 1 --save-every 0 --run-name huanhuan-direct-100step-seed42 --swanlab
 ```

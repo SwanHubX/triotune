@@ -1,6 +1,6 @@
 # Trainer 模块
 
-`trainer` 包含 PyTRIO 原生 GRPO、DPO 和 SFT 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本。GRPO 和 DPO 提供同步和异步训练路径，SFT 提供同步训练路径。
+`trainer` 包含 PyTRIO 原生 GRPO、DPO 和 SFT 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本。GRPO 和 DPO 提供同步和异步训练路径，SFT 提供异步训练路径。
 
 ## 训练流程
 
@@ -98,7 +98,11 @@ print(state.checkpoint_path)
 | `run_name` | 设置运行名称；`None` 使用 `<模型名>-sft`。 |
 | `log_dir` | 指定本地 SwanLab 日志目录；`None` 使用 SDK 默认值。 |
 
+`step()`、`train()` 和 checkpoint 保存采用异步 PyTRIO 调用，等待远端结果时让出事件循环。每步仍按反向、优化器更新、保存的顺序执行，不并发更新同一模型。下面使用 `asyncio.run` 启动训练；在已有事件循环中使用 `await trainer.train()`。客户端构造和 tokenization 仍是同步操作，异步应用可用 `asyncio.to_thread` 构造 trainer。
+
 ```python
+import asyncio
+
 from trio_cookbook.trainer import SFTConfig, SFTTrainer
 
 rows = [{"prompt": "What is 2 + 2?", "completion": "4"}]
@@ -107,6 +111,6 @@ trainer = SFTTrainer(
     args=SFTConfig(batch_size=1, max_steps=1, save_every=1),
     train_dataset=rows,
 )
-state = trainer.train()
+state = asyncio.run(trainer.train())
 print(state.checkpoint_path)
 ```
