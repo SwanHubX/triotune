@@ -9,6 +9,57 @@ from typing import Any, Literal
 
 @dataclass(slots=True)
 class SFTConfig:
+    """Configure text-only supervised fine-tuning with PyTRIO.
+
+    Parameters:
+        batch_size (`int`, defaults to `1`):
+            Number of dataset rows processed per training step.
+        max_in_flight (`int`, defaults to `32`):
+            Maximum number of submitted batches awaiting completion during `train()`.
+        max_steps (`int` or `None`, defaults to `None`):
+            Maximum number of training steps. `None` trains until the dataset is exhausted.
+        max_length (`int` or `None`, defaults to `1024`):
+            Maximum token length per example; longer examples are truncated. `None` disables truncation.
+        dataset_text_field (`str`, defaults to `"text"`):
+            Dataset column containing plain text when a row has no other supported input format.
+        completion_only_loss (`bool` or `None`, defaults to `None`):
+            Train only on completion tokens for prompt/completion rows when `True`. `None` enables this
+            for prompt/completion rows and trains on all next tokens for other un-tokenized rows.
+            Pre-tokenized rows use their `labels` to select tokens for the loss.
+        assistant_only_loss (`bool`, defaults to `False`):
+            Train only on assistant tokens in conversational rows; requires a chat template that
+            returns a non-empty assistant token mask.
+        add_eos_token (`bool`, defaults to `True`):
+            Append the tokenizer's EOS token when missing from un-tokenized, non-conversational rows.
+        chat_template_kwargs (`dict[str, Any]`, defaults to `{}`):
+            Extra keyword arguments passed to the tokenizer's chat template for conversational rows.
+        learning_rate (`float`, defaults to `2e-5`):
+            Learning rate passed to the remote Adam optimizer.
+        beta1 (`float`, defaults to `0.9`):
+            Adam coefficient for the first-moment estimate.
+        beta2 (`float`, defaults to `0.95`):
+            Adam coefficient for the second-moment estimate.
+        eps (`float`, defaults to `1e-8`):
+            Adam denominator smoothing constant.
+        seed (`int` or `None`, defaults to `None`):
+            Seed for the PyTRIO training client; `None` leaves it unspecified.
+        save_every (`int`, defaults to `0`):
+            Interval between periodic state checkpoints. `0` disables periodic saves;
+            `train()` still saves the final state after at least one step.
+        report_to (`"swanlab"` or `None`, defaults to `None`):
+            Enable SwanLab reporting, or use terminal progress only when `None`.
+        project (`str`, defaults to `"trio-cookbook-sft"`):
+            SwanLab project name.
+        workspace (`str` or `None`, defaults to `None`):
+            SwanLab workspace; `None` uses the SDK default.
+        tags (`list[str]` or `None`, defaults to `None`):
+            Tags attached to the SwanLab run.
+        run_name (`str` or `None`, defaults to `None`):
+            SwanLab run name; `None` derives a name from the model.
+        log_dir (`str` or `None`, defaults to `None`):
+            Local directory for SwanLab logs; `None` uses the SDK default.
+    """
+
     batch_size: int = 1
     max_in_flight: int = 32
     max_steps: int | None = None

@@ -85,11 +85,3 @@ curl --fail --location https://raw.githubusercontent.com/KMnO4-zx/huanhuan-chat/
 ```bash
 bash trio-cookbook/scripts/train_sft_huanhuan.sh
 ```
-
-独立 PyTRIO 版本可用同样参数作对照：
-
-两个 SFT recipe 均通过 `asyncio.run` 启动流水线训练：顺序提交每批反向和优化器操作，后台等待结果并记录指标。`--max-in-flight` 默认 32，控制未完成批次数；两份脚本的数据、模型更新顺序和指标口径一致。比较训练用时使用最后一步的 `time/train`，请求等待延迟记在 `time/request_latency`。
-
-```bash
-uv run python trio-cookbook/recipes/sft_huanhuan.py --steps 100 --batch-size 1 --limit 100 --epochs 1 --save-every 0 --run-name huanhuan-direct-100step-seed42 --swanlab
-```
