@@ -10,6 +10,7 @@ from typing import Any, Literal
 @dataclass(slots=True)
 class SFTConfig:
     batch_size: int = 1
+    max_in_flight: int = 32
     max_steps: int | None = None
     max_length: int | None = 1024
     dataset_text_field: str = "text"
@@ -33,6 +34,8 @@ class SFTConfig:
     def __post_init__(self) -> None:
         if self.batch_size < 1 or (self.max_steps is not None and self.max_steps < 1):
             raise ValueError("batch_size and max_steps must be positive.")
+        if self.max_in_flight < 1:
+            raise ValueError("max_in_flight must be positive.")
         if self.max_length is not None and self.max_length < 2:
             raise ValueError("max_length must be at least 2.")
         if self.save_every < 0:

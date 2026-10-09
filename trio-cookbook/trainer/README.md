@@ -98,7 +98,11 @@ print(state.checkpoint_path)
 | `run_name` | 设置运行名称；`None` 使用 `<模型名>-sft`。 |
 | `log_dir` | 指定本地 SwanLab 日志目录；`None` 使用 SDK 默认值。 |
 
-`step()`、`train()` 和 checkpoint 保存采用异步 PyTRIO 调用，等待远端结果时让出事件循环。每步仍按反向、优化器更新、保存的顺序执行，不并发更新同一模型。下面使用 `asyncio.run` 启动训练；在已有事件循环中使用 `await trainer.train()`。客户端构造和 tokenization 仍是同步操作，异步应用可用 `asyncio.to_thread` 构造 trainer。
+`train()` 按顺序提交每批的反向、优化器和可选 checkpoint 操作，取得 future 后继续提交下一批，由后台任务等待结果并按批次顺序记录指标。PyTRIO 为同一客户端的事件排序，保证模型更新顺序；不要并发调用同一 trainer 的 `step()` 或 `train()`。`max_in_flight`（默认 32）限制未完成批次数，设为 1 时逐批等待。`step()` 提交一个 batch 并等待完成。训练结束或出错时回收后台任务；已提交的远端操作无法通过取消本地任务撤销。
+
+`time/request_latency` 表示从准备该批到取得结果的延迟，多个 batch 的延迟可能重叠；`time/step` 表示相邻批次按顺序确认完成的间隔，首批从训练开始计时；`time/train` 表示到当前批次的累计训练墙钟时间。比较吞吐使用最后一步的 `time/train`，不累加请求延迟。训练计时包含样本准备与流水线排队，不含客户端初始化、最后单独保存 checkpoint 和结束上传。
+
+下面使用 `asyncio.run` 启动训练；在已有事件循环中使用 `await trainer.train()`。客户端构造和 tokenization 仍是同步操作，异步应用可用 `asyncio.to_thread` 构造 trainer。
 
 ```python
 import asyncio

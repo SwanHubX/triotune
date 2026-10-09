@@ -23,6 +23,7 @@ async def main() -> None:
     parser.add_argument("--model")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--max-in-flight", type=int)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--limit", type=int, help="Use only the first N dialogue pairs.")
     parser.add_argument("--data-file", type=Path)
@@ -75,6 +76,7 @@ async def main() -> None:
     sft = dict(settings["sft"])
     for option, field in (
         ("batch_size", "batch_size"), ("steps", "max_steps"),
+        ("max_in_flight", "max_in_flight"),
         ("max_length", "max_length"), ("learning_rate", "learning_rate"),
         ("save_every", "save_every"), ("seed", "seed"),
     ):

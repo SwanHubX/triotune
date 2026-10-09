@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -66,11 +67,13 @@ class _Client:
         self.optim_calls = 0
         self.fail_forward = False
         self.saved: list[str] = []
+        self.events: list[str] = []
 
     def get_tokenizer(self) -> _Tokenizer:
         return _Tokenizer()
 
     def forward_backward(self, datums: list[object], **kwargs: object) -> object:
+        self.events.append("forward")
         self.datums = datums
         assert kwargs == {"loss_fn": "cross_entropy", "auto_shift": False}
         if self.fail_forward:
@@ -78,10 +81,12 @@ class _Client:
         return SimpleNamespace(metrics={"loss_mean": 0.5, "token_count": 2})
 
     def optim_step(self, params: object) -> object:
+        self.events.append("optim")
         self.optim_calls += 1
         return SimpleNamespace(metrics={"grad_norm": 0.1})
 
     def save_state(self, *, name: str) -> object:
+        self.events.append(name)
         self.saved.append(name)
         return SimpleNamespace(path=f"checkpoint://{name}")
 
@@ -126,7 +131,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def trainer(self, **kwargs: object) -> SFTTrainer:
         return SFTTrainer("test-model", args=SFTConfig(**kwargs))
 
-    async def test_waiting_for_forward_yields_and_precedes_optimizer(self) -> None:
+    async def test_optimizer_submitted_before_forward_result(self) -> None:
         trainer = self.trainer()
         submitted, release = asyncio.Event(), asyncio.Event()
 
@@ -143,7 +148,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(trainer.step([{"text": "ab"}]))
             try:
                 await asyncio.wait_for(submitted.wait(), timeout=1)
-                self.assertEqual(self.client.optim_calls, 0)
+                self.assertEqual(self.client.optim_calls, 1)
                 self.assertEqual(trainer.state.global_step, 0)
                 release.set()
                 await asyncio.wait_for(task, timeout=1)
@@ -152,6 +157,109 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                 if not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+
+    async def test_pipeline_submits_batches_and_checkpoints_in_order(self) -> None:
+        trainer = self.trainer(report_to="swanlab", max_steps=3, save_every=2)
+        trainer.train_dataset = [{"text": "ab"}] * 3
+        release, all_submitted = asyncio.Event(), asyncio.Event()
+        count = 0
+
+        class PendingFuture(_Future):
+            async def _resolve(self) -> object:
+                await release.wait()
+                return self.value
+
+        async def forward(datums: list[object], **kwargs: object) -> object:
+            nonlocal count
+            result = self.client.forward_backward(datums, **kwargs)
+            count += 1
+            if count == 3:
+                all_submitted.set()
+            return PendingFuture(result) if count == 1 else _Future(result)
+
+        with patch.object(self.client, "forward_backward_async", side_effect=forward):
+            task = asyncio.create_task(trainer.train())
+            try:
+                await asyncio.wait_for(all_submitted.wait(), 1)
+                self.assertEqual(self.client.events, [
+                    "forward", "optim", "forward", "optim", "sft-step-00000002", "forward", "optim",
+                ])
+                self.assertEqual(self.run.logs, [])
+                self.assertEqual(trainer.state.global_step, 0)
+                release.set()
+                state = await asyncio.wait_for(task, 1)
+                self.assertEqual(state.global_step, 3)
+                self.assertEqual([step for _, step in self.run.logs], [1, 2, 3])
+                self.assertEqual(state.checkpoint_path, "checkpoint://sft-step-00000003")
+                total = sum(values["time/step"] for values, _ in self.run.logs)
+                self.assertAlmostEqual(total, state.metrics["time/train"])
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_pipeline_limits_outstanding_batches(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_in_flight"):
+            SFTConfig(max_in_flight=0)
+        trainer = self.trainer(max_steps=4, max_in_flight=2)
+        trainer.train_dataset = [{"text": "ab"}] * 4
+        submitted, release = asyncio.Event(), asyncio.Event()
+        count = 0
+
+        class PendingFuture(_Future):
+            async def _resolve(self) -> object:
+                await release.wait()
+                return self.value
+
+        async def forward(datums: list[object], **kwargs: object) -> object:
+            nonlocal count
+            count += 1
+            if count == 2:
+                submitted.set()
+            return PendingFuture(self.client.forward_backward(datums, **kwargs))
+
+        with patch.object(self.client, "forward_backward_async", side_effect=forward):
+            task = asyncio.create_task(trainer.train())
+            try:
+                await asyncio.wait_for(submitted.wait(), 1)
+                await asyncio.sleep(0)
+                self.assertEqual(count, 2)
+                release.set()
+                self.assertEqual((await asyncio.wait_for(task, 1)).global_step, 4)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_remote_failure_reclaims_background_tasks(self) -> None:
+        trainer = self.trainer(report_to="swanlab", max_steps=3)
+        trainer.train_dataset = [{"text": "ab"}] * 3
+        tasks = []
+        create_task = asyncio.create_task
+
+        class FailedFuture(_Future):
+            async def _resolve(self) -> object:
+                await asyncio.sleep(0)
+                raise RuntimeError("remote forward failed")
+
+        def tracked_task(coro):
+            task = create_task(coro)
+            tasks.append(task)
+            return task
+
+        with (
+            patch.object(self.client, "forward_backward_async", return_value=FailedFuture(None)),
+            patch("trio_cookbook.trainer.sft_trainer.asyncio.create_task", side_effect=tracked_task),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "remote forward failed"):
+                await trainer.train()
+        self.assertTrue(tasks)
+        self.assertTrue(all(task.done() for task in tasks))
+        self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(self.client.saved, [])
+        self.assertTrue(self.run.finished)
 
     async def test_swanlab_options_and_disabled_reporting(self) -> None:
         with patch("trio_cookbook.trainer.sft_trainer.swanlab.init") as init:
@@ -250,21 +358,54 @@ class SFTRecipeTests(unittest.IsolatedAsyncioTestCase):
                 output = super().apply_chat_template(*args, **kwargs)
                 return {"input_ids": output} if isinstance(output, list) else output
 
-        client = _Client()
+        release, submitted = asyncio.Event(), asyncio.Event()
+
+        class PendingFuture(_Future):
+            async def _resolve(self) -> object:
+                await release.wait()
+                return self.value
+
+        class QueuedClient(_Client):
+            async def forward_backward_async(self, datums: list[object], **kwargs: object) -> object:
+                result = self.forward_backward(datums, **kwargs)
+                return PendingFuture(result) if self.events.count("forward") == 1 else _Future(result)
+
+            async def optim_step_async(self, params: object) -> object:
+                result = self.optim_step(params)
+                if self.optim_calls == 3:
+                    submitted.set()
+                return _Future(result)
+
+        client = QueuedClient()
         client.get_tokenizer = lambda: SDKTokenizer()
         run = _Run()
         with (
-            patch("pathlib.Path.read_text", return_value='[{"instruction":"Q","input":"","output":"A"}]'),
+            patch("pathlib.Path.read_text", return_value=json.dumps([
+                {"instruction": "Q", "input": "", "output": "A"},
+            ] * 3)),
             patch.object(sft_huanhuan.trio, "ServiceClient") as service,
             patch.object(sft_huanhuan.swanlab, "init", return_value=run),
-            patch("sys.argv", ["sft_huanhuan.py", "--steps", "1", "--batch-size", "1", "--swanlab"]),
+            patch("sys.argv", ["sft_huanhuan.py", "--steps", "3", "--batch-size", "1", "--save-every", "2", "--swanlab"]),
             patch("builtins.print"),
         ):
-            service.return_value.create_lora_training_client.return_value = client
-            await sft_huanhuan.main()
-        self.assertEqual(client.optim_calls, 1)
-        self.assertEqual(client.saved, ["sft-step-00000001"])
-        self.assertEqual(len(run.logs), 1)
+            service.return_value.create_lora_training_client_async = AsyncMock(return_value=client)
+            task = asyncio.create_task(sft_huanhuan.main())
+            try:
+                await asyncio.wait_for(submitted.wait(), 1)
+                self.assertEqual(run.logs, [])
+                self.assertEqual(client.events, [
+                    "forward", "optim", "forward", "optim", "sft-step-00000002", "forward", "optim",
+                ])
+                release.set()
+                await asyncio.wait_for(task, 1)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(client.optim_calls, 3)
+        self.assertEqual(client.saved, ["sft-step-00000002", "sft-step-00000003"])
+        self.assertEqual([step for _, step in run.logs], [1, 2, 3])
         self.assertTrue(run.finished)
 
     async def test_config_defaults_and_cli_overrides(self) -> None:
@@ -283,15 +424,17 @@ class SFTRecipeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(defaults["model"], "Qwen/Qwen3.5-4B")
             self.assertEqual(defaults["lora_rank"], 8)
             self.assertEqual(defaults["args"].max_steps, 100)
+            self.assertEqual(defaults["args"].max_in_flight, 32)
             self.assertEqual(defaults["args"].report_to, "swanlab")
             self.assertEqual(list(defaults["train_dataset"])[0]["completion"][0]["content"], "A")
 
             with patch("sys.argv", [
-                "sft_huanhuan_trio.py", "--steps", "2", "--batch-size", "2", "--no-swanlab"
+                "sft_huanhuan_trio.py", "--steps", "2", "--batch-size", "2", "--max-in-flight", "2", "--no-swanlab"
             ]):
                 await sft_huanhuan_trio.main()
             overridden = trainer_class.call_args.kwargs["args"]
             self.assertEqual((overridden.max_steps, overridden.batch_size), (2, 2))
+            self.assertEqual(overridden.max_in_flight, 2)
             self.assertIsNone(overridden.report_to)
 
             settings = {

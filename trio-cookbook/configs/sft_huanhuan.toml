@@ -9,6 +9,7 @@ epochs = 1
 
 [sft]
 batch_size = 1
+max_in_flight = 32
 max_steps = 100
 max_length = 384
 learning_rate = 1e-4
