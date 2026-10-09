@@ -30,6 +30,23 @@
 `messages` 是共同的对话前文；`chosen` 和 `rejected` 分别是更好和更差的回复，
 三者均为必填。预处理脚本生成的回复字段各含一条 assistant 消息。
 
+### SFT
+
+`SFTTrainer` 的每条样本可使用以下一种格式，例如 `{"text":"你好，世界！"}`：
+
+- `text`（或 `dataset_text_field` 指定的字段）：字符串。
+- `messages`：非空聊天消息列表，每条包含非空字符串 `role` 和字符串 `content`。
+- `prompt` 与 `completion`：两者同为字符串或聊天消息列表；默认只对 completion
+  计算损失。
+- `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
+  表示不参与损失。
+
+截断后须保留至少一个有效的 next-token 标签；`assistant_only_loss=True` 要求对话数据
+及支持 assistant token mask 的聊天模板。
+
+嬛嬛示例脚本读取 `data/huanhuan.json` 中的 `instruction`、`input`、`output`，
+再转换为 `prompt`/`completion`；上述行格式适用于直接向 `SFTTrainer` 传入数据。
+
 以下命令默认从仓库根目录执行，启动脚本会切换到仓库根目录并使用 `uv`。
 
 ## HH-RLHF DPO 案例
@@ -69,4 +86,19 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 
 ```bash
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --help
+```
+
+## 嬛嬛 SFT 案例
+
+训练数据下载：
+
+```bash
+mkdir -p data
+curl --fail --location https://raw.githubusercontent.com/KMnO4-zx/huanhuan-chat/2d6c72909d6c3b35e3435cd7ce5658306737bfbd/dataset/train/lora/huanhuan.json --output data/huanhuan.json
+```
+
+训练启动：
+
+```bash
+bash trio-cookbook/scripts/train_sft_huanhuan.sh
 ```

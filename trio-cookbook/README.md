@@ -1,13 +1,13 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO 训练器及示例。源码目录名为
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT 训练器及示例。源码目录名为
 `trio-cookbook`，Python 导入名为 `trio_cookbook`。
 
 ## 目录结构
 
 ```text
 trio-cookbook/
-├── configs/          # GRPO、DPO 训练参数
+├── configs/          # GRPO、DPO、SFT 训练参数
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
 ├── trainer/          # 算法核心：输入、采样、奖励、优势、Datum 和训练循环
@@ -46,6 +46,17 @@ DPO 训练数据使用 JSONL，每行包含一组偏好回复：
 `messages` 是共同的对话前文；`chosen` 和 `rejected` 分别是更好和更差的回复，
 三者均为必填。预处理脚本生成的回复字段各含一条 assistant 消息。
 
+### SFT
+
+`SFTTrainer` 的每条样本可使用以下一种格式，例如 `{"text":"你好，世界！"}`：
+
+- `text`（或 `dataset_text_field` 指定的字段）：字符串。
+- `messages`：非空聊天消息列表，每条包含非空字符串 `role` 和字符串 `content`。
+- `prompt` 与 `completion`：两者同为字符串或聊天消息列表；默认只对 completion
+  计算损失。
+- `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
+  表示不参与损失。
+
 ## 启动命令
 
 在仓库根目录运行（启动脚本使用 `uv`）：
@@ -70,5 +81,10 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh --prepare-only
 bash trio-cookbook/scripts/train_dpo_rlhf.sh
 ```
 
-GRPO 启动脚本每次重新生成数据；DPO 启动脚本默认复用已有数据，传入 `--rebuild-data`
-才重新生成。自定义数据的参数见 [脚本说明](scripts/README.md)。
+### SFT
+
+按 [脚本说明](scripts/README.md) 下载数据后，使用 `configs/sft_huanhuan.toml` 启动训练：
+
+```bash
+bash trio-cookbook/scripts/train_sft_huanhuan.sh
+```
