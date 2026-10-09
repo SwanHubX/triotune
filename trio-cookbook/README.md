@@ -1,13 +1,13 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO 训练器及示例。源码目录名为
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT 训练器及示例。源码目录名为
 `trio-cookbook`，Python 导入名为 `trio_cookbook`。
 
 ## 目录结构
 
 ```text
 trio-cookbook/
-├── configs/          # GRPO、DPO 训练参数
+├── configs/          # GRPO、DPO、SFT 训练参数
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
 ├── trainer/          # 算法核心：输入、采样、奖励、优势、Datum 和训练循环
@@ -70,5 +70,10 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh --prepare-only
 bash trio-cookbook/scripts/train_dpo_rlhf.sh
 ```
 
-GRPO 启动脚本每次重新生成数据；DPO 启动脚本默认复用已有数据，传入 `--rebuild-data`
-才重新生成。自定义数据的参数见 [脚本说明](scripts/README.md)。
+### SFT
+
+按 [脚本说明](scripts/README.md) 下载数据后，使用 `configs/sft_huanhuan.toml` 启动训练：
+
+```bash
+bash trio-cookbook/scripts/train_sft_huanhuan.sh
+```
