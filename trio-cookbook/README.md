@@ -46,6 +46,21 @@ DPO 训练数据使用 JSONL，每行包含一组偏好回复：
 `messages` 是共同的对话前文；`chosen` 和 `rejected` 分别是更好和更差的回复，
 三者均为必填。预处理脚本生成的回复字段各含一条 assistant 消息。
 
+### SFT
+
+`SFTTrainer` 的每条样本可使用以下一种格式，例如 `{"text":"你好，世界！"}`：
+
+- `text`（或 `dataset_text_field` 指定的字段）：字符串。
+- `messages`：非空聊天消息列表，每条包含非空字符串 `role` 和字符串 `content`。
+- `prompt` 与 `completion`：两者同为字符串或聊天消息列表；默认只对 completion
+  计算损失。
+- `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
+  表示不参与损失。
+
+截断后须保留至少一个有效的 next-token 标签。`assistant_only_loss=True` 还要求
+对话数据及支持 assistant token mask 的聊天模板。嬛嬛 recipe 将原始数据的
+`instruction`、`input`、`output` 转换为 `prompt`/`completion`。
+
 ## 启动命令
 
 在仓库根目录运行（启动脚本使用 `uv`）：
