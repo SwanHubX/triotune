@@ -1,4 +1,4 @@
-"""使用 ``trio_cookbook.trainer`` 训练 4x4 数独的 GRPO recipe。
+"""使用 ``trio_cookbook.trainer.grpo`` 训练 4x4 数独的 GRPO recipe。
 
 这个脚本把 ``trio-cookbook/recipes/grpo_sudoku.py`` 的任务逻辑接到
 PyTRIO cookbook 的 ``GRPOTrainer`` 上：数据格式、prompt、六项奖励和组内
@@ -41,7 +41,7 @@ import pytrio as trio
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
-from trio_cookbook.trainer import GRPOBatch, GRPOConfig as BaseGRPOConfig, GRPOResult, GRPOTrainer
+from trio_cookbook.trainer.grpo import GRPOBatch, GRPOConfig as BaseGRPOConfig, GRPOResult, GRPOTrainer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

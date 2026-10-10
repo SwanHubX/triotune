@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from trio_cookbook import DPOConfig, DPOTrainer
+from trio_cookbook.trainer.dpo import DPOConfig, DPOTrainer
 
 
 ROOT = Path(__file__).resolve().parents[2]

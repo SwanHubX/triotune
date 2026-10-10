@@ -9,7 +9,7 @@ import json
 import tomllib
 from pathlib import Path
 
-from trio_cookbook.trainer import SFTConfig, SFTTrainer
+from trio_cookbook.trainer.sft import SFTConfig, SFTTrainer
 
 
 ROOT = Path(__file__).resolve().parents[2]

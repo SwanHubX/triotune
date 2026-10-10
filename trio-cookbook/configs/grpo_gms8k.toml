@@ -1,3 +1,7 @@
+# recipes/grpo_gms8k_trio.py 读取本文件。
+# [grpo] 与 [swanlab] 合并为 trio_cookbook.trainer.grpo.GRPOConfig。
+# [model] 和 [data] 是 recipe 的模型初始化与数据准备参数。
+
 [model]
 name = "Qwen/Qwen3.5-9B"
 lora_rank = 32

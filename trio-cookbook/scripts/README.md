@@ -1,5 +1,24 @@
 # 训练脚本
 
+## 脚本、配置与算法入口
+
+脚本调用 recipe，recipe 读取 TOML 并使用对应算法包的公开入口：
+
+| 启动脚本 | Recipe | 配置 | Python 入口 |
+| --- | --- | --- | --- |
+| [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) | [grpo_gms8k.toml](../configs/grpo_gms8k.toml) | `trio_cookbook.trainer.grpo` |
+| [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [dpo_rlhf_trio.py](../recipes/dpo_rlhf_trio.py) | [dpo_rlhf.toml](../configs/dpo_rlhf.toml) | `trio_cookbook.trainer.dpo` |
+| [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [sft_huanhuan_trio.py](../recipes/sft_huanhuan_trio.py) | [sft_huanhuan.toml](../configs/sft_huanhuan.toml) | `trio_cookbook.trainer.sft` |
+
+各配置的算法表（`[grpo]`、`[dpo]`、`[sft]`）与 `[swanlab]`
+合并为对应的 Config；`[model]` 与 `[data]` 由 recipe 读取。
+训练器目录调整不影响脚本路径和配置字段，原有启动命令仍可使用。
+DPO 脚本保留 `uv run --extra dpo`，用于安装本地损失计算需要的 PyTorch。
+
+数独框架示例 [grpo_sudoku_trio.py](../recipes/grpo_sudoku_trio.py)
+同样使用 `trio_cookbook.trainer.grpo`，通过自己的命令行参数配置。
+独立版 recipe 直接调用 PyTRIO。OPD 当前提供算法模块和使用示例，尚无启动脚本或配置 recipe。
+
 ## 输入数据集格式
 
 ### GRPO
