@@ -34,4 +34,4 @@ logging_step = 1
 project = "cookbook-test"
 workspace = "pytrio"
 run_name = "hh-rlhf"
-tags = ["dpo", "hh-rlhf", "modelscope"]
+tags = ["dpo", "hh-rlhf", "trainer"]

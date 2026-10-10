@@ -60,11 +60,6 @@ DPO 脚本保留 `uv run --extra dpo`，用于安装本地损失计算需要的 
 - `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
   表示不参与损失。
 
-截断后须保留至少一个有效的 next-token 标签；`assistant_only_loss=True` 要求对话数据
-及支持 assistant token mask 的聊天模板。
-
-嬛嬛示例脚本读取 `data/huanhuan.json` 中的 `instruction`、`input`、`output`，
-再转换为 `prompt`/`completion`；上述行格式适用于直接向 `SFTTrainer` 传入数据。
 
 以下命令默认从仓库根目录执行，启动脚本会切换到仓库根目录并使用 `uv`。
 

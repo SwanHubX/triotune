@@ -31,5 +31,5 @@ report_to = "swanlab"
 project = "cookbook-test"
 run_name = "huanhuan-framework-100step-seed42"
 workspace = "pytrio"
-tags = ["sft", "huanhuan"]
+tags = ["sft", "trainer"]
 # log_dir = "swanlog"

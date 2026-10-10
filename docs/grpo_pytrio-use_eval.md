@@ -107,3 +107,9 @@ B现通过 get_stop_sequences() 传入了 eos_token 和 <|im_end|>，遇到结�
 | `policy/kl_sample_train`（有值 step） | 0.00025311 | 0.00018280 | +0.00007031 |
 
 两边平均 reward 都达到满分 3.0 的 98% 以上，均值只差约 0.09%，说明框架版与独立版的 prompt、奖励和 GRPO 更新路径整体一致。A 的退化组更少，因此产生了更多有效 Datum 和 optimizer step；相应的 loss、KL 差异主要来自实际采样回答不同，不能解释为同一批数据上的公式误差。
+
+
+
+## 修改了trainer布局之后的测试
+
+等待中...
