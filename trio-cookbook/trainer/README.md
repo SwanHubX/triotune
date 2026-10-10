@@ -2,38 +2,63 @@
 
 `trainer` 包含 PyTRIO 原生 GRPO、DPO、SFT 和 OPD 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本；OPD 用学生生成的序列及教师评分进行在线蒸馏。GRPO、DPO 和 OPD 提供同步和异步训练路径，SFT 提供异步训练路径。
 
-## 训练流程
 
-一次训练 step 大致按以下顺序执行：
+## 目录与职责
 
-1. `GRPOTrainer` 从数据行读取默认的 `messages` 字段。
-2. `prompts.py` 校验并渲染字符串、整数 token 列表或文本聊天消息。
-3. `rollout.py` 通过 `SamplingClient` 为每个输入采样多个 completion，并校验 token、log-probability 和文本。
-4. `rewards.py` 批量调用奖励函数，聚合各个奖励并生成奖励指标。
-5. `advantages.py` 在每个 prompt 对应的 completion 组内计算 centered advantage。
-6. `datum.py` 完成 prompt 与 completion 的 one-token shift，构造 PyTRIO `Datum`。
-7. `GRPOTrainer` 调用 `forward_backward` 和 `optim_step`，记录指标并按配置保存状态。
 
-## 文件说明
+```text
+trainer/
+├── __init__.py          # 公开导出与历史模块路径兼容
+├── common/
+│   ├── prompts.py       # 通用文本、token 和聊天输入渲染
+│   ├── logging.py       # SwanLab 初始化、指标窗口计算和结束记录
+│   └── checkpoint.py    # checkpoint 命名、保存和响应校验
+├── grpo/
+│   ├── config.py
+│   ├── trainer.py
+│   ├── types.py
+│   ├── advantages.py
+│   ├── rewards.py
+│   ├── rollout.py
+│   ├── datum.py
+│   └── metrics.py
+├── dpo/
+│   ├── config.py
+│   ├── trainer.py
+│   ├── types.py
+│   ├── data.py
+│   ├── loss.py
+│   └── metrics.py
+├── sft/
+│   ├── config.py
+│   ├── trainer.py
+│   ├── types.py
+│   └── data.py
+└── opd/
+    ├── config.py
+    ├── trainer.py
+    ├── types.py
+    └── distillation.py
+```
 
-| 文件 | 主要对象 | 用处 |
-| --- | --- | --- |
-| [`__init__.py`](./__init__.py) | `GRPOTrainer`、`DPOTrainer`、配置、类型和渲染函数 | 定义模块的公开导出，提供稳定的导入入口。 |
-| [`advantages.py`](./advantages.py) | `group_advantages` | 对一个完整的 GRPO completion 组计算均值、标准差、centered advantage 和退化组指标。支持不缩放和组内标准差缩放。 |
-| [`grpo_config.py`](./grpo_config.py) | `GRPOConfig` | 保存采样、优化、奖励缩放、数据输入和 SwanLab 配置；在初始化时校验数值范围和不兼容选项，并生成采样器和 Adam 参数。 |
-| [`dpo_config.py`](./dpo_config.py) | `DPOConfig` | 配置 DPO 系数、批大小、长度、优化、checkpoint 和 SwanLab。 |
-| [`dpo_trainer.py`](./dpo_trainer.py) | `DPOTrainer`、`DPOState`、`DPOResult` | 用 PyTRIO 的参考采样器和自定义反向接口训练偏好对。 |
-| [`sft_config.py`](./sft_config.py) | `SFTConfig` | 配置批大小、截断、标签掩码、优化器和日志。 |
-| [`sft_trainer.py`](./sft_trainer.py) | `SFTTrainer`、`SFTState` | 将文本或聊天数据转成 next-token 标签，调用 PyTRIO 交叉熵训练并保存状态。 |
-| [`opd_config.py`](./opd_config.py) | `OPDConfig` | 配置学生生成、异步并发、反向 KL 信号、优化、checkpoint 和日志；类注释逐项说明原理与默认值。 |
-| [`opd_trainer.py`](./opd_trainer.py) | `OPDTrainer`、`OPDState`、`OPDResult` | 编排当前学生采样、固定教师评分、远端更新和同步／异步训练。 |
-| [`opd_distillation.py`](./opd_distillation.py) | `distillation_advantages`、`build_opd_datum` | 校验 logprob、提取教师 completion 评分、计算 token advantage，并对齐和屏蔽 prompt。 |
-| [`datum.py`](./datum.py) | `build_aligned_datum`、`validate_datum`、`to_client_datum` | 将 prompt token、completion token、旧策略 log-probability 和 advantage 对齐为训练字段，检查长度和有限值，再物化为 PyTRIO 或兼容客户端的 `Datum`。 |
-| [`grpo_trainer.py`](./grpo_trainer.py) | `GRPOTrainer`、`TrainerState` | 训练主编排器。管理客户端、数据行、采样、奖励、advantage、Datum、前向反向、优化、checkpoint、同步/异步训练和 SwanLab 日志。 |
-| [`prompts.py`](./prompts.py) | `RenderedPrompt`、`render_prompt`、`as_prompt_text` | 校验 text-only 输入并调用 tokenizer。聊天消息使用 `apply_chat_template`，整数列表直接作为 token，同时生成采样和奖励需要的文本表示。 |
-| [`rewards.py`](./rewards.py) | `RewardEvaluator`、`RewardFunc` | 适配同步或异步的 TRL 风格奖励函数，展开数据列，聚合加权奖励，校验返回数量和有限值，并输出每个奖励函数的指标。 |
-| [`rollout.py`](./rollout.py) | `SamplingAdapter`、`parse_sample` | 适配 PyTRIO 采样客户端的同步/异步调用，读取不同响应对象中的 sequences，校验 token 与 log-probability，并生成 `SequenceSample`。 |
-| [`types.py`](./types.py) | `SequenceSample`、`GRPOBatch`、`GRPODatum`、`GRPOResult` | 定义采样结果、prompt 分组、训练 Datum 和 step 结果等数据结构，连接采样、奖励和优化阶段。 |
+| 模块 | 职责 |
+| --- | --- |
+| [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
+| [输入渲染](./common/prompts.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
+| [日志公共能力](./common/logging.py) | 初始化 SwanLab、累计与平均指标、结束运行；指标命名和记录频率由各算法决定。 |
+| [保存公共能力](./common/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
+| [GRPO 编排](./grpo/trainer.py) | 组织采样、奖励、advantage、Datum、远端更新以及同步／异步训练。 |
+| [GRPO 奖励](./grpo/rewards.py)、[优势](./grpo/advantages.py) | 适配奖励函数、聚合加权奖励，计算组内 centered advantage。 |
+| [GRPO 采样](./grpo/rollout.py)、[对齐](./grpo/datum.py)、[指标](./grpo/metrics.py) | 解析分组采样结果，完成 token shift，计算 rollout 统计和策略变化估计。 |
+| [DPO 编排](./dpo/trainer.py)、[数据](./dpo/data.py)、[损失](./dpo/loss.py)、[指标](./dpo/metrics.py) | 偏好对校验和分词、固定参考评分、本地成对损失与远端反向、指标名称映射。 |
+| [SFT 编排](./sft/trainer.py)、[数据](./sft/data.py) | 数据模块负责标签、mask 和截断；trainer 负责远端交叉熵、流水线提交及按批次顺序发布结果。 |
+| [OPD 编排](./opd/trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
+
+`common/` 只承载实际共用的能力。GRPO 的分组采样依赖 `GRPOBatch`，
+因此保留在 `grpo/rollout.py`；PyTRIO future 与客户端调用适配继续位于
+[utils/client.py](../utils/client.py)。各算法保留自己的同步／异步训练时序，
+SFT 的排队保存仍在 trainer 中提交，以保持 SDK 请求顺序。
+
 
 ## 数据输入格式
 

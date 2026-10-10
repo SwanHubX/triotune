@@ -11,49 +11,25 @@ import itertools
 import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from ..utils.client import call_async, optimizer_params
-from .opd_config import OPDConfig
-from .opd_distillation import (
+from ...utils.client import call_async, optimizer_params
+from ..common.checkpoint import save_checkpoint_async
+from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
+from ..common.prompts import RenderedPrompt, render_prompt
+from .config import OPDConfig
+from .distillation import (
     build_opd_datum,
     distillation_advantages,
     teacher_completion_logprobs,
     validate_logprobs,
     validate_tokens,
 )
-from .prompts import RenderedPrompt, render_prompt
-
-
-@dataclass(slots=True)
-class OPDState:
-    global_step: int = 0
-    behavior_policy_version: int = 0
-    metrics: dict[str, float] = field(default_factory=dict)
-    checkpoint_path: str | None = None
-
-
-@dataclass(slots=True)
-class OPDResult:
-    step: int
-    metrics: dict[str, float]
-    num_datums: int
-    behavior_policy_version: int
-    checkpoint_path: str | None = None
-
-
-@dataclass(slots=True)
-class _ScoredCompletion:
-    datum: Any
-    tokens: int
-    student_sum: float
-    teacher_sum: float
-    advantage_sum: float
+from .types import OPDResult, OPDState, _ScoredCompletion
 
 
 class OPDTrainer:
@@ -113,14 +89,13 @@ class OPDTrainer:
         self._metric_window: dict[str, tuple[float, int]] = {}
         self._run: Any = None
         if self.args.report_to == "swanlab":
-            self._run = swanlab.init(
-                project=self.args.project, workspace=self.args.workspace,
-                tags=self.args.tags, name=self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-opd",
-                log_dir=self.args.log_dir,
-                config={"model": self.model, "teacher_model": self.teacher_model,
-                        "teacher_model_path": teacher_model_path, "lora_rank": lora_rank,
-                        "sampling_temperature": 1.0, "sampling_top_p": 1.0,
-                        "sampling_top_k": -1, **asdict(self.args)},
+            self._run = start_run(
+                self.args,
+                default_name=f"{self.model.rsplit('/', 1)[-1]}-opd",
+                metadata={"model": self.model, "teacher_model": self.teacher_model,
+                          "teacher_model_path": teacher_model_path, "lora_rank": lora_rank,
+                          "sampling_temperature": 1.0, "sampling_top_p": 1.0,
+                          "sampling_top_k": -1},
             )
 
     def _enter(self) -> None:
@@ -254,35 +229,30 @@ class OPDTrainer:
         return metrics
 
     async def _save_state_async(self) -> str:
-        saved = await call_async(
-            self._training_client, "save_state", name=f"opd-step-{self.state.global_step:08d}",
+        path = await save_checkpoint_async(
+            self._training_client, "opd", self.state.global_step, error_method="save_state",
         )
-        path = getattr(saved, "path", None)
-        if not isinstance(path, str) or not path:
-            raise TypeError("PyTRIO save_state() returned no checkpoint path.")
         self.state.checkpoint_path = path
         return path
 
     def _log(self, metrics: dict[str, float]) -> None:
         if self._run is None:
             return
-        for key, value in metrics.items():
-            total, count = self._metric_window.get(key, (0.0, 0))
-            self._metric_window[key] = (total + value, count + 1)
+        accumulate_metrics(self._metric_window, metrics)
         if self.state.global_step % self.args.logging_step == 0:
             self._flush_log()
 
     def _flush_log(self) -> None:
         if self._run is not None and self._metric_window:
             self._run.log(
-                {key: total / count for key, (total, count) in self._metric_window.items()},
+                averaged_metrics(self._metric_window),
                 step=self.state.global_step,
             )
             self._metric_window.clear()
 
     def _finish_run(self, state: str, error: str | None = None) -> None:
         if self._run is not None:
-            self._run.finish(state=state, error=error)
+            finish_run(self._run, state=state, error=error)
             self._run = None
 
     async def _step_async(self, rows: Sequence[Mapping[str, Any]]) -> OPDResult:

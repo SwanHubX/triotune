@@ -13,134 +13,30 @@ import json
 import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from ..utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
+from ...utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
+from ..common.checkpoint import save_checkpoint, save_checkpoint_async
+from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
+from ..common.prompts import render_prompt
 from .advantages import group_advantages
+from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
-from .grpo_config import GRPOConfig
-from .prompts import render_prompt
+from .metrics import (
+    FINAL_SUMMARY_KEYS,
+    _is_checkpoint_metric,
+    _is_per_prompt_metric,
+    _rollout_metrics,
+    _sample_train_kl,
+    _swanlab_metric_name,
+)
 from .rewards import RewardEvaluator, RewardFunc
 from .rollout import SamplingAdapter
-from .types import GRPOBatch, GRPOResult
-
-
-FINAL_SUMMARY_KEYS = (
-    "train/loss",
-    "reward/mean",
-    "policy/entropy",
-    "policy/kl_sample_train",
-    "optim/lr",
-    "optim/grad_norm",
-    "time/step",
-    "time/train_runtime",
-    "time/train_steps_per_second",
-    "time/train_tokens_per_second",
-)
-
-
-def _is_per_prompt_metric(name: str) -> bool:
-    """Return whether a metric belongs to one prompt rather than the batch."""
-
-    _, separator, metric_name = name.partition("/")
-    return bool(separator) and metric_name.startswith(("reward/", "advantage/"))
-
-
-def _swanlab_metric_name(name: str) -> str:
-    """Map trainer metrics to the namespaces exposed in SwanLab."""
-
-    if name == "optim/lr":
-        return "train/learning_rate"
-    if name.startswith(("trainer/", "scalar/")):
-        return "train/" + name.partition("/")[2]
-    if "/" not in name:
-        return "train/" + name
-    return name
-
-
-def _is_checkpoint_metric(name: str) -> bool:
-    """Return whether a metric describes checkpoint handling."""
-
-    return name == "time/checkpoint" or name.startswith("checkpoint/")
-
-
-def _tensor_values(value: Any) -> list[float] | None:
-    data = getattr(value, "data", None)
-    if not isinstance(data, list):
-        return None
-    if not all(isinstance(item, (int, float)) for item in data):
-        return None
-    return [float(item) for item in data]
-
-
-def _rollout_metrics(groups: Sequence[GRPOBatch]) -> dict[str, float]:
-    samples = [sample for group in groups for sample in group.samples]
-    logprobs = [value for sample in samples for value in sample.logprobs]
-    lengths = [len(sample.tokens) for sample in samples]
-    metrics: dict[str, float] = {}
-    if logprobs:
-        metrics["policy/entropy"] = -sum(logprobs) / len(logprobs)
-    if lengths:
-        metrics.update(
-            {
-                "rollout/completion_length_mean": sum(lengths) / len(lengths),
-                "rollout/completion_length_min": float(min(lengths)),
-                "rollout/completion_length_max": float(max(lengths)),
-            }
-        )
-    return metrics
-
-
-def _sample_train_kl(datums: Sequence[Any], forward_result: Any) -> float | None:
-    outputs = getattr(forward_result, "loss_fn_outputs", None)
-    if not isinstance(outputs, list) or len(outputs) != len(datums):
-        return None
-
-    squared_logprob_differences: list[float] = []
-    for datum, output in zip(datums, outputs, strict=True):
-        if not isinstance(output, Mapping) or "logprobs" not in output:
-            return None
-        loss_inputs = getattr(datum, "loss_fn_inputs", None)
-        if not isinstance(loss_inputs, Mapping):
-            return None
-        old_logprobs = _tensor_values(loss_inputs.get("logprobs"))
-        advantages = _tensor_values(loss_inputs.get("advantages"))
-        current_logprobs = _tensor_values(output["logprobs"])
-        if old_logprobs is None or advantages is None or current_logprobs is None:
-            return None
-        if not len(old_logprobs) == len(advantages) == len(current_logprobs):
-            return None
-        squared_logprob_differences.extend(
-            (old - current) ** 2
-            for old, current, advantage in zip(
-                old_logprobs,
-                current_logprobs,
-                advantages,
-                strict=True,
-            )
-            if advantage != 0.0
-        )
-    if not squared_logprob_differences:
-        return None
-    return 0.5 * sum(squared_logprob_differences) / len(squared_logprob_differences)
-
-
-@dataclass(slots=True)
-class TrainerState:
-    """Mutable local state tracked across GRPO training steps."""
-    # Number of completed trainer steps.
-    global_step: int = 0
-    # Version of the behavior policy used to generate the next rollout batch.
-    behavior_policy_version: int = 0
-    # Metrics collected during the most recently completed trainer step.
-    metrics: dict[str, float] = field(default_factory=dict)
-    # URI of the most recently saved weights and optimizer state.
-    checkpoint_path: str | None = None
+from .types import GRPOBatch, GRPOResult, TrainerState
 
 
 class GRPOTrainer:
@@ -204,17 +100,10 @@ class GRPOTrainer:
         if self.config.report_to is None:
             return None
         model_slug = self.model_name.rsplit("/", 1)[-1].replace("/", "-")
-        return swanlab.init(
-            project=self.config.project,
-            workspace=self.config.workspace,
-            tags=self.config.tags,
-            name=self.config.run_name or f"{model_slug}-grpo",
-            log_dir=self.config.log_dir,
-            config={
-                "model_name": self.model_name,
-                "lora_rank": lora_rank,
-                **asdict(self.config),
-            },
+        return start_run(
+            self.config,
+            default_name=f"{model_slug}-grpo",
+            metadata={"model_name": self.model_name, "lora_rank": lora_rank},
         )
 
     def _log_swanlab(self, result: GRPOResult) -> None:
@@ -236,16 +125,14 @@ class GRPOTrainer:
         )
         if not hasattr(self, "_metric_window"):
             self._metric_window = {}
-        for name, value in payload.items():
-            total, samples = self._metric_window.get(name, (0.0, 0))
-            self._metric_window[name] = (total + value, samples + 1)
+        accumulate_metrics(self._metric_window, payload)
         if result.step % self.config.logging_step == 0:
             self._flush_swanlab(result.step)
 
     def _flush_swanlab(self, step: int) -> None:
         if self._swanlab_run is None or not hasattr(self, "_metric_window"):
             return
-        payload = {name: total / samples for name, (total, samples) in self._metric_window.items()}
+        payload = averaged_metrics(self._metric_window)
         self._metric_window.clear()
         if payload:
             self._swanlab_run.log({**payload, "train/step": float(step)}, step=step)
@@ -354,7 +241,7 @@ class GRPOTrainer:
     def _finish_swanlab(self, state: str = "success", error: str | None = None) -> None:
         if self._swanlab_run is None:
             return
-        self._swanlab_run.finish(state=state, error=error)
+        finish_run(self._swanlab_run, state=state, error=error)
         self._swanlab_run = None
 
     @staticmethod
@@ -556,14 +443,7 @@ class GRPOTrainer:
             not final and self.state.global_step % self.config.save_every != 0
         ):
             return None
-        result = call(
-            self._training_client,
-            "save_state",
-            name=f"grpo-step-{self.state.global_step:08d}",
-        )
-        path = getattr(result, "path", None)
-        if not isinstance(path, str) or not path:
-            raise TypeError("PyTRIO save_state() returned no checkpoint path.")
+        path = save_checkpoint(self._training_client, "grpo", self.state.global_step)
         self.state.checkpoint_path = path
         return path
 
@@ -572,14 +452,7 @@ class GRPOTrainer:
             not final and self.state.global_step % self.config.save_every != 0
         ):
             return None
-        result = await call_async(
-            self._training_client,
-            "save_state",
-            name=f"grpo-step-{self.state.global_step:08d}",
-        )
-        path = getattr(result, "path", None)
-        if not isinstance(path, str) or not path:
-            raise TypeError("PyTRIO save_state_async() returned no checkpoint path.")
+        path = await save_checkpoint_async(self._training_client, "grpo", self.state.global_step)
         self.state.checkpoint_path = path
         return path
 
