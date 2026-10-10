@@ -1,6 +1,6 @@
 # Trainer 模块
 
-`trainer` 包含 PyTRIO 原生 GRPO、DPO 和 SFT 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本。GRPO 和 DPO 提供同步和异步训练路径，SFT 提供异步训练路径。
+`trainer` 包含 PyTRIO 原生 GRPO、DPO、SFT 和 OPD 训练实现。GRPO 将采样、奖励和组内 advantage 对齐为 PyTRIO `Datum`；DPO 使用偏好数据和固定参考策略，在客户端计算成对损失；SFT 用远端交叉熵训练文本样本；OPD 用学生生成的序列及教师评分进行在线蒸馏。GRPO、DPO 和 OPD 提供同步和异步训练路径，SFT 提供异步训练路径。
 
 ## 训练流程
 
@@ -25,6 +25,9 @@
 | [`dpo_trainer.py`](./dpo_trainer.py) | `DPOTrainer`、`DPOState`、`DPOResult` | 用 PyTRIO 的参考采样器和自定义反向接口训练偏好对。 |
 | [`sft_config.py`](./sft_config.py) | `SFTConfig` | 配置批大小、截断、标签掩码、优化器和日志。 |
 | [`sft_trainer.py`](./sft_trainer.py) | `SFTTrainer`、`SFTState` | 将文本或聊天数据转成 next-token 标签，调用 PyTRIO 交叉熵训练并保存状态。 |
+| [`opd_config.py`](./opd_config.py) | `OPDConfig` | 配置学生生成、异步并发、反向 KL 信号、优化、checkpoint 和日志；类注释逐项说明原理与默认值。 |
+| [`opd_trainer.py`](./opd_trainer.py) | `OPDTrainer`、`OPDState`、`OPDResult` | 编排当前学生采样、固定教师评分、远端更新和同步／异步训练。 |
+| [`opd_distillation.py`](./opd_distillation.py) | `distillation_advantages`、`build_opd_datum` | 校验 logprob、提取教师 completion 评分、计算 token advantage，并对齐和屏蔽 prompt。 |
 | [`datum.py`](./datum.py) | `build_aligned_datum`、`validate_datum`、`to_client_datum` | 将 prompt token、completion token、旧策略 log-probability 和 advantage 对齐为训练字段，检查长度和有限值，再物化为 PyTRIO 或兼容客户端的 `Datum`。 |
 | [`grpo_trainer.py`](./grpo_trainer.py) | `GRPOTrainer`、`TrainerState` | 训练主编排器。管理客户端、数据行、采样、奖励、advantage、Datum、前向反向、优化、checkpoint、同步/异步训练和 SwanLab 日志。 |
 | [`prompts.py`](./prompts.py) | `RenderedPrompt`、`render_prompt`、`as_prompt_text` | 校验 text-only 输入并调用 tokenizer。聊天消息使用 `apply_chat_template`，整数列表直接作为 token，同时生成采样和奖励需要的文本表示。 |
@@ -89,21 +92,6 @@ print(state.checkpoint_path)
 
 `text` 和 `messages` 行默认训练全部 next-token 标签；`prompt`/`completion` 行默认只训练 completion。预分词行可传 `input_ids` 和 `labels`，用 `-100` 屏蔽不参与 loss 的 token。`assistant_only_loss=True` 需要能返回 assistant token mask 的聊天模板。SFT 只支持文本，暂不支持 packing 和多模态数据。
 
-当 `report_to="swanlab"` 时，`SFTConfig` 的以下字段传给 `swanlab.init`。这些字段默认为 `None`，可在 recipe 的 TOML `[swanlab]` 表中配置。
-
-| 字段 | 作用 |
-| --- | --- |
-| `workspace` | 指定 SwanLab 工作区；`None` 使用 SDK 默认值。 |
-| `tags` | 设置运行标签列表。 |
-| `run_name` | 设置运行名称；`None` 使用 `<模型名>-sft`。 |
-| `log_dir` | 指定本地 SwanLab 日志目录；`None` 使用 SDK 默认值。 |
-
-`train()` 按顺序提交每批的反向、优化器和可选 checkpoint 操作，取得 future 后继续提交下一批，由后台任务等待结果并按批次顺序记录指标。PyTRIO 为同一客户端的事件排序，保证模型更新顺序；不要并发调用同一 trainer 的 `step()` 或 `train()`。`max_in_flight`（默认 32）限制未完成批次数，设为 1 时逐批等待。`step()` 提交一个 batch 并等待完成。训练结束或出错时回收后台任务；已提交的远端操作无法通过取消本地任务撤销。
-
-`time/request_latency` 表示从准备该批到取得结果的延迟，多个 batch 的延迟可能重叠；`time/step` 表示相邻批次按顺序确认完成的间隔，首批从训练开始计时；`time/train` 表示到当前批次的累计训练墙钟时间。比较吞吐使用最后一步的 `time/train`，不累加请求延迟。训练计时包含样本准备与流水线排队，不含客户端初始化、最后单独保存 checkpoint 和结束上传。
-
-下面使用 `asyncio.run` 启动训练；在已有事件循环中使用 `await trainer.train()`。客户端构造和 tokenization 仍是同步操作，异步应用可用 `asyncio.to_thread` 构造 trainer。
-
 ```python
 import asyncio
 
@@ -116,5 +104,44 @@ trainer = SFTTrainer(
     train_dataset=rows,
 )
 state = asyncio.run(trainer.train())
+print(state.checkpoint_path)
+```
+
+## OPD 训练
+
+OPD（On-Policy Distillation）只需要 prompt 数据。每一步保存当前学生权重并创建采样器，由学生生成 completion，固定教师对完全相同的 prompt + completion token 序列调用 `compute_logprobs`。教师不生成训练答案，也不参与优化。
+
+### 训练目标和对齐
+
+记学生采样时的 token logprob 为 `log p_t`，教师对该 token 的 logprob 为 `log q_t`：
+
+```text
+a_t = kl_coef * (log q_t - log p_t)
+A_t = a_t + discount_factor * A_(t+1)     # 从后向前计算，末尾未来项为 0
+L = -mean_completion[exp(log p_theta,t - log p_t) * stop_gradient(A_t)]
+```
+
+默认 `discount_factor=0`，使用每个学生访问到的上下文中的 token 级反向 KL 梯度代理；设为 `1` 时加入后续 token 的完整 KL 信号，用于序列级信用分配。这里是采样 token 的估计，不计算全词表 KL，也不使用教师 top-k logits。advantage 不做 GRPO 式组内中心化，因此每个 prompt 只生成一条回答也能训练。
+
+`Datum.model_input` 为 `(prompt + completion)[:-1]`，`target_tokens` 为 `[-100] * (len(prompt)-1) + completion`。prompt 的 logprob 和 advantage 填零，`-100` 同时将其排除在 PyTRIO 有效 token 的归一化分母之外。教师评分包含整个输入序列（首 token 可以为 `None`），只取 `[len(prompt):]`；学生采样评分必须与 completion 等长。远端使用 `importance_sampling` 和 `auto_shift=False`，只进行一次 next-token shift，无需本地 PyTorch 或自定义 backward。
+
+学生采样固定为 `temperature=1.0, top_p=1.0, top_k=-1`，保证采样评分对应训练时的学生分布。当前 config 不开放温度和截断采样调节；支持这些模式需要另行设计分布修正。生成保留实际采样到的 EOS，不补写 EOS；到达长度上限时训练生成前缀。`max_length` 限制 prompt + completion 长度，不截断 prompt，而是缩减该 prompt 的生成预算；没有剩余空间则报错。
+
+
+### 使用示例
+
+
+```python
+from trio_cookbook.trainer import OPDConfig, OPDTrainer
+
+rows = [{"messages": [{"role": "user", "content": "Explain why the sky is blue."}]}]
+trainer = OPDTrainer(
+    model="student-base-model-id",        # 替换成服务可用的学生模型 ID
+    teacher_model="teacher-base-model-id",  # 替换成词表一致的教师模型 ID
+    # teacher_model_path="trio://...",    # 可选的教师 LoRA checkpoint
+    args=OPDConfig(batch_size=4, max_steps=100, report_to="swanlab"),
+    train_dataset=rows,
+)
+state = trainer.train()
 print(state.checkpoint_path)
 ```

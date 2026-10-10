@@ -1,6 +1,7 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT 训练器及示例。源码目录名为
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT、OPD 训练器。前三个算法包含运行示例；
+OPD 的 config、trainer 和使用示例见 [训练器说明](trainer/README.md#opd-训练)。源码目录名为
 `trio-cookbook`，Python 导入名为 `trio_cookbook`。
 
 ## 目录结构

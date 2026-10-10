@@ -6,6 +6,7 @@ clients supplied by the caller.
 """
 
 from .trainer import DPOConfig, DPOTrainer, GRPOConfig, GRPOTrainer, RenderedPrompt, render_prompt
+from .trainer import OPDConfig, OPDTrainer
 from .utils import call, call_async, wait, wait_async
 
 __all__ = [
@@ -13,6 +14,8 @@ __all__ = [
     "DPOTrainer",
     "GRPOConfig",
     "GRPOTrainer",
+    "OPDConfig",
+    "OPDTrainer",
     "RenderedPrompt",
     "call",
     "call_async",
