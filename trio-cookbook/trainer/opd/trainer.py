@@ -220,7 +220,7 @@ class OPDTrainer:
                     metrics[str(key)] = float(value)
         for key in ("loss_mean", "loss", "loss:mean", "scalar/loss_mean"):
             if key in metrics:
-                metrics["train/surrogate_loss"] = metrics[key]
+                metrics["train/loss"] = metrics[key]
                 break
         for key in ("grad_norm", "gradient_norm"):
             if key in metrics:

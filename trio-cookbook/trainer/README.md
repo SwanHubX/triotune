@@ -134,6 +134,9 @@ print(state.checkpoint_path)
 
 ## OPD 训练
 
+DeepMath 的完整框架版案例、配置和启动命令见
+[OPD 异步脚本说明](../scripts/README.md#deepmath-opd-异步案例)。
+
 OPD（On-Policy Distillation）只需要 prompt 数据。每一步保存当前学生权重并创建采样器，由学生生成 completion，固定教师对完全相同的 prompt + completion token 序列调用 `compute_logprobs`。教师不生成训练答案，也不参与优化。
 
 ### 训练目标和对齐
@@ -151,6 +154,8 @@ L = -mean_completion[exp(log p_theta,t - log p_t) * stop_gradient(A_t)]
 `Datum.model_input` 为 `(prompt + completion)[:-1]`，`target_tokens` 为 `[-100] * (len(prompt)-1) + completion`。prompt 的 logprob 和 advantage 填零，`-100` 同时将其排除在 PyTRIO 有效 token 的归一化分母之外。教师评分包含整个输入序列（首 token 可以为 `None`），只取 `[len(prompt):]`；学生采样评分必须与 completion 等长。远端使用 `importance_sampling` 和 `auto_shift=False`，只进行一次 next-token shift，无需本地 PyTorch 或自定义 backward。
 
 学生采样固定为 `temperature=1.0, top_p=1.0, top_k=-1`，保证采样评分对应训练时的学生分布。当前 config 不开放温度和截断采样调节；支持这些模式需要另行设计分布修正。生成保留实际采样到的 EOS，不补写 EOS；到达长度上限时训练生成前缀。`max_length` 限制 prompt + completion 长度，不截断 prompt，而是缩减该 prompt 的生成预算；没有剩余空间则报错。
+
+SwanLab 的 `train/loss`（原名 `train/surrogate_loss`）映射远端 `loss_mean`，两者数值相同；PyTRIO 返回的 `loss_mean = loss_sum / token_count`。这是 `importance_sampling` 的代理损失，不是完整词表 KL。`distill/reverse_kl_sampled` 记录采样 token 的学生与教师 logprob 差值均值；蒸馏效果还需结合独立验证集评估。
 
 
 ### 使用示例

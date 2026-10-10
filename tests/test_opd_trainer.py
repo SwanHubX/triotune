@@ -288,7 +288,8 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(result.behavior_policy_version, 0)
         self.assertEqual(trainer.state.behavior_policy_version, 1)
         self.assertEqual(result.metrics["distill/reverse_kl_sampled"], -0.25)
-        self.assertEqual(result.metrics["train/surrogate_loss"], 0.3)
+        self.assertEqual(result.metrics["train/loss"], 0.3)
+        self.assertEqual(result.metrics["train/loss"], result.metrics["loss_mean"])
         self.assertEqual(self.service.training.events, ["snapshot", "forward", "optim"])
 
     def test_identical_teacher_student_keeps_zero_signal_without_group_filtering(self):
