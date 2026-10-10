@@ -62,3 +62,16 @@ class GRPOResult:
     num_datums: int = 0
     skipped_groups: int = 0
     checkpoint_path: str | None = None
+
+
+@dataclass(slots=True)
+class TrainerState:
+    """Mutable local state tracked across GRPO training steps."""
+    # Number of completed trainer steps.
+    global_step: int = 0
+    # Version of the behavior policy used to generate the next rollout batch.
+    behavior_policy_version: int = 0
+    # Metrics collected during the most recently completed trainer step.
+    metrics: dict[str, float] = field(default_factory=dict)
+    # URI of the most recently saved weights and optimizer state.
+    checkpoint_path: str | None = None

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 from trio_cookbook.trainer import GRPOBatch, GRPOConfig, GRPOResult, GRPOTrainer, SequenceSample, TrainerState
-from trio_cookbook.trainer.grpo_trainer import _rollout_metrics
+from trio_cookbook.trainer.grpo.metrics import _rollout_metrics
 
 
 class TrainerMetricsTests(unittest.TestCase):

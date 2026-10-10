@@ -16,7 +16,7 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from trio_cookbook import GRPOConfig, GRPOTrainer
+from trio_cookbook.trainer.grpo import GRPOConfig, GRPOTrainer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -186,7 +186,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train GSM8K through trio_cookbook.GRPOTrainer")
+    parser = argparse.ArgumentParser(description="Train GSM8K through trio_cookbook.trainer.grpo.GRPOTrainer")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=positive_int, help="override grpo.max_steps")
     parser.add_argument("--batch-size", type=positive_int, help="override grpo.batch_size")

@@ -15,3 +15,4 @@
 
 1. grpo：[grpo框架测试结果（gms8k案例）](grpo_pytrio-use_eval.md)
 2. dpo：[dpo框架测试结果](dpo_pytrio-use_eval.md)
+3. opd：[opd框架测试结果（DeepMath 案例）](opd_pytrio-use_eval.md)

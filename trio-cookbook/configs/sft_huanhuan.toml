@@ -1,3 +1,7 @@
+# recipes/sft_huanhuan_trio.py 读取本文件。
+# [sft] 与 [swanlab] 合并为 trio_cookbook.trainer.sft.SFTConfig。
+# [model] 和 [data] 是 recipe 的模型初始化与数据准备参数。
+
 [model]
 name = "Qwen/Qwen3.5-4B"
 lora_rank = 8
@@ -27,5 +31,5 @@ report_to = "swanlab"
 project = "cookbook-test"
 run_name = "huanhuan-framework-100step-seed42"
 workspace = "pytrio"
-tags = ["sft", "huanhuan"]
+tags = ["sft", "trainer"]
 # log_dir = "swanlog"

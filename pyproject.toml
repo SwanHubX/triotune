@@ -20,7 +20,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["trio_cookbook", "trio_cookbook.trainer", "trio_cookbook.utils"]
+packages = [
+    "trio_cookbook",
+    "trio_cookbook.trainer",
+    "trio_cookbook.trainer.common",
+    "trio_cookbook.trainer.grpo",
+    "trio_cookbook.trainer.dpo",
+    "trio_cookbook.trainer.sft",
+    "trio_cookbook.trainer.opd",
+    "trio_cookbook.utils",
+]
 
 [tool.setuptools.package-dir]
 trio_cookbook = "trio-cookbook"

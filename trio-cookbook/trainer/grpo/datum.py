@@ -2,7 +2,7 @@
 
 The SDK materialization helper is small, but the required fields and one-token
 shift are specific to GRPO policy learning, so this module intentionally stays
-under ``trainer`` rather than being presented as a generic data utility.
+under ``trainer.grpo`` rather than being presented as a generic data utility.
 """
 
 from __future__ import annotations

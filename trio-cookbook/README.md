@@ -1,16 +1,23 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT 训练器及示例。源码目录名为
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT、OPD 训练器及运行示例。
+OPD 的算法说明见 [训练器说明](trainer/README.md#opd-训练)，DeepMath 案例见
+[脚本说明](scripts/README.md#deepmath-opd-异步案例)。源码目录名为
 `trio-cookbook`，Python 导入名为 `trio_cookbook`。
 
 ## 目录结构
 
 ```text
 trio-cookbook/
-├── configs/          # GRPO、DPO、SFT 训练参数
+├── configs/          # GRPO、DPO、SFT、OPD 训练参数
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
-├── trainer/          # 算法核心：输入、采样、奖励、优势、Datum 和训练循环
+├── trainer/          # 按算法组织的训练实现和稳定导入入口
+│   ├── common/       # 输入渲染、日志与 checkpoint 公共能力
+│   ├── grpo/         # 分组采样、奖励、优势、Datum 与训练编排
+│   ├── dpo/          # 偏好数据、成对损失与训练编排
+│   ├── sft/          # 标签处理与异步流水线训练
+│   └── opd/          # 教师评分、蒸馏信号与训练编排
 └── utils/            # PyTRIO 客户端及同步/异步适配工具
 ```
 
@@ -57,6 +64,12 @@ DPO 训练数据使用 JSONL，每行包含一组偏好回复：
 - `input_ids`：非空的非负整数 token 列表；可附等长 `labels`，其中 `-100`
   表示不参与损失。
 
+### OPD
+
+DeepMath OPD 从 ModelScope 的 `AI-ModelScope/DeepMath-103K` 下载 train parquet，
+只将 `question` 转换为带题目后缀的 user 消息，不使用参考答案或 R1 解答作为标签。
+样本以固定 seed 打乱后抽样；框架按配置的步数循环使用这些 prompt。
+
 ## 启动命令
 
 在仓库根目录运行（启动脚本使用 `uv`）：
@@ -87,4 +100,14 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh
 
 ```bash
 bash trio-cookbook/scripts/train_sft_huanhuan.sh
+```
+
+### OPD
+
+```bash
+# 下载、抽样并检查问题，不创建训练客户端
+bash trio-cookbook/scripts/train_opd_deepmath.sh --prepare-only
+
+# 按 configs/opd_deepmath.toml 异步训练
+bash trio-cookbook/scripts/train_opd_deepmath.sh
 ```

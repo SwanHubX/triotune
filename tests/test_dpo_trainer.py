@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from trio_cookbook.trainer import DPOConfig, DPOTrainer
-from trio_cookbook.trainer.dpo_trainer import _datum, _loss_fn, _reference_logprob
+from trio_cookbook.trainer.dpo.data import build_datum as _datum, reference_logprob as _reference_logprob
+from trio_cookbook.trainer.dpo.loss import make_loss_fn as _loss_fn
 
 
 class _Tokenizer:
@@ -167,8 +168,8 @@ class DPOTrainerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = _ServiceClient()
         self.run = _SwanLabRun()
-        service_patch = patch("trio_cookbook.trainer.dpo_trainer.trio.ServiceClient", return_value=self.service)
-        swanlab_patch = patch("trio_cookbook.trainer.dpo_trainer.swanlab.init", return_value=self.run)
+        service_patch = patch("trio_cookbook.trainer.dpo.trainer.trio.ServiceClient", return_value=self.service)
+        swanlab_patch = patch("trio_cookbook.trainer.dpo.trainer.swanlab.init", return_value=self.run)
         service_patch.start()
         swanlab_patch.start()
         self.addCleanup(service_patch.stop)
@@ -181,8 +182,8 @@ class DPOTrainerTests(unittest.TestCase):
     def test_none_report_to_uses_terminal_progress_without_swanlab(self) -> None:
         self.assertIsNone(DPOConfig().report_to)
         with (
-            patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init,
-            patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress,
+            patch("trio_cookbook.trainer.dpo.trainer.swanlab.init") as init,
+            patch("trio_cookbook.trainer.dpo.trainer.tqdm") as progress,
         ):
             trainer = self.trainer(report_to=None, max_steps=1)
             trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
@@ -272,7 +273,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/train_runtime", summary)
 
     def test_swanlab_mode_initializes_run_without_sdk_mode_override(self) -> None:
-        with patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.dpo.trainer.swanlab.init") as init:
             self.trainer()
         self.assertNotIn("mode", init.call_args.kwargs)
 
