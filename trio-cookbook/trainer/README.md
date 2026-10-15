@@ -9,7 +9,12 @@
 ```text
 trainer/
 ├── __init__.py          # 公开导出与历史模块路径兼容
+├── grpo_trainer.py      # GRPO 训练编排
+├── dpo_trainer.py       # DPO 训练编排
+├── sft_trainer.py       # SFT 训练编排
+├── opd_trainer.py       # OPD 训练编排
 ├── common/
+│   ├── client.py        # Training/Sampling client 与 future 适配
 │   ├── config.py        # 公共配置契约与各算法配置
 │   ├── logging.py       # SwanLab 初始化、指标窗口计算和结束记录
 │   └── checkpoint.py    # checkpoint 命名、保存和响应校验
@@ -19,7 +24,6 @@ trainer/
 │   ├── examples.py      # 各算法共享的标准化训练样本
 │   └── swe_sft/         # 软件工程智能体轨迹的 SFT 数据处理
 ├── grpo/
-│   ├── trainer.py
 │   ├── types.py
 │   ├── advantages.py
 │   ├── rewards.py
@@ -27,15 +31,12 @@ trainer/
 │   ├── datum.py
 │   └── metrics.py
 ├── dpo/
-│   ├── trainer.py
 │   ├── types.py
 │   ├── loss.py
 │   └── metrics.py
 ├── sft/
-│   ├── trainer.py
 │   └── types.py
 └── opd/
-    ├── trainer.py
     ├── types.py
     └── distillation.py
 ```
@@ -44,24 +45,25 @@ trainer/
 | --- | --- |
 | [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
 | [配置契约](./common/config.py) | 定义 `BaseTrainerConfig` 以及 GRPO、DPO、SFT、OPD 配置；集中校验优化器、运行控制和日志字段。 |
+| [客户端契约](./common/client.py) | 统一 TrainingClient、SamplingClient 的同步／异步调用、future 解析及 SDK 参数构造；client 刷新时机由算法决定。 |
 | [输入渲染](./dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](./dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
 | [训练样本](./dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
 | [SWE 轨迹](./dataset/swe_sft/) | 将包含工具调用、工具结果和多轮决策的软件工程智能体轨迹转换为 PyTRIO SFT 数据。 |
 | [日志公共能力](./common/logging.py) | 初始化 SwanLab、累计与平均指标、结束运行；指标命名和记录频率由各算法决定。 |
 | [保存公共能力](./common/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
-| [GRPO 编排](./grpo/trainer.py) | 组织采样、奖励、advantage、Datum、远端更新以及同步／异步训练。 |
+| [GRPO 编排](./grpo_trainer.py) | 组织采样、奖励、advantage、Datum、远端更新以及同步／异步训练。 |
 | [GRPO 奖励](./grpo/rewards.py)、[优势](./grpo/advantages.py) | 适配奖励函数、聚合加权奖励，计算组内 centered advantage。 |
 | [GRPO 采样](./grpo/rollout.py)、[对齐](./grpo/datum.py)、[指标](./grpo/metrics.py) | 解析分组采样结果，完成 token shift，计算 rollout 统计和策略变化估计。 |
-| [DPO 编排](./dpo/trainer.py)、[损失](./dpo/loss.py)、[指标](./dpo/metrics.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；其余模块实现成对损失与指标映射。 |
-| [SFT 编排](./sft/trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
-| [OPD 编排](./opd/trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
+| [DPO 编排](./dpo_trainer.py)、[损失](./dpo/loss.py)、[指标](./dpo/metrics.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；其余模块实现成对损失与指标映射。 |
+| [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
+| [OPD 编排](./opd_trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
 
 `common/` 是 trainer 内部的公共接口与数据契约层，集中放置稳定配置、日志和
-checkpoint 能力。算法配置继承 `BaseTrainerConfig`，共享 batch、step、Adam、
+client、checkpoint 能力。算法配置继承 `BaseTrainerConfig`，共享 batch、step、Adam、
 保存和报告字段，同时保留各算法原有的公开构造参数。GRPO 的分组采样依赖 `GRPOBatch`，
-因此保留在 `grpo/rollout.py`；PyTRIO future 与客户端调用适配继续位于
-[utils/client.py](../utils/client.py)。各算法保留自己的同步／异步训练时序，
+因此保留在 `grpo/rollout.py`。`common/client.py` 只统一 PyTRIO client 的调用
+协议；训练权重何时生成新的 sampling client 仍由各算法控制。各算法保留自己的同步／异步训练时序，
 SFT 的排队保存仍在 trainer 中提交，以保持 SDK 请求顺序。用户输入的校验、
 分词、EOS、长度和 loss mask 统一由 `dataset/` 负责；算法目录只保留 Datum
 构造及其训练目标特有的对齐。
@@ -83,6 +85,42 @@ mask 和 PyTRIO next-token 对齐：
 prompt、completion 和 preference response 可以是字符串、非空整数 token 列表，
 或相应的聊天消息。聊天消息中的每一项都必须包含非空字符串 `role` 和字符串
 `content`。
+
+## 验证集与评估
+
+四个 Trainer 都接受可选的 `valid_dataset`，并使用 `EvaluationConfig` 控制评估：
+
+```python
+from trio_cookbook.trainer import EvaluationConfig, SFTConfig, SFTTrainer
+
+trainer = SFTTrainer(
+    model="Qwen/Qwen3.5-4B",
+    args=SFTConfig(
+        evaluation=EvaluationConfig(
+            before_train=True,
+            every_steps=100,
+            after_train=True,
+            max_batches=20,
+        )
+    ),
+    train_dataset=train_rows,
+    valid_dataset=valid_rows,
+)
+```
+
+配置也可以从 TOML 字典构造，例如
+`evaluation={"every_steps": 100, "max_batches": 20}`。验证不会调用 backward
+或 optimizer：SFT 记录 token-weighted loss；DPO 记录当前策略相对固定 reference
+的 DPO loss、reward margin 和 accuracy；GRPO 记录验证 rollout 的 reward、长度和
+entropy；OPD 记录 sampled reverse KL 及 student/teacher logprob。
+
+验证集应当可重复迭代，因为周期评估每次都会创建一个新 iterator。生成式验证可
+用 `max_batches` 限制成本；`batch_size=None` 时复用训练 batch size。
+
+当前 checkpoint 已保存模型与 optimizer，但尚未开放自动恢复训练。可靠恢复还需
+同时保存 dataset iterator、epoch、随机 shuffle 和评估调度状态；在统一可恢复数据
+迭代契约完成前，仅从模型 checkpoint 恢复会重复消费样本。同理，Trainer 当前消费
+数据集一次；多 epoch 将与可重放、可 shuffle 的 dataset contract 一起实现。
 
 ```python
 rows = [

@@ -11,13 +11,13 @@ import trio_cookbook.trainer as trainers
 class TrainerLayoutTests(unittest.TestCase):
     def test_legacy_imports_are_the_actual_modules(self):
         aliases = {
-            "grpo_trainer": "grpo.trainer",
+            "grpo_trainer": "grpo_trainer",
             "grpo_config": "common.config",
-            "dpo_trainer": "dpo.trainer",
+            "dpo_trainer": "dpo_trainer",
             "dpo_config": "common.config",
-            "sft_trainer": "sft.trainer",
+            "sft_trainer": "sft_trainer",
             "sft_config": "common.config",
-            "opd_trainer": "opd.trainer",
+            "opd_trainer": "opd_trainer",
             "opd_config": "common.config",
             "opd_distillation": "opd.distillation",
             "advantages": "grpo.advantages",
@@ -50,8 +50,19 @@ class TrainerLayoutTests(unittest.TestCase):
                 )
                 self.assertIs(module, common)
 
+    def test_algorithm_trainer_paths_alias_root_modules(self):
+        for algorithm in ("grpo", "dpo", "sft", "opd"):
+            with self.subTest(algorithm=algorithm):
+                root = importlib.import_module(
+                    f"trio_cookbook.trainer.{algorithm}_trainer"
+                )
+                nested = importlib.import_module(
+                    f"trio_cookbook.trainer.{algorithm}.trainer"
+                )
+                self.assertIs(nested, root)
+
     def test_patching_a_legacy_module_updates_the_actual_module(self):
-        actual = importlib.import_module("trio_cookbook.trainer.dpo.trainer")
+        actual = importlib.import_module("trio_cookbook.trainer.dpo_trainer")
         with patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress:
             self.assertIs(actual.tqdm, progress)
 

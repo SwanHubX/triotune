@@ -12,13 +12,12 @@ trio-cookbook/
 ├── configs/          # GRPO、DPO、SFT、OPD 训练参数
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
-├── trainer/          # 按算法组织的训练实现和稳定导入入口
-│   ├── common/       # 输入渲染、日志与 checkpoint 公共能力
+└── trainer/          # 按算法组织的训练实现和稳定导入入口
+│   ├── common/       # 配置、client、验证、日志与 checkpoint 公共契约
 │   ├── grpo/         # 分组采样、奖励、优势、Datum 与训练编排
 │   ├── dpo/          # 偏好数据、成对损失与训练编排
 │   ├── sft/          # 标签处理与异步流水线训练
 │   └── opd/          # 教师评分、蒸馏信号与训练编排
-└── utils/            # PyTRIO 客户端及同步/异步适配工具
 ```
 
 训练器模块的详细职责见 [trainer/README.md](trainer/README.md)；脚本参数及独立版示例见

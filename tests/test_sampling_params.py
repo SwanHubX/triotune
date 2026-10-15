@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from trio_cookbook import GRPOConfig
-from trio_cookbook.utils.client import sampling_params
+from trio_cookbook.trainer.common.client import sampling_params
 
 
 class _SamplingParams:

@@ -30,13 +30,11 @@ packages = [
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",
     "trio_cookbook.trainer.opd",
-    "trio_cookbook.utils",
 ]
 
 [tool.setuptools.package-dir]
 trio_cookbook = "trio-cookbook"
 "trio_cookbook.trainer" = "trio-cookbook/trainer"
-"trio_cookbook.utils" = "trio-cookbook/utils"
 
 [tool.uv]
 # Keep the historical on-disk directory name while installing it under the

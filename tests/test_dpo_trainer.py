@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from trio_cookbook.trainer import DPOConfig, DPOTrainer
 from trio_cookbook.trainer.dpo.loss import make_loss_fn as _loss_fn
-from trio_cookbook.trainer.dpo.trainer import _datum, _reference_logprob
+from trio_cookbook.trainer.dpo_trainer import _datum, _reference_logprob
 
 
 class _Tokenizer:
@@ -74,6 +74,16 @@ class _SamplingClient:
         self.async_calls += 1
         await asyncio.sleep(0)
         return self.sample(**kwargs)
+
+    def compute_logprobs(self, model_input: object) -> list[float | None]:
+        tokens = model_input.to_ints()
+        return [None] + [-token / 2000 for token in tokens[1:]]
+
+    async def compute_logprobs_async(
+        self, model_input: object
+    ) -> list[float | None]:
+        await asyncio.sleep(0)
+        return self.compute_logprobs(model_input)
 
 
 class _TrainingClient:
@@ -168,8 +178,8 @@ class DPOTrainerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = _ServiceClient()
         self.run = _SwanLabRun()
-        service_patch = patch("trio_cookbook.trainer.dpo.trainer.trio.ServiceClient", return_value=self.service)
-        swanlab_patch = patch("trio_cookbook.trainer.dpo.trainer.swanlab.init", return_value=self.run)
+        service_patch = patch("trio_cookbook.trainer.dpo_trainer.trio.ServiceClient", return_value=self.service)
+        swanlab_patch = patch("trio_cookbook.trainer.dpo_trainer.swanlab.init", return_value=self.run)
         service_patch.start()
         swanlab_patch.start()
         self.addCleanup(service_patch.stop)
@@ -182,8 +192,8 @@ class DPOTrainerTests(unittest.TestCase):
     def test_none_report_to_uses_terminal_progress_without_swanlab(self) -> None:
         self.assertIsNone(DPOConfig().report_to)
         with (
-            patch("trio_cookbook.trainer.dpo.trainer.swanlab.init") as init,
-            patch("trio_cookbook.trainer.dpo.trainer.tqdm") as progress,
+            patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init,
+            patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress,
         ):
             trainer = self.trainer(report_to=None, max_steps=1)
             trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
@@ -217,6 +227,18 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(self.service.training.optim_calls, 1)
         self.assertEqual(self.run.logs[0][1], 1)
         self.assertEqual(self.service.training.sampling_client_calls, 0)
+
+    def test_validation_scores_current_policy_without_optimizer(self) -> None:
+        trainer = self.trainer()
+        rows = [{"messages": "P", "chosen": "A", "rejected": "B"}]
+
+        metrics = trainer.evaluate(rows)
+
+        self.assertAlmostEqual(metrics["eval/loss"], math.log(2), places=3)
+        self.assertEqual(metrics["eval/pairs"], 1.0)
+        self.assertEqual(self.service.training.sampling_client_calls, 1)
+        self.assertEqual(self.service.training.optim_calls, 0)
+        self.assertEqual(trainer.state.global_step, 0)
 
     def test_step_logs_dpo_loss_and_measured_work_without_surrogate_loss(self) -> None:
         result = self.trainer(save_every=1).step([{"messages": "P", "chosen": "A", "rejected": "B"}])
@@ -273,7 +295,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/train_runtime", summary)
 
     def test_swanlab_mode_initializes_run_without_sdk_mode_override(self) -> None:
-        with patch("trio_cookbook.trainer.dpo.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init:
             self.trainer()
         self.assertNotIn("mode", init.call_args.kwargs)
 

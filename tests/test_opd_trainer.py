@@ -269,7 +269,7 @@ class OPDConfigTests(unittest.TestCase):
 class OPDTrainerTests(unittest.TestCase):
     def setUp(self):
         self.service, self.run = _Service(), _Run()
-        self.patch = patch("trio_cookbook.trainer.opd.trainer.trio.ServiceClient", return_value=self.service)
+        self.patch = patch("trio_cookbook.trainer.opd_trainer.trio.ServiceClient", return_value=self.service)
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
@@ -291,6 +291,17 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(result.metrics["train/loss"], 0.3)
         self.assertEqual(result.metrics["train/loss"], result.metrics["loss_mean"])
         self.assertEqual(self.service.training.events, ["snapshot", "forward", "optim"])
+
+    def test_validation_scores_student_and_teacher_without_optimizer(self):
+        trainer = self.trainer()
+
+        metrics = trainer.evaluate([{"messages": "PQ"}])
+
+        self.assertEqual(metrics["eval/prompts"], 1.0)
+        self.assertEqual(metrics["eval/completions"], 1.0)
+        self.assertAlmostEqual(metrics["eval/reverse_kl_sampled"], -0.25)
+        self.assertEqual(self.service.training.optim_calls, 0)
+        self.assertEqual(trainer.state.global_step, 0)
 
     def test_identical_teacher_student_keeps_zero_signal_without_group_filtering(self):
         self.service.student_values = [-1, -1]
@@ -356,7 +367,7 @@ class OPDTrainerTests(unittest.TestCase):
         for failure in ("fail_forward", "fail_optim"):
             with self.subTest(failure=failure):
                 self.service = _Service()
-                with patch("trio_cookbook.trainer.opd.trainer.trio.ServiceClient", return_value=self.service):
+                with patch("trio_cookbook.trainer.opd_trainer.trio.ServiceClient", return_value=self.service):
                     trainer = self.trainer()
                 setattr(self.service.training, failure, True)
                 with self.assertRaises(RuntimeError):
@@ -369,7 +380,7 @@ class OPDTrainerTests(unittest.TestCase):
                     trainer.step([{"messages": "P"}])
 
     def test_swanlab_flush_and_failure_finish(self):
-        with patch("trio_cookbook.trainer.opd.trainer.swanlab.init", return_value=self.run):
+        with patch("trio_cookbook.trainer.opd_trainer.swanlab.init", return_value=self.run):
             trainer = self.trainer(report_to="swanlab", logging_step=10, batch_size=1)
         trainer.train_dataset = [{"messages": "P"}] * 2
         trainer.train()
@@ -378,7 +389,7 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertIn("distill/reverse_kl_sampled", self.run.logs[0][0])
         self.assertEqual(self.run.texts[0]["data"], trainer.state.checkpoint_path)
         self.run = _Run()
-        with patch("trio_cookbook.trainer.opd.trainer.swanlab.init", return_value=self.run):
+        with patch("trio_cookbook.trainer.opd_trainer.swanlab.init", return_value=self.run):
             trainer = self.trainer(report_to="swanlab")
         self.service.training.fail_forward = True
         trainer.train_dataset = [{"messages": "P"}]

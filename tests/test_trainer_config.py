@@ -7,6 +7,7 @@ import unittest
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
     DPOConfig,
+    EvaluationConfig,
     GRPOConfig,
     OPDConfig,
     SFTConfig,
@@ -35,6 +36,8 @@ class TrainerConfigTests(unittest.TestCase):
                         "beta1": 0.9,
                         "beta2": 0.95,
                         "eps": 1e-8,
+                        "weight_decay": 0.0,
+                        "grad_clip_norm": 0.0,
                     },
                 )
 
@@ -49,6 +52,37 @@ class TrainerConfigTests(unittest.TestCase):
             with self.subTest(config=config_class.__name__, field="tags"):
                 with self.assertRaisesRegex(ValueError, "tags"):
                     config_class(tags=[""])
+
+    def test_optimizer_contract_exposes_decay_and_gradient_clipping(self) -> None:
+        config = DPOConfig(weight_decay=0.01, grad_clip_norm=1.0)
+
+        self.assertEqual(config.optimizer_params()["weight_decay"], 0.01)
+        self.assertEqual(config.optimizer_params()["grad_clip_norm"], 1.0)
+        for field in ("weight_decay", "grad_clip_norm"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                DPOConfig(**{field: -1.0})
+
+    def test_evaluation_schedule_rejects_invalid_limits(self) -> None:
+        for kwargs in (
+            {"every_steps": -1},
+            {"every_steps": True},
+            {"batch_size": 0},
+            {"max_batches": 0},
+            {"before_train": "yes"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                EvaluationConfig(**kwargs)
+
+    def test_algorithm_config_accepts_nested_evaluation_mapping(self) -> None:
+        config = SFTConfig(
+            evaluation={"before_train": True, "every_steps": 5, "max_batches": 2}
+        )
+
+        self.assertIsInstance(config.evaluation, EvaluationConfig)
+        self.assertTrue(config.evaluation.before_train)
+        self.assertEqual(config.evaluation.every_steps, 5)
+        self.assertEqual(config.evaluation.max_batches, 2)
+
 
 
 if __name__ == "__main__":

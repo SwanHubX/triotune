@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from trio_cookbook.recipes import sft_huanhuan, sft_huanhuan_trio
-from trio_cookbook.trainer import SFTConfig, SFTTrainer
+from trio_cookbook.trainer import EvaluationConfig, SFTConfig, SFTTrainer
 
 
 class _Tokenizer:
@@ -68,6 +68,7 @@ class _Client:
         self.fail_forward = False
         self.saved: list[str] = []
         self.events: list[str] = []
+        self.eval_calls = 0
 
     def get_tokenizer(self) -> _Tokenizer:
         return _Tokenizer()
@@ -79,6 +80,23 @@ class _Client:
         if self.fail_forward:
             raise RuntimeError("forward failed")
         return SimpleNamespace(metrics={"loss_mean": 0.5, "token_count": 2})
+
+    def forward(self, datums: list[object], **kwargs: object) -> object:
+        self.events.append("evaluate")
+        self.eval_calls += 1
+        assert kwargs == {"loss_fn": "cross_entropy", "auto_shift": False}
+        token_count = sum(
+            target != -100
+            for datum in datums
+            for target in datum.loss_fn_inputs["target_tokens"].data
+        )
+        return SimpleNamespace(
+            metrics={"loss_mean": 0.25, "loss_sum": 0.25 * token_count,
+                     "token_count": token_count}
+        )
+
+    async def forward_async(self, datums: list[object], **kwargs: object) -> object:
+        return _Future(self.forward(datums, **kwargs))
 
     def optim_step(self, params: object) -> object:
         self.events.append("optim")
@@ -120,8 +138,8 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.client = _Client()
         self.run = _Run()
-        service = patch("trio_cookbook.trainer.sft.trainer.trio.ServiceClient")
-        swanlab = patch("trio_cookbook.trainer.sft.trainer.swanlab.init", return_value=self.run)
+        service = patch("trio_cookbook.trainer.sft_trainer.trio.ServiceClient")
+        swanlab = patch("trio_cookbook.trainer.sft_trainer.swanlab.init", return_value=self.run)
         self.service = service.start()
         swanlab.start()
         self.addCleanup(service.stop)
@@ -199,6 +217,35 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def test_validation_uses_forward_without_optimizer_or_state_step(self) -> None:
+        trainer = self.trainer()
+
+        metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
+
+        self.assertEqual(metrics["eval/loss"], 0.25)
+        self.assertEqual(metrics["eval/examples"], 2.0)
+        self.assertEqual(self.client.eval_calls, 2)
+        self.assertEqual(self.client.optim_calls, 0)
+        self.assertEqual(trainer.state.global_step, 0)
+
+    async def test_train_schedules_initial_and_periodic_validation_once(self) -> None:
+        trainer = self.trainer(
+            max_steps=1,
+            evaluation=EvaluationConfig(
+                before_train=True,
+                every_steps=1,
+                after_train=True,
+            ),
+        )
+        trainer.train_dataset = [{"text": "train"}]
+        trainer.valid_dataset = [{"text": "valid"}]
+
+        state = await trainer.train()
+
+        self.assertEqual(state.global_step, 1)
+        self.assertEqual(self.client.optim_calls, 1)
+        self.assertEqual(self.client.eval_calls, 2)
+
     async def test_pipeline_limits_outstanding_batches(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_in_flight"):
             SFTConfig(max_in_flight=0)
@@ -251,7 +298,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(self.client, "forward_backward_async", return_value=FailedFuture(None)),
-            patch("trio_cookbook.trainer.sft.trainer.asyncio.create_task", side_effect=tracked_task),
+            patch("trio_cookbook.trainer.sft_trainer.asyncio.create_task", side_effect=tracked_task),
         ):
             with self.assertRaisesRegex(RuntimeError, "remote forward failed"):
                 await trainer.train()
@@ -262,7 +309,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.run.finished)
 
     async def test_swanlab_options_and_disabled_reporting(self) -> None:
-        with patch("trio_cookbook.trainer.sft.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.sft_trainer.swanlab.init") as init:
             self.trainer()
             init.assert_not_called()
             self.trainer(report_to="swanlab")

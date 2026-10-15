@@ -6,7 +6,7 @@ SFT submits queued saves in its trainer to preserve the SDK's request ordering.
 
 from typing import Any
 
-from ...utils.client import call, call_async
+from .client import call, call_async
 
 
 def checkpoint_name(algorithm: str, step: int) -> str:

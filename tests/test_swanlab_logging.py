@@ -64,7 +64,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer.model_name = "Qwen/Qwen3.5-9B"
         trainer.config = GRPOConfig(report_to="swanlab", workspace="my-organization", tags=["grpo", "gsm8k"])
 
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
             trainer._init_swanlab_run(lora_rank=32)
 
         self.assertEqual(init.call_args.kwargs["workspace"], "my-organization")
@@ -76,7 +76,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer.model_name = "Qwen/Qwen3.5-9B"
         trainer.config = GRPOConfig(report_to="swanlab")
 
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
             trainer._init_swanlab_run(lora_rank=32)
 
         self.assertIsNone(init.call_args.kwargs["workspace"])
@@ -85,7 +85,7 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_none_report_to_uses_terminal_only(self) -> None:
         trainer = GRPOTrainer.__new__(GRPOTrainer)
         trainer.config = GRPOConfig()
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.trainer.grpo_trainer.swanlab.init") as init:
             self.assertIsNone(trainer._init_swanlab_run(lora_rank=32))
         init.assert_not_called()
 
@@ -194,7 +194,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             trainer._log_final_checkpoint()
 
         terminal.assert_not_called()
@@ -204,7 +204,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             trainer.config = GRPOConfig(output_dir=False)
             trainer._log_final_checkpoint()
             trainer.config = GRPOConfig(output_dir=True)
@@ -254,7 +254,7 @@ class SwanLabLoggingTests(unittest.TestCase):
 
         trainer.step = step
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             state = trainer.train()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
@@ -309,7 +309,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         trainer.step_async = step_async
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             state = await trainer.train_async()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")

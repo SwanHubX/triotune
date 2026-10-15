@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from trio_cookbook.trainer import GRPOConfig, GRPOTrainer, TrainerState
+from trio_cookbook.trainer.grpo.rewards import RewardEvaluator
 
 
 class _Tokenizer:
@@ -26,6 +28,7 @@ class DatasetRowTests(unittest.TestCase):
         self.trainer.config = GRPOConfig()
         self.trainer.state = TrainerState()
         self.trainer._tokenizer = _Tokenizer()
+        self.trainer._decode = lambda tokens: "decoded tokens"
 
     def test_default_messages_accepts_text_tokens_and_chat(self) -> None:
         rows = [
@@ -58,6 +61,32 @@ class DatasetRowTests(unittest.TestCase):
 
         self.trainer.config = GRPOConfig(stop=False)
         self.assertIsNone(self.trainer._stop_sequences())
+
+    def test_validation_samples_and_scores_without_training(self) -> None:
+        self.trainer.config = GRPOConfig(num_generations=2)
+        self.trainer._last_eval_step = None
+        self.trainer._swanlab_run = None
+        self.trainer.reward_evaluator = RewardEvaluator(
+            lambda completions, **_: [float(index + 1) for index, _ in enumerate(completions)]
+        )
+
+        class Sampler:
+            def sample(self, **_: object) -> object:
+                return SimpleNamespace(
+                    sequences=[
+                        SimpleNamespace(tokens=[5], logprobs=[-0.5], text="a"),
+                        SimpleNamespace(tokens=[6, 7], logprobs=[-0.4, -0.3], text="b"),
+                    ]
+                )
+
+        self.trainer._new_sampling_client = Sampler
+
+        metrics = self.trainer.evaluate([{"messages": "question"}])
+
+        self.assertEqual(metrics["eval/reward"], 1.5)
+        self.assertEqual(metrics["eval/prompts"], 1.0)
+        self.assertEqual(metrics["eval/completions"], 2.0)
+        self.assertEqual(self.trainer.state.global_step, 0)
 
 
 if __name__ == "__main__":

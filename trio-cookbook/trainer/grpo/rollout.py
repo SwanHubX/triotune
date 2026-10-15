@@ -1,7 +1,7 @@
 """Text-only GRPO rollout adapter for ``SamplingClient``.
 
 It returns grouped completions and behavior logprobs, which are GRPO contracts;
-the lower-level future handling it uses lives in ``utils.client``.
+the lower-level future handling it uses lives in ``common.client``.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
-from ...utils.client import call, call_async, sampling_params
+from ..common.client import call, call_async, sampling_params
 from ..dataset.prompt import as_prompt_text
 from .types import GRPOBatch, SequenceSample
 
