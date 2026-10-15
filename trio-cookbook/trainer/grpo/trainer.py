@@ -22,7 +22,7 @@ from tqdm import tqdm
 from ...utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
 from ..common.checkpoint import save_checkpoint, save_checkpoint_async
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from ..common.prompts import render_prompt
+from ..dataset import prepare_prompt
 from .advantages import group_advantages
 from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
@@ -269,14 +269,15 @@ class GRPOTrainer:
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
         groups = []
         for index, row in enumerate(rows):
-            # 数据行默认使用 messages 字段，值可以是文本、token ID 或对话消息。
-            if self.config.prompt_key not in row:
-                raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
-            rendered = render_prompt(
-                row[self.config.prompt_key],
+            # The dataset layer accepts text, token IDs, or chat messages and
+            # renders each prompt exactly once for rewards and model sampling.
+            rendered = prepare_prompt(
+                row,
                 self._tokenizer,
+                prompt_key=self.config.prompt_key,
                 add_generation_prompt=self.config.add_generation_prompt,
                 chat_template_kwargs=self.config.chat_template_kwargs,
+                row_index=index,
             )
             groups.append(
                 GRPOBatch(

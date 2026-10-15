@@ -1,1 +1,1 @@
-"""Shared text input and training support."""
+"""Shared checkpoint and logging support for trainer algorithms."""

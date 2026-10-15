@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ...utils.client import call, call_async, sampling_params
-from ..common.prompts import as_prompt_text
+from ..dataset.prompt import as_prompt_text
 from .types import GRPOBatch, SequenceSample
 
 

@@ -20,7 +20,7 @@ from tqdm import tqdm
 from ...utils.client import call_async, optimizer_params
 from ..common.checkpoint import save_checkpoint_async
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from ..common.prompts import RenderedPrompt, render_prompt
+from ..dataset import PromptExample, prepare_prompt
 from .config import OPDConfig
 from .distillation import (
     build_opd_datum,
@@ -105,25 +105,30 @@ class OPDTrainer:
             raise RuntimeError("An update failed or was cancelled; recreate the trainer from a valid checkpoint.")
         self._busy = True
 
-    def _prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[RenderedPrompt]:
+    def _prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[PromptExample]:
         if not rows:
             raise ValueError("An OPD step requires at least one prompt.")
         prompts = []
         for index, row in enumerate(rows):
-            if not isinstance(row, Mapping) or self.args.prompt_key not in row:
-                raise ValueError(f"Dataset row {index} needs {self.args.prompt_key!r}.")
-            prompt = render_prompt(
-                row[self.args.prompt_key], self._tokenizer,
-                add_generation_prompt=self.args.add_generation_prompt,
-                chat_template_kwargs=self.args.chat_template_kwargs,
-            )
-            validate_tokens(prompt.tokens, source=f"Prompt {index}")
-            if self.args.max_length is not None and len(prompt.tokens) >= self.args.max_length:
-                raise ValueError(f"Prompt {index} leaves no completion space within max_length.")
+            try:
+                prompt = prepare_prompt(
+                    row,
+                    self._tokenizer,
+                    prompt_key=self.args.prompt_key,
+                    add_generation_prompt=self.args.add_generation_prompt,
+                    chat_template_kwargs=self.args.chat_template_kwargs,
+                    max_length=self.args.max_length,
+                    min_completion_tokens=1,
+                    row_index=index,
+                )
+            except KeyError as error:
+                # OPD historically treats every malformed prompt row as a
+                # value error; retain that trainer contract at this boundary.
+                raise ValueError(str(error)) from error
             prompts.append(prompt)
         return prompts
 
-    def _sampling_params(self, prompt: RenderedPrompt, index: int) -> Any:
+    def _sampling_params(self, prompt: PromptExample, index: int) -> Any:
         max_tokens = self.args.max_completion_length
         if self.args.max_length is not None:
             max_tokens = min(max_tokens, self.args.max_length - len(prompt.tokens))
@@ -136,7 +141,7 @@ class OPDTrainer:
         )
 
     async def _score_completion(
-        self, prompt: RenderedPrompt, tokens: list[int], student: list[float],
+        self, prompt: PromptExample, tokens: list[int], student: list[float],
         scoring_slots: asyncio.Semaphore,
     ) -> _ScoredCompletion:
         async with scoring_slots:
@@ -154,7 +159,7 @@ class OPDTrainer:
         )
 
     async def _sample_and_score(
-        self, prompt: RenderedPrompt, index: int, sampler: Any,
+        self, prompt: PromptExample, index: int, sampler: Any,
         sampling_slots: asyncio.Semaphore, scoring_slots: asyncio.Semaphore,
     ) -> list[_ScoredCompletion]:
         params = self._sampling_params(prompt, index)
@@ -185,7 +190,9 @@ class OPDTrainer:
                      for tokens, student in samples]
         return [task.result() for task in tasks]
 
-    async def _rollout_and_score(self, prompts: list[RenderedPrompt], sampler: Any) -> list[_ScoredCompletion]:
+    async def _rollout_and_score(
+        self, prompts: list[PromptExample], sampler: Any
+    ) -> list[_ScoredCompletion]:
         sampling_slots = asyncio.Semaphore(self.args.max_concurrent_sampling)
         scoring_slots = asyncio.Semaphore(self.args.max_concurrent_scoring)
         pending = iter(enumerate(prompts))

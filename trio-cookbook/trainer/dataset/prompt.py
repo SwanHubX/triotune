@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
+
+from .examples import PromptExample
+
+
+# ``RenderedPrompt`` was the original public name. Both names now reference
+# one canonical dataset example instead of maintaining duplicate structures.
+RenderedPrompt = PromptExample
 
 
 def _is_token(value: Any) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool)
-
-
-@dataclass(slots=True, frozen=True)
-class RenderedPrompt:
-    """A text prompt rendered exactly once for sampling and training."""
-
-    text: str
-    tokens: list[int]
 
 
 def _text_content(content: Any, *, location: str) -> str:

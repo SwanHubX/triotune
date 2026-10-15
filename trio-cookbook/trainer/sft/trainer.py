@@ -15,8 +15,8 @@ from tqdm import tqdm
 
 from ...utils.client import call_async, optimizer_params, submit_async, wait_async
 from ..common.logging import finish_run, start_run
+from ..dataset import SupervisedExample, prepare_sft
 from .config import SFTConfig
-from .data import tokens_and_labels
 from .types import SFTState
 
 
@@ -55,8 +55,17 @@ class SFTTrainer:
                 metadata={"model": self.model, "lora_rank": lora_rank},
             )
 
-    def _tokens_and_labels(self, row: Mapping[str, Any]) -> tuple[list[int], list[int]]:
-        return tokens_and_labels(row, self._tokenizer, self.args)
+    def _prepare_example(self, row: Mapping[str, Any]) -> SupervisedExample:
+        return prepare_sft(
+            row,
+            self._tokenizer,
+            text_field=self.args.dataset_text_field,
+            max_length=self.args.max_length,
+            completion_only_loss=self.args.completion_only_loss,
+            assistant_only_loss=self.args.assistant_only_loss,
+            add_eos_token=self.args.add_eos_token,
+            chat_template_kwargs=self.args.chat_template_kwargs,
+        )
 
     async def step(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
         """Submit one batch and wait for it; train() pipelines multiple batches."""
@@ -69,13 +78,13 @@ class SFTTrainer:
         if not rows:
             raise ValueError("An SFT step requires at least one row.")
         started = time.perf_counter()
-        examples = [self._tokens_and_labels(row) for row in rows]
+        examples = [self._prepare_example(row) for row in rows]
         datums = [
             trio.Datum(
-                model_input=trio.ModelInput.from_ints(tokens[:-1]),
-                loss_fn_inputs={"target_tokens": labels[1:]},
+                model_input=trio.ModelInput.from_ints(example.model_input),
+                loss_fn_inputs={"target_tokens": example.target_tokens},
             )
-            for tokens, labels in examples
+            for example in examples
         ]
         # Await submission only. The SDK orders FB -> optim -> save -> next FB.
         forward_future = await submit_async(self._client, "forward_backward", datums, loss_fn="cross_entropy", auto_shift=False)
@@ -83,7 +92,11 @@ class SFTTrainer:
         save_future = None
         if self.args.save_every and step % self.args.save_every == 0:
             save_future = await submit_async(self._client, "save_state", name=f"sft-step-{step:08d}")
-        token_count = sum(label != -100 for _, labels in examples for label in labels[1:])
+        token_count = sum(
+            target != -100
+            for example in examples
+            for target in example.target_tokens
+        )
 
         async def collect() -> dict[str, float]:
             forward = await wait_async(forward_future)

@@ -24,6 +24,8 @@ packages = [
     "trio_cookbook",
     "trio_cookbook.trainer",
     "trio_cookbook.trainer.common",
+    "trio_cookbook.trainer.dataset",
+    "trio_cookbook.trainer.dataset.swe_sft",
     "trio_cookbook.trainer.grpo",
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",

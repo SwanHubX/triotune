@@ -25,7 +25,7 @@ class TrainerLayoutTests(unittest.TestCase):
             "rewards": "grpo.rewards",
             "rollout": "grpo.rollout",
             "types": "grpo.types",
-            "prompts": "common.prompts",
+            "prompts": "dataset.prompt",
         }
         for old, new in aliases.items():
             with self.subTest(module=old):

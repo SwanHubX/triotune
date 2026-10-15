@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from trio_cookbook.trainer import DPOConfig, DPOTrainer
-from trio_cookbook.trainer.dpo.data import build_datum as _datum, reference_logprob as _reference_logprob
 from trio_cookbook.trainer.dpo.loss import make_loss_fn as _loss_fn
+from trio_cookbook.trainer.dpo.trainer import _datum, _reference_logprob
 
 
 class _Tokenizer:

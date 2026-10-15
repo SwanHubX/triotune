@@ -21,17 +21,46 @@ from tqdm import tqdm
 from ...utils.client import call, call_async, optimizer_params
 from ..common.checkpoint import save_checkpoint, save_checkpoint_async
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from ..common.prompts import RenderedPrompt, render_prompt
-from .config import DPOConfig
-from .data import (
-    Preference as _Preference,
-    build_datum as _datum,
-    prepare_preferences,
-    reference_logprob as _reference_logprob,
+from ..dataset import (
+    IGNORE_INDEX,
+    PreferenceExample,
+    PromptExample,
+    SupervisedExample,
+    prepare_preference,
+    prepare_prompt,
 )
+from .config import DPOConfig
 from .loss import make_loss_fn as _loss_fn
 from .metrics import swanlab_metrics as _swanlab_metrics
 from .types import DPOResult, DPOState
+
+
+def _datum(prompt: list[int], completion: list[int]) -> Any:
+    """Build the masked, next-token-aligned PyTRIO sequence used by DPO."""
+
+    example = SupervisedExample(
+        input_ids=prompt + completion,
+        labels=[IGNORE_INDEX] * len(prompt) + completion,
+    )
+    return trio.Datum(
+        model_input=trio.ModelInput.from_ints(example.model_input),
+        loss_fn_inputs={"target_tokens": example.target_tokens},
+    )
+
+
+def _reference_logprob(
+    values: Sequence[float | None], prompt_length: int, total_length: int
+) -> float:
+    """Reduce reference token scores over the completion only."""
+
+    if len(values) != total_length:
+        raise ValueError("Reference sampler returned the wrong number of token logprobs.")
+    completion_values = values[prompt_length:]
+    if not completion_values or any(
+        value is None or not math.isfinite(value) for value in completion_values
+    ):
+        raise ValueError("Reference sampler returned missing or non-finite completion logprobs.")
+    return sum(float(value) for value in completion_values if value is not None)
 
 
 class DPOTrainer:
@@ -77,17 +106,32 @@ class DPOTrainer:
                 metadata={"model": self.model, "ref_model": self.ref_model, "lora_rank": lora_rank},
             )
 
-    def _preferences(self, rows: Sequence[Mapping[str, Any]]) -> list[_Preference]:
-        return prepare_preferences(rows, self._tokenizer, self.args)
+    def _preferences(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> list[PreferenceExample]:
+        if not rows:
+            raise ValueError("A DPO step requires at least one preference pair.")
+        return [
+            prepare_preference(
+                row,
+                self._tokenizer,
+                prompt_key=self.args.prompt_key,
+                add_eos_token=self.args.add_eos_token,
+                chat_template_kwargs=self.args.chat_template_kwargs,
+                max_length=self.args.max_length,
+                row_index=index,
+            )
+            for index, row in enumerate(rows)
+        ]
 
-    def _datums(self, pairs: Sequence[_Preference]) -> list[Any]:
+    def _datums(self, pairs: Sequence[PreferenceExample]) -> list[Any]:
         return [
             _datum(pair.prompt, completion)
             for pair in pairs
             for completion in (pair.chosen, pair.rejected)
         ]
 
-    def _reference_scores(self, pairs: Sequence[_Preference]) -> list[float]:
+    def _reference_scores(self, pairs: Sequence[PreferenceExample]) -> list[float]:
         scores = []
         for pair in pairs:
             for completion in (pair.chosen, pair.rejected):
@@ -96,7 +140,9 @@ class DPOTrainer:
                 scores.append(_reference_logprob(values, len(pair.prompt), len(tokens)))
         return scores
 
-    async def _reference_scores_async(self, pairs: Sequence[_Preference]) -> list[float]:
+    async def _reference_scores_async(
+        self, pairs: Sequence[PreferenceExample]
+    ) -> list[float]:
         requests = [
             (pair.prompt, completion)
             for pair in pairs
@@ -260,14 +306,20 @@ class DPOTrainer:
                 step=self.state.global_step,
             )
 
-    def _final_sample_prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[RenderedPrompt]:
+    def _final_sample_prompts(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> list[PromptExample]:
         return [
-            render_prompt(
-                row[self.args.prompt_key],
+            prepare_prompt(
+                row,
                 self._tokenizer,
+                prompt_key=self.args.prompt_key,
                 chat_template_kwargs=self.args.chat_template_kwargs,
+                max_length=self.args.max_length,
+                min_completion_tokens=1,
+                row_index=index,
             )
-            for row in rows[:4]
+            for index, row in enumerate(rows[:4])
         ]
 
     def _final_sampling_params(self, prompt_length: int) -> Any:
@@ -276,7 +328,9 @@ class DPOTrainer:
             max_tokens = min(max_tokens, self.args.max_length - prompt_length)
         return trio.SamplingParams(max_tokens=max_tokens, seed=self.args.seed)
 
-    def _write_final_samples(self, prompts: Sequence[RenderedPrompt], responses: Sequence[Any]) -> None:
+    def _write_final_samples(
+        self, prompts: Sequence[PromptExample], responses: Sequence[Any]
+    ) -> None:
         texts = []
         for prompt, response in zip(prompts, responses, strict=True):
             if not response.sequences:

@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from trio_cookbook.trainer.dpo.data import build_datum
+from trio_cookbook.trainer.dpo.trainer import _datum as build_datum
 from trio_cookbook.trainer.dpo.loss import make_loss_fn
 
 

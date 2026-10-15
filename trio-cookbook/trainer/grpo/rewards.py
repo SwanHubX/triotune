@@ -8,7 +8,7 @@ import math
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from ..common.prompts import as_prompt_text
+from ..dataset.prompt import as_prompt_text
 from .types import GRPOBatch
 
 RewardFunc = Callable[..., Sequence[float | None]]
