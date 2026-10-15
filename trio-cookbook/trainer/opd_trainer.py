@@ -14,22 +14,22 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import pytrio as trio
-import swanlab
 from tqdm import tqdm
 
-from .common.client import call_async, optimizer_params
-from .common.checkpoint import save_checkpoint_async
-from .common.config import OPDConfig
-from .common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from .dataset import PromptExample, prepare_prompt
+from ..api.cli_args import OPDConfig
+from ..api.client_api import call_async, optimizer_params
+from ..dataset import PromptExample, prepare_prompt
+from ..utils.checkpoint import save_checkpoint_async
+from ..utils.metrics import MetricsAPI
 from .opd.distillation import (
+    _ScoredCompletion,
     build_opd_datum,
     distillation_advantages,
     teacher_completion_logprobs,
     validate_logprobs,
     validate_tokens,
 )
-from .opd.types import OPDResult, OPDState, _ScoredCompletion
+from .opd.state import OPDResult, OPDState
 
 
 class OPDTrainer:
@@ -97,22 +97,20 @@ class OPDTrainer:
         self._requires_restart = False
         self._sampling_seed_offset = 0
         self._total_tokens = 0
-        self._metric_window: dict[str, tuple[float, int]] = {}
-        self._run: Any = None
-        if self.args.report_to == "swanlab":
-            self._run = start_run(
-                self.args,
-                default_name=f"{self.model.rsplit('/', 1)[-1]}-opd",
-                metadata={
-                    "model": self.model,
-                    "teacher_model": self.teacher_model,
-                    "teacher_model_path": teacher_model_path,
-                    "lora_rank": lora_rank,
-                    "sampling_temperature": 1.0,
-                    "sampling_top_p": 1.0,
-                    "sampling_top_k": -1,
-                },
-            )
+        self._metrics_api = MetricsAPI.from_config(
+            self.args,
+            default_name=f"{self.model.rsplit('/', 1)[-1]}-opd",
+            metadata={
+                "model": self.model,
+                "teacher_model": self.teacher_model,
+                "teacher_model_path": teacher_model_path,
+                "lora_rank": lora_rank,
+                "sampling_temperature": 1.0,
+                "sampling_top_p": 1.0,
+                "sampling_top_k": -1,
+            },
+            logging_step=self.args.logging_step,
+        )
 
     # ------------------------------------------------------------------
     # Re-entrancy and failure-state guard
@@ -328,28 +326,17 @@ class OPDTrainer:
     def _log(self, metrics: dict[str, float]) -> None:
         """Accumulate OPD metrics and flush at the configured interval."""
 
-        if self._run is None:
-            return
-        accumulate_metrics(self._metric_window, metrics)
-        if self.state.global_step % self.args.logging_step == 0:
-            self._flush_log()
+        self._metrics_api.record(metrics, step=self.state.global_step)
 
     def _flush_log(self) -> None:
         """Publish and clear the current OPD metric window."""
 
-        if self._run is not None and self._metric_window:
-            self._run.log(
-                averaged_metrics(self._metric_window),
-                step=self.state.global_step,
-            )
-            self._metric_window.clear()
+        self._metrics_api.flush(step=self.state.global_step)
 
     def _finish_run(self, state: str, error: str | None = None) -> None:
         """Close SwanLab once and clear the owned run handle."""
 
-        if self._run is not None:
-            finish_run(self._run, state=state, error=error)
-            self._run = None
+        self._metrics_api.finish(state=state, error=error)
 
     async def _step_async(self, rows: Sequence[Mapping[str, Any]]) -> OPDResult:
         """Execute one fresh-rollout OPD update without taking the public lock."""
@@ -474,11 +461,7 @@ class OPDTrainer:
         values = {str(name): float(value) for name, value in metrics.items()}
         self._last_eval_step = self.state.global_step
         self.state.metrics.update(values)
-        if self._run is not None:
-            self._run.log(
-                {**values, "train/step": float(self.state.global_step)},
-                step=self.state.global_step,
-            )
+        self._metrics_api.publish(values, step=self.state.global_step)
         return values
 
     async def _evaluate_async(
@@ -586,10 +569,10 @@ class OPDTrainer:
             if self.state.global_step > initial_step:
                 if not self.args.save_every or self.state.global_step % self.args.save_every:
                     await self._save_state_async()
-                if self._run is not None:
+                if self._metrics_api.enabled:
                     elapsed = time.perf_counter() - started
                     self._flush_log()
-                    self._run.log(
+                    self._metrics_api.publish(
                         {
                             "time/train_runtime": elapsed,
                             "time/train_steps_per_second": (
@@ -603,7 +586,7 @@ class OPDTrainer:
                         },
                         step=self.state.global_step,
                     )
-                    self._run.log_text(
+                    self._metrics_api.log_text(
                         key="checkpoint/path",
                         data=self.state.checkpoint_path,
                         step=self.state.global_step,

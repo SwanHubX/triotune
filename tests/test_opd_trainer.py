@@ -380,7 +380,10 @@ class OPDTrainerTests(unittest.TestCase):
                     trainer.step([{"messages": "P"}])
 
     def test_swanlab_flush_and_failure_finish(self):
-        with patch("trio_cookbook.trainer.opd_trainer.swanlab.init", return_value=self.run):
+        with patch(
+            "trio_cookbook.utils.metrics.swanlab.init",
+            return_value=self.run,
+        ):
             trainer = self.trainer(report_to="swanlab", logging_step=10, batch_size=1)
         trainer.train_dataset = [{"messages": "P"}] * 2
         trainer.train()
@@ -389,7 +392,10 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertIn("distill/reverse_kl_sampled", self.run.logs[0][0])
         self.assertEqual(self.run.texts[0]["data"], trainer.state.checkpoint_path)
         self.run = _Run()
-        with patch("trio_cookbook.trainer.opd_trainer.swanlab.init", return_value=self.run):
+        with patch(
+            "trio_cookbook.utils.metrics.swanlab.init",
+            return_value=self.run,
+        ):
             trainer = self.trainer(report_to="swanlab")
         self.service.training.fail_forward = True
         trainer.train_dataset = [{"messages": "P"}]

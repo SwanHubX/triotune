@@ -10,14 +10,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import pytrio as trio
-import swanlab
 from tqdm import tqdm
 
-from .common.client import call_async, optimizer_params, submit_async, wait_async
-from .common.config import SFTConfig
-from .common.logging import finish_run, start_run
-from .dataset import SupervisedExample, prepare_sft
-from .sft.types import SFTState
+from ..api.cli_args import SFTConfig
+from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
+from ..dataset import SupervisedExample, prepare_sft
+from ..utils.metrics import MetricsAPI
+from .sft.state import SFTState
 
 
 class SFTTrainer:
@@ -53,13 +52,11 @@ class SFTTrainer:
         self._tokenizer = self._client.get_tokenizer()
         self.state = SFTState()
         self._last_eval_step: int | None = None
-        self._run = None
-        if self.args.report_to == "swanlab":
-            self._run = start_run(
-                self.args,
-                default_name=f"{self.model.rsplit('/', 1)[-1]}-sft",
-                metadata={"model": self.model, "lora_rank": lora_rank},
-            )
+        self._metrics_api = MetricsAPI.from_config(
+            self.args,
+            default_name=f"{self.model.rsplit('/', 1)[-1]}-sft",
+            metadata={"model": self.model, "lora_rank": lora_rank},
+        )
 
     # ------------------------------------------------------------------
     # Dataset conversion
@@ -120,11 +117,7 @@ class SFTTrainer:
         values = {str(name): float(value) for name, value in metrics.items()}
         self._last_eval_step = self.state.global_step
         self.state.metrics.update(values)
-        if self._run is not None:
-            self._run.log(
-                {**values, "train/step": float(self.state.global_step)},
-                step=self.state.global_step,
-            )
+        self._metrics_api.publish(values, step=self.state.global_step)
         return values
 
     async def evaluate(
@@ -265,8 +258,7 @@ class SFTTrainer:
                 self.state.checkpoint_path = (await wait_async(save_future)).path
             self.state.global_step = step
             self.state.metrics = metrics
-            if self._run is not None:
-                self._run.log({**metrics, "train/step": step}, step=step)
+            self._metrics_api.record(metrics, step=step)
             return metrics
 
         return asyncio.create_task(collect())
@@ -343,20 +335,18 @@ class SFTTrainer:
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate()
-            if self._run is not None:
-                if self.state.checkpoint_path is not None:
-                    self._run.log_text(
-                        key="checkpoint/path",
-                        data=self.state.checkpoint_path,
-                        step=self.state.global_step,
-                    )
-                self._run.finish()
+            if self.state.checkpoint_path is not None:
+                self._metrics_api.log_text(
+                    key="checkpoint/path",
+                    data=self.state.checkpoint_path,
+                    step=self.state.global_step,
+                )
+            self._metrics_api.finish()
         except BaseException as error:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-            if self._run is not None:
-                finish_run(self._run, state="crashed", error=str(error))
+            self._metrics_api.finish(state="crashed", error=str(error))
             raise
         finally:
             progress.close()

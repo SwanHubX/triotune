@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from trio_cookbook.trainer.dataset import (
+from trio_cookbook.dataset import (
     PreferenceExample,
     PromptExample,
     SupervisedExample,

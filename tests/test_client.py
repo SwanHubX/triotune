@@ -9,7 +9,7 @@ import unittest
 
 from pytrio.types.future.api_future import APIFuture
 
-from trio_cookbook.trainer.common.client import call_async, wait_async
+from trio_cookbook.api.client_api import call_async, wait_async
 
 
 class _BlockingFuture:
@@ -43,10 +43,10 @@ class WaitAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(loop_progressed.is_set())
         await tick_task
 
-    def test_legacy_utils_path_aliases_common_client_module(self) -> None:
-        common = importlib.import_module("trio_cookbook.trainer.common.client")
+    def test_legacy_utils_path_aliases_client_api_module(self) -> None:
+        client_api = importlib.import_module("trio_cookbook.api.client_api")
         legacy = importlib.import_module("trio_cookbook.utils.client")
-        self.assertIs(legacy, common)
+        self.assertIs(legacy, client_api)
 
     async def test_resolves_coroutine_returning_native_future(self) -> None:
         async def submit() -> asyncio.Future[str]:

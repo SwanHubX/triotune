@@ -1,4 +1,4 @@
-"""Public dataset preprocessing API shared by all trainer algorithms."""
+"""Public dataset preprocessing API shared by every trainer algorithm."""
 
 from .examples import IGNORE_INDEX, PreferenceExample, PromptExample, SupervisedExample
 from .prepare import prepare_preference, prepare_prompt, prepare_rows, prepare_sft

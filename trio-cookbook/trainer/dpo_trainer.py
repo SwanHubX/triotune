@@ -18,11 +18,9 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from .common.client import call, call_async, optimizer_params
-from .common.checkpoint import save_checkpoint, save_checkpoint_async
-from .common.config import DPOConfig
-from .common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from .dataset import (
+from ..api.cli_args import DPOConfig
+from ..api.client_api import call, call_async, optimizer_params
+from ..dataset import (
     IGNORE_INDEX,
     PreferenceExample,
     PromptExample,
@@ -30,9 +28,10 @@ from .dataset import (
     prepare_preference,
     prepare_prompt,
 )
+from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.metrics import MetricsAPI
 from .dpo.loss import make_loss_fn as _loss_fn
-from .dpo.metrics import swanlab_metrics as _swanlab_metrics
-from .dpo.types import DPOResult, DPOState
+from .dpo.state import DPOResult, DPOState
 
 
 def _datum(prompt: list[int], completion: list[int]) -> Any:
@@ -125,18 +124,16 @@ class DPOTrainer:
         self._last_eval_step: int | None = None
         self._total_tokens = 0
         self._total_pairs = 0
-        self._metric_window: dict[str, tuple[float, int]] = {}
-        self._run = None
-        if self.args.report_to == "swanlab":
-            self._run = start_run(
-                self.args,
-                default_name=f"{self.model.rsplit('/', 1)[-1]}-dpo",
-                metadata={
-                    "model": self.model,
-                    "ref_model": self.ref_model,
-                    "lora_rank": lora_rank,
-                },
-            )
+        self._metrics_api = MetricsAPI.from_config(
+            self.args,
+            default_name=f"{self.model.rsplit('/', 1)[-1]}-dpo",
+            metadata={
+                "model": self.model,
+                "ref_model": self.ref_model,
+                "lora_rank": lora_rank,
+            },
+            logging_step=self.args.logging_step,
+        )
 
     # ------------------------------------------------------------------
     # Preference preparation and model scoring
@@ -284,11 +281,7 @@ class DPOTrainer:
         values = {str(name): float(value) for name, value in metrics.items()}
         self._last_eval_step = self.state.global_step
         self.state.metrics.update(values)
-        if self._run is not None:
-            self._run.log(
-                {**values, "train/step": float(self.state.global_step)},
-                step=self.state.global_step,
-            )
+        self._metrics_api.publish(values, step=self.state.global_step)
         return values
 
     def evaluate(
@@ -385,34 +378,20 @@ class DPOTrainer:
     def _finish_run(self, state: str, error: str | None = None) -> None:
         """Close SwanLab once and clear the owned run handle."""
 
-        if self._run is not None:
-            finish_run(self._run, state=state, error=error)
-            self._run = None
+        self._metrics_api.finish(state=state, error=error)
 
     def _log_swanlab(self, metrics: dict[str, float], count: int) -> None:
         """Accumulate step metrics and flush at the configured interval."""
 
-        if self._run is None:
-            return
-        accumulate_metrics(
-            self._metric_window,
-            {**_swanlab_metrics(metrics), "train/pairs": count},
+        self._metrics_api.record(
+            {**metrics, "train/pairs": count},
+            step=self.state.global_step,
         )
-        if self.state.global_step % self.args.logging_step == 0:
-            self._flush_swanlab()
 
     def _flush_swanlab(self) -> None:
         """Publish and clear the current DPO metric window."""
 
-        if self._run is None:
-            return
-        payload = averaged_metrics(self._metric_window)
-        self._metric_window.clear()
-        if payload:
-            self._run.log(
-                {**payload, "train/step": self.state.global_step},
-                step=self.state.global_step,
-            )
+        self._metrics_api.flush(step=self.state.global_step)
 
     def _finish_step(
         self, metrics: dict[str, float], count: int, started: float
@@ -544,14 +523,14 @@ class DPOTrainer:
         return {
             key: f"{value:.4f}"
             for key, value in result.metrics.items()
-            if key in {"train/loss", "rewards/accuracies"}
+            if key in {"train/loss", "reward/accuracy"}
         }
 
     def _log_final_checkpoint(self) -> None:
         """Publish the final checkpoint URI when reporting is enabled."""
 
-        if self._run is not None and self.state.checkpoint_path is not None:
-            self._run.log_text(
+        if self.state.checkpoint_path is not None:
+            self._metrics_api.log_text(
                 key="checkpoint/path",
                 data=self.state.checkpoint_path,
                 step=self.state.global_step,
@@ -601,12 +580,16 @@ class DPOTrainer:
             if completion is None:
                 completion = self._tokenizer.decode(sequence.tokens, skip_special_tokens=True)
             texts.append(swanlab.Text(completion, caption=prompt.text))
-        self._run.log_text(key="sample/text", data=texts, step=self.state.global_step)
+        self._metrics_api.log_text(
+            key="sample/text",
+            data=texts,
+            step=self.state.global_step,
+        )
 
     def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Snapshot current weights and synchronously generate final samples."""
 
-        if self._run is None or not rows:
+        if not self._metrics_api.enabled or not rows:
             return
         client = call(self._training_client, "save_weights_and_get_sampling_client")
         prompts = self._final_sample_prompts(rows)
@@ -625,7 +608,7 @@ class DPOTrainer:
     async def _log_final_samples_async(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Asynchronously generate final samples from a current-policy snapshot."""
 
-        if self._run is None or not rows:
+        if not self._metrics_api.enabled or not rows:
             return
         client = await call_async(self._training_client, "save_weights_and_get_sampling_client")
         prompts = self._final_sample_prompts(rows)
@@ -658,8 +641,7 @@ class DPOTrainer:
             "data/total_pairs": self._total_pairs,
         }
         self.state.metrics.update(summary)
-        if self._run is not None:
-            self._run.log(_swanlab_metrics(summary), step=self.state.global_step)
+        self._metrics_api.publish(summary, step=self.state.global_step)
 
     # ------------------------------------------------------------------
     # Full dataset training

@@ -1,7 +1,7 @@
 """DPO training implementation."""
 
-from ..common.config import DPOConfig
+from ...api.cli_args import DPOConfig
 from ..dpo_trainer import DPOTrainer
-from .types import DPOResult, DPOState
+from .state import DPOResult, DPOState
 
 __all__ = ["DPOConfig", "DPOTrainer", "DPOResult", "DPOState"]

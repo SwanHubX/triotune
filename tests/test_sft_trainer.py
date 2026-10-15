@@ -139,7 +139,10 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.client = _Client()
         self.run = _Run()
         service = patch("trio_cookbook.trainer.sft_trainer.trio.ServiceClient")
-        swanlab = patch("trio_cookbook.trainer.sft_trainer.swanlab.init", return_value=self.run)
+        swanlab = patch(
+            "trio_cookbook.utils.metrics.swanlab.init",
+            return_value=self.run,
+        )
         self.service = service.start()
         swanlab.start()
         self.addCleanup(service.stop)
@@ -309,7 +312,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.run.finished)
 
     async def test_swanlab_options_and_disabled_reporting(self) -> None:
-        with patch("trio_cookbook.trainer.sft_trainer.swanlab.init") as init:
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
             self.trainer()
             init.assert_not_called()
             self.trainer(report_to="swanlab")

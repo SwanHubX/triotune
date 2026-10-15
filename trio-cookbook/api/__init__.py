@@ -1,6 +1,6 @@
-"""Public contracts and shared support for trainer algorithms."""
+"""Public configuration and client contracts for trainer algorithms."""
 
-from .client import (
+from .client_api import (
     call,
     call_async,
     optimizer_params,
@@ -10,7 +10,7 @@ from .client import (
     wait,
     wait_async,
 )
-from .config import (
+from .cli_args import (
     BaseTrainerConfig,
     DPOConfig,
     EvaluationConfig,

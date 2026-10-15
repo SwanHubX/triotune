@@ -1,7 +1,7 @@
 """SFT training implementation."""
 
-from ..common.config import SFTConfig
+from ...api.cli_args import SFTConfig
 from ..sft_trainer import SFTTrainer
-from .types import SFTState
+from .state import SFTState
 
 __all__ = ["SFTConfig", "SFTTrainer", "SFTState"]

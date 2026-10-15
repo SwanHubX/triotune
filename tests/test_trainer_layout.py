@@ -11,26 +11,26 @@ import trio_cookbook.trainer as trainers
 class TrainerLayoutTests(unittest.TestCase):
     def test_legacy_imports_are_the_actual_modules(self):
         aliases = {
-            "grpo_trainer": "grpo_trainer",
-            "grpo_config": "common.config",
-            "dpo_trainer": "dpo_trainer",
-            "dpo_config": "common.config",
-            "sft_trainer": "sft_trainer",
-            "sft_config": "common.config",
-            "opd_trainer": "opd_trainer",
-            "opd_config": "common.config",
-            "opd_distillation": "opd.distillation",
-            "advantages": "grpo.advantages",
-            "datum": "grpo.datum",
-            "rewards": "grpo.rewards",
-            "rollout": "grpo.rollout",
-            "types": "grpo.types",
-            "prompts": "dataset.prompt",
+            "grpo_trainer": "trio_cookbook.trainer.grpo_trainer",
+            "grpo_config": "trio_cookbook.api.cli_args",
+            "dpo_trainer": "trio_cookbook.trainer.dpo_trainer",
+            "dpo_config": "trio_cookbook.api.cli_args",
+            "sft_trainer": "trio_cookbook.trainer.sft_trainer",
+            "sft_config": "trio_cookbook.api.cli_args",
+            "opd_trainer": "trio_cookbook.trainer.opd_trainer",
+            "opd_config": "trio_cookbook.api.cli_args",
+            "opd_distillation": "trio_cookbook.trainer.opd.distillation",
+            "advantages": "trio_cookbook.trainer.grpo.advantages",
+            "datum": "trio_cookbook.trainer.grpo.datum",
+            "rewards": "trio_cookbook.trainer.grpo.rewards",
+            "rollout": "trio_cookbook.trainer.grpo.rollout",
+            "types": "trio_cookbook.trainer.grpo.contracts",
+            "prompts": "trio_cookbook.dataset.prompt",
         }
         for old, new in aliases.items():
             with self.subTest(module=old):
                 legacy = importlib.import_module(f"trio_cookbook.trainer.{old}")
-                actual = importlib.import_module(f"trio_cookbook.trainer.{new}")
+                actual = importlib.import_module(new)
                 self.assertIs(legacy, actual)
                 self.assertIs(getattr(trainers, old), actual)
 
@@ -41,14 +41,32 @@ class TrainerLayoutTests(unittest.TestCase):
                 with self.subTest(algorithm=algorithm, name=name):
                     self.assertIs(getattr(package, name), getattr(trainers, name))
 
-    def test_algorithm_config_paths_share_the_common_contract_module(self):
-        common = importlib.import_module("trio_cookbook.trainer.common.config")
+    def test_algorithm_config_paths_share_the_api_contract_module(self):
+        cli_args = importlib.import_module("trio_cookbook.api.cli_args")
         for algorithm in ("grpo", "dpo", "sft", "opd"):
             with self.subTest(algorithm=algorithm):
                 module = importlib.import_module(
                     f"trio_cookbook.trainer.{algorithm}.config"
                 )
-                self.assertIs(module, common)
+                self.assertIs(module, cli_args)
+
+    def test_old_nested_packages_alias_new_sibling_packages(self):
+        aliases = {
+            "trio_cookbook.trainer.common": "trio_cookbook.api",
+            "trio_cookbook.trainer.common.config": "trio_cookbook.api.cli_args",
+            "trio_cookbook.trainer.common.client": "trio_cookbook.api.client_api",
+            "trio_cookbook.trainer.common.checkpoint": "trio_cookbook.utils.checkpoint",
+            "trio_cookbook.trainer.common.metrics_api": "trio_cookbook.utils.metrics",
+            "trio_cookbook.trainer.common.logging": "trio_cookbook.utils.metrics",
+            "trio_cookbook.trainer.dataset": "trio_cookbook.dataset",
+            "trio_cookbook.trainer.dataset.swe_sft": "trio_cookbook.dataset.swe_sft",
+        }
+        for old, new in aliases.items():
+            with self.subTest(module=old):
+                self.assertIs(
+                    importlib.import_module(old),
+                    importlib.import_module(new),
+                )
 
     def test_algorithm_trainer_paths_alias_root_modules(self):
         for algorithm in ("grpo", "dpo", "sft", "opd"):
@@ -60,6 +78,19 @@ class TrainerLayoutTests(unittest.TestCase):
                     f"trio_cookbook.trainer.{algorithm}.trainer"
                 )
                 self.assertIs(nested, root)
+
+    def test_renamed_algorithm_modules_keep_legacy_imports(self):
+        aliases = {
+            "grpo.types": "grpo.contracts",
+            "dpo.types": "dpo.state",
+            "sft.types": "sft.state",
+            "opd.types": "opd.state",
+        }
+        for old, new in aliases.items():
+            with self.subTest(module=old):
+                legacy = importlib.import_module(f"trio_cookbook.trainer.{old}")
+                canonical = importlib.import_module(f"trio_cookbook.trainer.{new}")
+                self.assertIs(legacy, canonical)
 
     def test_patching_a_legacy_module_updates_the_actual_module(self):
         actual = importlib.import_module("trio_cookbook.trainer.dpo_trainer")

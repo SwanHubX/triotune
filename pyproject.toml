@@ -22,14 +22,15 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = [
     "trio_cookbook",
+    "trio_cookbook.api",
+    "trio_cookbook.dataset",
+    "trio_cookbook.dataset.swe_sft",
     "trio_cookbook.trainer",
-    "trio_cookbook.trainer.common",
-    "trio_cookbook.trainer.dataset",
-    "trio_cookbook.trainer.dataset.swe_sft",
     "trio_cookbook.trainer.grpo",
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",
     "trio_cookbook.trainer.opd",
+    "trio_cookbook.utils",
 ]
 
 [tool.setuptools.package-dir]

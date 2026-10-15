@@ -13,7 +13,7 @@ from datasets import Dataset
 
 from trio_cookbook.trainer.grpo.datum import build_aligned_datum, to_client_datum
 from trio_cookbook.trainer.grpo.metrics import _sample_train_kl
-from trio_cookbook.trainer.grpo.types import SequenceSample
+from trio_cookbook.trainer.grpo.contracts import SequenceSample
 
 
 def _load_recipe() -> ModuleType:

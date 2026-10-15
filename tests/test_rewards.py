@@ -6,7 +6,7 @@ from unittest.mock import patch
 from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
 import trio_cookbook.trainer.grpo_trainer as trainer_module
 from trio_cookbook.trainer.grpo.rewards import RewardEvaluator
-from trio_cookbook.trainer.grpo.types import GRPOBatch, SequenceSample
+from trio_cookbook.trainer.grpo.contracts import GRPOBatch, SequenceSample
 
 
 class RewardEvaluatorTests(unittest.TestCase):

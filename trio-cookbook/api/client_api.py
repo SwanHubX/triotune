@@ -1,8 +1,8 @@
-"""Shared adapters around public PyTRIO client methods.
+"""Public adapters around PyTRIO training and sampling client methods.
 
 Every algorithm uses a training client, while rollout algorithms also use a
 sampling client. Both expose the same future and async conventions, so those
-mechanics belong to the common contract layer. Sampling-client lifetime does
+mechanics belong to the API contract layer. Sampling-client lifetime does
 not: each algorithm decides when a new checkpoint must be exposed through
 ``save_weights_and_get_sampling_client`` and passes that client to these helpers.
 

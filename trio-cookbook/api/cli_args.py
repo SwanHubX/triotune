@@ -1,4 +1,4 @@
-"""Public configuration contracts shared by all PyTRIO trainers.
+"""Public configuration and command-line contracts for PyTRIO trainers.
 
 This module is the trainer's contract layer: common run controls live on
 ``BaseTrainerConfig`` while algorithm subclasses add only their own behavior.

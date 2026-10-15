@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from trio_cookbook.trainer import GRPOConfig, GRPOTrainer, TrainerState
+from trio_cookbook.utils.metrics import MetricsAPI
 from trio_cookbook.trainer.grpo.rewards import RewardEvaluator
 
 
@@ -65,7 +66,7 @@ class DatasetRowTests(unittest.TestCase):
     def test_validation_samples_and_scores_without_training(self) -> None:
         self.trainer.config = GRPOConfig(num_generations=2)
         self.trainer._last_eval_step = None
-        self.trainer._swanlab_run = None
+        self.trainer._metrics_api = MetricsAPI()
         self.trainer.reward_evaluator = RewardEvaluator(
             lambda completions, **_: [float(index + 1) for index, _ in enumerate(completions)]
         )

@@ -19,7 +19,7 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from .common.client import (
+from ..api.client_api import (
     call,
     call_async,
     optimizer_params,
@@ -28,23 +28,21 @@ from .common.client import (
     wait,
     wait_async,
 )
-from .common.checkpoint import save_checkpoint, save_checkpoint_async
-from .common.config import GRPOConfig
-from .common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from .dataset import prepare_prompt
+from ..api.cli_args import GRPOConfig
+from ..dataset import prepare_prompt
+from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.metrics import MetricsAPI
 from .grpo.advantages import group_advantages
 from .grpo.datum import build_aligned_datum, to_client_datum
 from .grpo.metrics import (
     FINAL_SUMMARY_KEYS,
-    _is_checkpoint_metric,
     _is_per_prompt_metric,
     _rollout_metrics,
     _sample_train_kl,
-    _swanlab_metric_name,
 )
 from .grpo.rewards import RewardEvaluator, RewardFunc
 from .grpo.rollout import SamplingAdapter
-from .grpo.types import GRPOBatch, GRPOResult, TrainerState
+from .grpo.contracts import GRPOBatch, GRPOResult, TrainerState
 
 
 class GRPOTrainer:
@@ -104,70 +102,51 @@ class GRPOTrainer:
         self.state = TrainerState()
         self._last_eval_step: int | None = None
         self._total_input_tokens = 0
-        self._metric_window: dict[str, tuple[float, int]] = {}
         self._decode = self._make_decode(self._tokenizer)
-        self._swanlab_run = self._init_swanlab_run(lora_rank)
+        self._metrics_api = self._init_metrics_api(lora_rank)
 
     # ------------------------------------------------------------------
     # Run reporting and final qualitative samples
     # ------------------------------------------------------------------
 
-    def _init_swanlab_run(self, lora_rank: int) -> Any | None:
-        """Create the optional run with model and LoRA metadata."""
+    def _init_metrics_api(self, lora_rank: int) -> MetricsAPI:
+        """Create the shared metric reporter with GRPO run metadata."""
 
-        if self.config.report_to is None:
-            return None
         model_slug = self.model_name.rsplit("/", 1)[-1].replace("/", "-")
-        return start_run(
+        return MetricsAPI.from_config(
             self.config,
             default_name=f"{model_slug}-grpo",
             metadata={"model_name": self.model_name, "lora_rank": lora_rank},
+            logging_step=self.config.logging_step,
         )
 
     def _log_swanlab(self, result: GRPOResult) -> None:
         """Accumulate batch metrics while omitting prompt-local diagnostics."""
 
-        if self._swanlab_run is None:
-            return
-        payload: dict[str, float] = {}
-        for key, value in result.metrics.items():
-            name = str(key)
-            if _is_per_prompt_metric(name) or _is_checkpoint_metric(name):
-                continue
-            number = float(value)
-            if math.isfinite(number):
-                payload[_swanlab_metric_name(name)] = number
-        payload.update(
+        self._metrics_api.record(
             {
+                **result.metrics,
                 "train/num_datums": float(result.num_datums),
                 "train/skipped_groups": float(result.skipped_groups),
-            }
+            },
+            step=result.step,
+            exclude=_is_per_prompt_metric,
         )
-        if not hasattr(self, "_metric_window"):
-            self._metric_window = {}
-        accumulate_metrics(self._metric_window, payload)
-        if result.step % self.config.logging_step == 0:
-            self._flush_swanlab(result.step)
 
     def _flush_swanlab(self, step: int) -> None:
         """Publish the current metric window and clear its accumulators."""
 
-        if self._swanlab_run is None or not hasattr(self, "_metric_window"):
-            return
-        payload = averaged_metrics(self._metric_window)
-        self._metric_window.clear()
-        if payload:
-            self._swanlab_run.log({**payload, "train/step": float(step)}, step=step)
+        self._metrics_api.flush(step=step)
 
     def _log_final_checkpoint(self) -> None:
         """Publish the final checkpoint URI when output logging is enabled."""
 
         if (
             self.config.output_dir
-            and self._swanlab_run is not None
+            and self._metrics_api.enabled
             and self.state.checkpoint_path is not None
         ):
-            self._swanlab_run.log_text(
+            self._metrics_api.log_text(
                 key="checkpoint/path",
                 data=self.state.checkpoint_path,
                 step=self.state.global_step,
@@ -187,8 +166,8 @@ class GRPOTrainer:
         ]
         for line in lines:
             tqdm.write(line)
-        if self._swanlab_run is not None:
-            self._swanlab_run.log_text(
+        if self._metrics_api.enabled:
+            self._metrics_api.log_text(
                 key="train/final_summary",
                 data="\n".join(lines),
                 step=self.state.global_step,
@@ -211,8 +190,7 @@ class GRPOTrainer:
             "train/total_input_tokens": float(input_tokens),
         }
         self.state.metrics.update(summary)
-        if self._swanlab_run is not None:
-            self._swanlab_run.log(summary, step=self.state.global_step)
+        self._metrics_api.publish(summary, step=self.state.global_step)
 
     @staticmethod
     def _sample_text(response: Any, decode: Callable[[list[int]], str]) -> str:
@@ -239,7 +217,7 @@ class GRPOTrainer:
                     caption=title,
                 )
             )
-        self._swanlab_run.log_text(
+        self._metrics_api.log_text(
             key="sample/text",
             data=texts,
             step=self.state.global_step,
@@ -248,7 +226,7 @@ class GRPOTrainer:
     def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Generate a small synchronous sample table from final weights."""
 
-        if self._swanlab_run is None or not rows:
+        if not self._metrics_api.enabled or not rows:
             return
         client = self._new_sampling_client()
         params = sampling_params(
@@ -274,7 +252,7 @@ class GRPOTrainer:
     ) -> None:
         """Generate final qualitative samples without blocking the event loop."""
 
-        if self._swanlab_run is None or not rows:
+        if not self._metrics_api.enabled or not rows:
             return
         client = await self._new_sampling_client_async()
         params = sampling_params(
@@ -302,10 +280,7 @@ class GRPOTrainer:
     ) -> None:
         """Finish the owned run once and release its handle."""
 
-        if self._swanlab_run is None:
-            return
-        finish_run(self._swanlab_run, state=state, error=error)
-        self._swanlab_run = None
+        self._metrics_api.finish(state=state, error=error)
 
     @staticmethod
     def _make_decode(tokenizer: Any) -> Callable[[list[int]], str]:
@@ -758,11 +733,7 @@ class GRPOTrainer:
         values = {str(name): float(value) for name, value in metrics.items()}
         self._last_eval_step = self.state.global_step
         self.state.metrics.update(values)
-        if self._swanlab_run is not None:
-            self._swanlab_run.log(
-                {**values, "train/step": float(self.state.global_step)},
-                step=self.state.global_step,
-            )
+        self._metrics_api.publish(values, step=self.state.global_step)
         return values
 
     def evaluate(

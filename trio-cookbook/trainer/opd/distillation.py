@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
 import pytrio as trio
+
+
+@dataclass(slots=True)
+class _ScoredCompletion:
+    """One student completion aligned with its teacher distillation signal."""
+
+    datum: Any
+    tokens: int
+    student_sum: float
+    teacher_sum: float
+    advantage_sum: float
 
 
 def validate_tokens(tokens: Sequence[int], *, source: str) -> list[int]:
@@ -45,7 +57,12 @@ def distillation_advantages(
     teacher = validate_logprobs(teacher, source="Teacher completion")
     if len(student) != len(teacher):
         raise ValueError("Student and teacher completion logprobs must align.")
-    if not math.isfinite(coef) or coef <= 0 or not math.isfinite(discount) or not 0 <= discount <= 1:
+    if (
+        not math.isfinite(coef)
+        or coef <= 0
+        or not math.isfinite(discount)
+        or not 0 <= discount <= 1
+    ):
         raise ValueError("coef must be positive and discount must be in [0, 1].")
     advantages = [coef * (q - p) for p, q in zip(student, teacher, strict=True)]
     future = 0.0

@@ -11,7 +11,7 @@ import math
 from collections.abc import Callable
 from typing import Any
 
-from .types import GRPODatum, SequenceSample
+from .contracts import GRPODatum, SequenceSample
 
 
 def build_aligned_datum(

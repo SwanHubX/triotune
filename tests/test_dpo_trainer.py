@@ -106,10 +106,10 @@ class _TrainingClient:
             raise RuntimeError("forward failed")
         return SimpleNamespace(metrics={
             "train/loss": 0.5,
-            "rewards/accuracies": 1.0,
-            "rewards/margins": 0.3,
-            "rewards/chosen": 0.2,
-            "rewards/rejected": -0.1,
+            "reward/accuracy": 1.0,
+            "reward/margin": 0.3,
+            "reward/chosen": 0.2,
+            "reward/rejected": -0.1,
             "loss_sum": -1.0,
             "loss_mean": -0.25,
             "scalar/loss_mean": -0.25,
@@ -179,7 +179,10 @@ class DPOTrainerTests(unittest.TestCase):
         self.service = _ServiceClient()
         self.run = _SwanLabRun()
         service_patch = patch("trio_cookbook.trainer.dpo_trainer.trio.ServiceClient", return_value=self.service)
-        swanlab_patch = patch("trio_cookbook.trainer.dpo_trainer.swanlab.init", return_value=self.run)
+        swanlab_patch = patch(
+            "trio_cookbook.utils.metrics.swanlab.init",
+            return_value=self.run,
+        )
         service_patch.start()
         swanlab_patch.start()
         self.addCleanup(service_patch.stop)
@@ -192,7 +195,7 @@ class DPOTrainerTests(unittest.TestCase):
     def test_none_report_to_uses_terminal_progress_without_swanlab(self) -> None:
         self.assertIsNone(DPOConfig().report_to)
         with (
-            patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init,
+            patch("trio_cookbook.utils.metrics.swanlab.init") as init,
             patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress,
         ):
             trainer = self.trainer(report_to=None, max_steps=1)
@@ -252,10 +255,10 @@ class DPOTrainerTests(unittest.TestCase):
         payload = self.run.logs[0][0]
         self.assertEqual({name.split("/", 1)[0] for name in payload}, {"train", "reward", "time"})
         self.assertEqual(payload["train/loss"], 0.5)
-        self.assertEqual(payload["reward/reward_accuracy"], 1.0)
-        self.assertEqual(payload["reward/reward_margin"], 0.3)
-        self.assertEqual(payload["reward/reward_chosen"], 0.2)
-        self.assertEqual(payload["reward/reward_rejected"], -0.1)
+        self.assertEqual(payload["reward/accuracy"], 1.0)
+        self.assertEqual(payload["reward/margin"], 0.3)
+        self.assertEqual(payload["reward/chosen"], 0.2)
+        self.assertEqual(payload["reward/rejected"], -0.1)
         self.assertEqual(payload["train/learning_rate"], 5e-6)
         self.assertEqual(payload["train/grad_norm"], 0.2)
         self.assertEqual(payload["train/backend_token_count"], 4)
@@ -287,7 +290,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual([step for _, step in self.run.logs], [2, 3, 3])
         first, final_interval, summary = [payload for payload, _ in self.run.logs]
         self.assertAlmostEqual(first["train/loss"], 0.3)
-        self.assertEqual(first["reward/reward_accuracy"], 1.0)
+        self.assertEqual(first["reward/accuracy"], 1.0)
         self.assertEqual(first["train/pairs"], 1.0)
         self.assertEqual(first["train/step"], 2)
         self.assertAlmostEqual(final_interval["train/loss"], 0.6)
@@ -295,7 +298,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/train_runtime", summary)
 
     def test_swanlab_mode_initializes_run_without_sdk_mode_override(self) -> None:
-        with patch("trio_cookbook.trainer.dpo_trainer.swanlab.init") as init:
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
             self.trainer()
         self.assertNotIn("mode", init.call_args.kwargs)
 
@@ -419,7 +422,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertAlmostEqual(chosen.grad[1].item(), -0.05, places=6)
         self.assertAlmostEqual(rejected.grad[1].item(), 0.05, places=6)
         self.assertEqual(chosen.grad[0].item(), 0.0)
-        self.assertEqual(metrics["rewards/margins"], 0.0)
+        self.assertEqual(metrics["reward/margin"], 0.0)
 
     def test_reference_logprobs_require_complete_finite_response(self) -> None:
         self.assertAlmostEqual(_reference_logprob([None, -1.0, -2.0], 1, 3), -3.0)

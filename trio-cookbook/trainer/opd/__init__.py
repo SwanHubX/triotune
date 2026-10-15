@@ -1,7 +1,7 @@
 """OPD training implementation."""
 
-from ..common.config import OPDConfig
+from ...api.cli_args import OPDConfig
 from ..opd_trainer import OPDTrainer
-from .types import OPDResult, OPDState
+from .state import OPDResult, OPDState
 
 __all__ = ["OPDConfig", "OPDTrainer", "OPDResult", "OPDState"]
