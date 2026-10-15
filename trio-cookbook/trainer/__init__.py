@@ -3,6 +3,7 @@
 from importlib import import_module
 import sys
 
+from .common.config import BaseTrainerConfig
 from .dataset import (
     IGNORE_INDEX,
     PreferenceExample,
@@ -28,13 +29,13 @@ from .sft import SFTConfig, SFTState, SFTTrainer
 # Historical flat imports resolve to the actual modules, preserving object
 # identity, pickled types, and patches of module attributes such as tqdm.
 _LEGACY_MODULES = {
-    "grpo_config": "grpo.config",
+    "grpo_config": "common.config",
     "grpo_trainer": "grpo.trainer",
-    "dpo_config": "dpo.config",
+    "dpo_config": "common.config",
     "dpo_trainer": "dpo.trainer",
-    "sft_config": "sft.config",
+    "sft_config": "common.config",
     "sft_trainer": "sft.trainer",
-    "opd_config": "opd.config",
+    "opd_config": "common.config",
     "opd_trainer": "opd.trainer",
     "opd_distillation": "opd.distillation",
     "advantages": "grpo.advantages",
@@ -50,7 +51,16 @@ for _old_name, _new_name in _LEGACY_MODULES.items():
     globals()[_old_name] = _module
 del _old_name, _new_name, _module
 
+# Algorithm-local config modules used to contain separate class definitions.
+# Keep those import paths as aliases while making common.config the sole source
+# of truth for framework configuration contracts.
+_config_module = import_module(".common.config", __name__)
+for _algorithm in ("grpo", "dpo", "sft", "opd"):
+    sys.modules[f"{__name__}.{_algorithm}.config"] = _config_module
+del _algorithm, _config_module
+
 __all__ = [
+    "BaseTrainerConfig",
     "DPOConfig",
     "DPOResult",
     "DPOState",

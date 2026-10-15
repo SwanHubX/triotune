@@ -21,10 +21,10 @@ from tqdm import tqdm
 
 from ...utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
 from ..common.checkpoint import save_checkpoint, save_checkpoint_async
+from ..common.config import GRPOConfig
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
 from ..dataset import prepare_prompt
 from .advantages import group_advantages
-from .config import GRPOConfig
 from .datum import build_aligned_datum, to_client_datum
 from .metrics import (
     FINAL_SUMMARY_KEYS,

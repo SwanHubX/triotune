@@ -14,9 +14,9 @@ import swanlab
 from tqdm import tqdm
 
 from ...utils.client import call_async, optimizer_params, submit_async, wait_async
+from ..common.config import SFTConfig
 from ..common.logging import finish_run, start_run
 from ..dataset import SupervisedExample, prepare_sft
-from .config import SFTConfig
 from .types import SFTState
 
 

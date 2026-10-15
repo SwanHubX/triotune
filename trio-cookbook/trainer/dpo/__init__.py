@@ -1,6 +1,6 @@
 """DPO training implementation."""
 
-from .config import DPOConfig
+from ..common.config import DPOConfig
 from .trainer import DPOTrainer
 from .types import DPOResult, DPOState
 

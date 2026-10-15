@@ -19,9 +19,9 @@ from tqdm import tqdm
 
 from ...utils.client import call_async, optimizer_params
 from ..common.checkpoint import save_checkpoint_async
+from ..common.config import OPDConfig
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
 from ..dataset import PromptExample, prepare_prompt
-from .config import OPDConfig
 from .distillation import (
     build_opd_datum,
     distillation_advantages,

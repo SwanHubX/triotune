@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from ...utils.client import call, call_async, optimizer_params
 from ..common.checkpoint import save_checkpoint, save_checkpoint_async
+from ..common.config import DPOConfig
 from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
 from ..dataset import (
     IGNORE_INDEX,
@@ -29,7 +30,6 @@ from ..dataset import (
     prepare_preference,
     prepare_prompt,
 )
-from .config import DPOConfig
 from .loss import make_loss_fn as _loss_fn
 from .metrics import swanlab_metrics as _swanlab_metrics
 from .types import DPOResult, DPOState

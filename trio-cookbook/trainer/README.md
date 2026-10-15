@@ -10,6 +10,7 @@
 trainer/
 ├── __init__.py          # 公开导出与历史模块路径兼容
 ├── common/
+│   ├── config.py        # 公共配置契约与各算法配置
 │   ├── logging.py       # SwanLab 初始化、指标窗口计算和结束记录
 │   └── checkpoint.py    # checkpoint 命名、保存和响应校验
 ├── dataset/
@@ -18,7 +19,6 @@ trainer/
 │   ├── examples.py      # 各算法共享的标准化训练样本
 │   └── swe_sft/         # 软件工程智能体轨迹的 SFT 数据处理
 ├── grpo/
-│   ├── config.py
 │   ├── trainer.py
 │   ├── types.py
 │   ├── advantages.py
@@ -27,17 +27,14 @@ trainer/
 │   ├── datum.py
 │   └── metrics.py
 ├── dpo/
-│   ├── config.py
 │   ├── trainer.py
 │   ├── types.py
 │   ├── loss.py
 │   └── metrics.py
 ├── sft/
-│   ├── config.py
 │   ├── trainer.py
 │   └── types.py
 └── opd/
-    ├── config.py
     ├── trainer.py
     ├── types.py
     └── distillation.py
@@ -46,6 +43,7 @@ trainer/
 | 模块 | 职责 |
 | --- | --- |
 | [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
+| [配置契约](./common/config.py) | 定义 `BaseTrainerConfig` 以及 GRPO、DPO、SFT、OPD 配置；集中校验优化器、运行控制和日志字段。 |
 | [输入渲染](./dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](./dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
 | [训练样本](./dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
@@ -59,7 +57,9 @@ trainer/
 | [SFT 编排](./sft/trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
 | [OPD 编排](./opd/trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
 
-`common/` 只承载实际共用的能力。GRPO 的分组采样依赖 `GRPOBatch`，
+`common/` 是 trainer 内部的公共接口与数据契约层，集中放置稳定配置、日志和
+checkpoint 能力。算法配置继承 `BaseTrainerConfig`，共享 batch、step、Adam、
+保存和报告字段，同时保留各算法原有的公开构造参数。GRPO 的分组采样依赖 `GRPOBatch`，
 因此保留在 `grpo/rollout.py`；PyTRIO future 与客户端调用适配继续位于
 [utils/client.py](../utils/client.py)。各算法保留自己的同步／异步训练时序，
 SFT 的排队保存仍在 trainer 中提交，以保持 SDK 请求顺序。用户输入的校验、

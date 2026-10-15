@@ -12,13 +12,13 @@ class TrainerLayoutTests(unittest.TestCase):
     def test_legacy_imports_are_the_actual_modules(self):
         aliases = {
             "grpo_trainer": "grpo.trainer",
-            "grpo_config": "grpo.config",
+            "grpo_config": "common.config",
             "dpo_trainer": "dpo.trainer",
-            "dpo_config": "dpo.config",
+            "dpo_config": "common.config",
             "sft_trainer": "sft.trainer",
-            "sft_config": "sft.config",
+            "sft_config": "common.config",
             "opd_trainer": "opd.trainer",
-            "opd_config": "opd.config",
+            "opd_config": "common.config",
             "opd_distillation": "opd.distillation",
             "advantages": "grpo.advantages",
             "datum": "grpo.datum",
@@ -40,6 +40,15 @@ class TrainerLayoutTests(unittest.TestCase):
             for name in package.__all__:
                 with self.subTest(algorithm=algorithm, name=name):
                     self.assertIs(getattr(package, name), getattr(trainers, name))
+
+    def test_algorithm_config_paths_share_the_common_contract_module(self):
+        common = importlib.import_module("trio_cookbook.trainer.common.config")
+        for algorithm in ("grpo", "dpo", "sft", "opd"):
+            with self.subTest(algorithm=algorithm):
+                module = importlib.import_module(
+                    f"trio_cookbook.trainer.{algorithm}.config"
+                )
+                self.assertIs(module, common)
 
     def test_patching_a_legacy_module_updates_the_actual_module(self):
         actual = importlib.import_module("trio_cookbook.trainer.dpo.trainer")
