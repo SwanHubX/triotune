@@ -1,0 +1,128 @@
+"""Text rollouts and pluggable rewards; tool workflows can supply Trajectory."""
+
+import asyncio
+import inspect
+from collections import defaultdict
+
+import pytrio as trio
+
+from ...api.client_api import call_async
+from ...dataset import prepare_prompt
+from .contracts import Trajectory
+
+
+async def gather_cancel_on_error(coroutines):
+    """Drain siblings on failure so no background work outlives its snapshot."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def generate_rollouts(
+    client, tokenizer, rows, reward_fn, config, *, first_group: int
+):
+    """Reward callable: ``(row=..., completion=..., completion_ids=...) -> float``.
+
+    Sync rewards run in a worker; async rewards are awaited. Each request gets
+    a distinct reproducible seed and prompt group ID, including repeated rows.
+    """
+
+    async def generate(row, index):
+        prompt = prepare_prompt(
+            row,
+            tokenizer,
+            prompt_key=config.prompt_key,
+            chat_template_kwargs=config.chat_template_kwargs,
+        )
+        result = await call_async(
+            client,
+            "sample",
+            prompt=trio.ModelInput.from_ints(prompt.tokens),
+            num_samples=config.num_generations,
+            sampling_params=trio.SamplingParams(
+                max_tokens=config.max_tokens,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                seed=None if config.seed is None else config.seed + index,
+            ),
+        )
+        if len(result.sequences) != config.num_generations:
+            raise ValueError("Sampler returned an unexpected number of responses.")
+        trajectories = []
+        for sequence in result.sequences:
+            text = sequence.text
+            if text is None:
+                text = tokenizer.decode(sequence.tokens, skip_special_tokens=False)
+            kwargs = dict(
+                row=row, completion=text, completion_ids=list(sequence.tokens)
+            )
+            if inspect.iscoroutinefunction(reward_fn):
+                reward = await reward_fn(**kwargs)
+            else:
+                reward = await asyncio.to_thread(reward_fn, **kwargs)
+                if inspect.isawaitable(reward):
+                    reward = await reward
+            reason = sequence.stop_reason
+            truncated = reason in ("length", "max_tokens", "max_length")
+            if reason not in (
+                "stop",
+                "eos",
+                "stop_token",
+                "length",
+                "max_tokens",
+                "max_length",
+            ):
+                truncated = len(sequence.tokens) >= config.max_tokens
+            trajectories.append(
+                Trajectory(
+                    prompt_tokens=list(prompt.tokens),
+                    completion_tokens=list(sequence.tokens),
+                    logprobs=list(sequence.logprobs),
+                    reward=float(reward),
+                    group_id=f"prompt-{index}",
+                    truncated=truncated,
+                )
+            )
+        return trajectories
+
+    groups = await gather_cancel_on_error(
+        generate(row, first_group + i) for i, row in enumerate(rows)
+    )
+    return [t for group in groups for t in group]
+
+
+def filter_informative_groups(trajectories: list[Trajectory]) -> list[Trajectory]:
+    """DAPO: refill the prompt batch after removing equal raw-reward groups."""
+    groups = defaultdict(list)
+    for t in trajectories:
+        groups[t.group_id].append(t)
+    return [
+        t
+        for group in groups.values()
+        if len({t.reward for t in group}) > 1
+        for t in group
+    ]
+
+
+async def score_reference(client, trajectories: list[Trajectory]) -> None:
+    async def score(t):
+        full = await call_async(
+            client,
+            "compute_logprobs",
+            prompt=trio.ModelInput.from_ints(t.prompt_tokens + t.completion_tokens),
+        )
+        if len(full) != len(t.prompt_tokens) + len(t.completion_tokens):
+            raise ValueError(
+                "Reference logprobs must align with the full sequence (first entry None)."
+            )
+        t.reference_logprobs = list(full[len(t.prompt_tokens) :])
+        t.__post_init__()
+
+    await gather_cancel_on_error(
+        score(t) for t in trajectories if t.reference_logprobs is None
+    )

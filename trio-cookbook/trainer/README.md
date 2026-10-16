@@ -1,5 +1,9 @@
 # Trainer 模块
 
+PPO 算法族的独立入口位于 [`ppo/`](./ppo/README.md)：同一异步训练循环可通过配置切换
+PPO、GRPO、RLOO、Dr.GRPO、LitePPO、GSPO、SAPO、CISPO 和 DAPO。
+其算法配置及模块实现均保存在该目录；标准 PPO 默认创建独立的 PyTRIO actor/critic 训练客户端，详见接口能力说明。
+
 ## 目录与职责
 
 

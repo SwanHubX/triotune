@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dpo = ["torch>=2.3"]
+ppo = ["torch>=2.3"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -30,6 +31,7 @@ packages = [
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",
     "trio_cookbook.trainer.opd",
+    "trio_cookbook.trainer.ppo",
     "trio_cookbook.utils",
 ]
 
