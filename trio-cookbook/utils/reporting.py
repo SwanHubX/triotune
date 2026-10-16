@@ -1,7 +1,9 @@
-"""A second SwanLab run in its own process (0.10.1 allows one per process).
+"""Process-isolated SwanLab reporting shared by trainers.
 
-Only metric transport is isolated. Both PyTRIO training clients stay in the
-trainer process. A module subprocess also works for notebooks and stdin scripts.
+SwanLab 0.10.1 permits one active run per process.  This utility provides a
+small pipe-backed reporter for a secondary run without moving PyTRIO training
+clients or model execution out of the trainer process.  It is deliberately
+algorithm-agnostic: callers supply the run name and metadata.
 """
 
 import json
@@ -10,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import asdict
 
-from ...utils.metrics import MetricsAPI
+from .metrics import MetricsAPI
 
 
 def _worker(source, sink):
@@ -49,7 +51,7 @@ class _RunProcess:
         code = (
             "import sys\nfrom contextlib import redirect_stdout\n"
             "with redirect_stdout(sys.stderr):\n"
-            "    from trio_cookbook.trainer.ppo.reporting import _worker\n"
+            "    from trio_cookbook.utils.reporting import _worker\n"
             "    _worker(sys.__stdin__, sys.__stdout__)\n"
         )
         self.process = subprocess.Popen(
@@ -68,17 +70,17 @@ class _RunProcess:
 
     def _wait(self, expected):
         if not select.select([self.process.stdout], [], [], self.timeout)[0]:
-            raise TimeoutError("Critic SwanLab reporter did not respond.")
+            raise TimeoutError("Secondary SwanLab reporter did not respond.")
         line = self.process.stdout.readline()
         if not line:
-            raise RuntimeError("Critic SwanLab reporter exited unexpectedly.")
+            raise RuntimeError("Secondary SwanLab reporter exited unexpectedly.")
         status, message = json.loads(line)
         if status != expected:
-            raise RuntimeError(f"Critic SwanLab reporter failed: {message}")
+            raise RuntimeError(f"Secondary SwanLab reporter failed: {message}")
 
     def _send(self, action, payload):
         if self.closed or self.process.poll() is not None:
-            raise RuntimeError("Critic SwanLab reporter is not running.")
+            raise RuntimeError("Secondary SwanLab reporter is not running.")
         if select.select([self.process.stdout], [], [], 0)[0]:
             self._wait("running")  # Only unexpected failures arrive between commands.
         self.process.stdin.write(json.dumps([action, payload], allow_nan=False) + "\n")
@@ -114,7 +116,15 @@ class _RunProcess:
             self._cleanup()
 
 
-def critic_metrics(config, *, name, metadata):
+def isolated_metrics(config, *, name, metadata):
+    """Create a metrics client backed by a separate SwanLab process.
+
+    Reporting-disabled configurations return the normal no-op capable
+    :class:`MetricsAPI`; enabled configurations use a pipe-backed secondary
+    run.  The function does not know whether the run belongs to a critic or
+    another trainer component.
+    """
+
     if config.report_to is None:
         return MetricsAPI()
     return MetricsAPI(
@@ -129,3 +139,7 @@ def critic_metrics(config, *, name, metadata):
             )
         )
     )
+
+
+# Historical PPO callers used this name before reporting moved to utils.
+critic_metrics = isolated_metrics

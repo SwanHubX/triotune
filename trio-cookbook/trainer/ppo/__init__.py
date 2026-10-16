@@ -1,13 +1,63 @@
-"""Composable PPO-family training, with explicit PyTRIO capability boundaries."""
+"""Composable PPO-family building blocks with explicit PyTRIO boundaries.
 
-from .actor import PPOActor
-from .advantages import prepare_advantages
-from .config import NormConfig, PPOConfig
+The training lifecycle is implemented by :class:`trainer.rl_trainer.PPOTrainer`.
+This package keeps the numerical, rollout, actor, and critic components grouped
+under ``trainer.ppo`` while exposing the historical ``ppo.trainer`` import as a
+compatibility alias.
+"""
+
+import importlib
+import sys
+
+from .actor import PPOActor, compute_gae, normalize, prepare_advantages
+from ...api.cli_args import NormConfig, PPOConfig
 from .contracts import PPOState, PreparedBatch, Trajectory
-from .critic import Critic, PyTRIOCritic
-from .critic_loss import value_loss
-from .gae import compute_gae
-from .trainer import PPOTrainer
+from .critic import Critic, PyTRIOCritic, value_loss
+
+# The actor and critic now own their complete algorithm-side pipelines. Keep
+# historical submodule imports working as identity aliases during migration.
+_actor_module = importlib.import_module(".actor", __name__)
+_critic_module = importlib.import_module(".critic", __name__)
+_config_module = importlib.import_module("...api.cli_args", __name__)
+_reporting_module = importlib.import_module("...utils.reporting", __name__)
+for _legacy_name, _canonical_module in (
+    ("config", _config_module),
+    ("advantages", _actor_module),
+    ("gae", _actor_module),
+    ("normalization", _actor_module),
+    ("critic_loss", _critic_module),
+    ("reporting", _reporting_module),
+):
+    sys.modules[f"{__name__}.{_legacy_name}"] = _canonical_module
+del (
+    _legacy_name,
+    _canonical_module,
+    _actor_module,
+    _critic_module,
+    _config_module,
+    _reporting_module,
+)
+
+# ``PPOTrainer`` moved to ``trainer.rl_trainer``. Importing the root trainer
+# while this package is being initialized would create a circular import, so
+# resolve the class after the local PPO components have loaded. The root module
+# installs the same alias when it is the import entry point.
+_root_trainer = sys.modules.get(f"{__package__.rsplit('.', 1)[0]}.rl_trainer")
+if _root_trainer is None:
+    _root_trainer = importlib.import_module("..rl_trainer", __package__)
+if hasattr(_root_trainer, "PPOTrainer"):
+    PPOTrainer = _root_trainer.PPOTrainer
+    sys.modules[f"{__name__}.trainer"] = _root_trainer
+
+
+def __getattr__(name):
+    """Resolve the moved trainer lazily for circular-import-safe compatibility."""
+
+    if name != "PPOTrainer":
+        raise AttributeError(name)
+    module = importlib.import_module("..rl_trainer", __package__)
+    sys.modules[f"{__name__}.trainer"] = module
+    return module.PPOTrainer
 
 __all__ = [
     "Critic",
@@ -20,6 +70,7 @@ __all__ = [
     "PreparedBatch",
     "Trajectory",
     "compute_gae",
+    "normalize",
     "prepare_advantages",
     "value_loss",
 ]

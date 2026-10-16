@@ -7,7 +7,9 @@ from ..api.cli_args import (
     BaseTrainerConfig,
     DPOConfig,
     GRPOConfig,
+    NormConfig,
     OPDConfig,
+    PPOConfig,
     SFTConfig,
 )
 from ..dataset import (
@@ -135,6 +137,16 @@ for _old_name, _new_name in _RENAMED_MODULES.items():
     )
 del _old_name, _new_name
 
+
+def __getattr__(name):
+    """Load the root-level PPO trainer without importing it eagerly."""
+
+    if name != "PPOTrainer":
+        raise AttributeError(name)
+    module = import_module(".rl_trainer", __name__)
+    globals()[name] = module.PPOTrainer
+    return module.PPOTrainer
+
 __all__ = [
     "BaseTrainerConfig",
     "DPOConfig",
@@ -163,6 +175,9 @@ __all__ = [
     "OPDTargetBuilder",
     "OPDTrainer",
     "OPDTrainingSample",
+    "NormConfig",
+    "PPOConfig",
+    "PPOTrainer",
     "PreferenceExample",
     "PromptExample",
     "RenderedPrompt",

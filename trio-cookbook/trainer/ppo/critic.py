@@ -1,5 +1,13 @@
-"""Independent PyTRIO critic using a logprob-based scalar readout."""
+"""PPO critic algorithm and its PyTRIO logprob-based value implementation.
 
+The critic reuses two existing vocabulary markers instead of requiring a new
+value head.  It builds causal marker targets, reads an unbounded scalar value
+from their logprob difference, and sends clipped value-loss gradients through
+PyTRIO's custom loss bridge.  The actor and critic remain independent remote
+training clients, while both consume the same frozen rollout targets.
+"""
+
+import math
 import time
 from dataclasses import replace
 from typing import Protocol
@@ -8,8 +16,152 @@ import numpy as np
 
 from ...api.client_api import call_async, optimizer_params
 from ...utils.checkpoint import save_checkpoint_async
+from ...utils.datums import materialize_datum
 from .contracts import Trajectory
-from .critic_loss import critic_datums, make_value_loss_fn, values_from_logprobs
+from .datum import IGNORE_INDEX
+
+
+# ---------------------------------------------------------------------------
+# Marker-based value readout and clipped value objective
+# ---------------------------------------------------------------------------
+
+def critic_datums(trajectories, token_ids):
+    """Build positive/negative marker targets on the real causal contexts.
+
+    Marker labels start at the final prompt position and continue through the
+    completion plus one bootstrap position.  The marker is never inserted into
+    the model input, so each predicted value sees only its preceding context.
+    """
+
+    rows = []
+    for trajectory in trajectories:
+        tokens = trajectory.prompt_tokens + trajectory.completion_tokens
+        for marker in token_ids:
+            labels = [IGNORE_INDEX] * (len(trajectory.prompt_tokens) - 1) + [marker] * (
+                len(trajectory.completion_tokens) + 1
+            )
+            rows.append(
+                materialize_datum(
+                    tokens, {"target_tokens": np.asarray(labels, dtype=np.int32)}
+                )
+            )
+    return rows
+
+
+def values_from_logprobs(logprobs, trajectories, config):
+    """Convert marker logprob pairs into one value row per trajectory."""
+
+    if len(logprobs) != 2 * len(trajectories):
+        raise ValueError(
+            "Critic needs positive and negative logprobs for every trajectory."
+        )
+    values = []
+    for index, trajectory in enumerate(trajectories):
+        positive, negative = [
+            row.reshape(-1) for row in logprobs[2 * index : 2 * index + 2]
+        ]
+        expected = len(trajectory.prompt_tokens) + len(trajectory.completion_tokens)
+        if len(positive) != expected or len(negative) != expected:
+            raise ValueError(
+                "Critic logprobs must align with full prompt+completion inputs."
+            )
+        start = len(trajectory.prompt_tokens) - 1
+        values.append(
+            config.critic_value_scale * (positive[start:] - negative[start:])
+            + config.critic_value_bias
+        )
+    return values
+
+
+def value_loss(values, old_values, returns, mask, *, clip: float = 0.2):
+    """Compute clipped value regression over active action states."""
+
+    import torch
+
+    if not math.isfinite(clip) or clip < 0:
+        raise ValueError("Value clip must be finite and nonnegative.")
+    if not (values.shape == old_values.shape == returns.shape == mask.shape):
+        raise ValueError("Value predictions, targets and masks must align.")
+    valid = mask.bool()
+    if not valid.any():
+        raise ValueError("Value loss requires active tokens.")
+    bounded = old_values.detach() + (values - old_values.detach()).clamp(-clip, clip)
+    return (
+        0.5
+        * torch.maximum(
+            (values - returns.detach()).square(),
+            (bounded - returns.detach()).square(),
+        )[valid].mean()
+    )
+
+
+def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
+    """Bind frozen returns and old values for every critic update epoch."""
+
+    if (
+        len(trajectories) != len(returns)
+        or len(returns) != len(masks)
+        or not trajectories
+    ):
+        raise ValueError("Critic trajectories, returns and masks must align.")
+    old, targets, valid = [], [], []
+    for trajectory, ret, mask in zip(trajectories, returns, masks, strict=True):
+        trajectory.__post_init__()
+        if (
+            trajectory.values is None
+            or len(ret) != len(trajectory.completion_tokens)
+            or len(mask) != len(ret)
+        ):
+            raise ValueError("Critic needs frozen T+1 values, T returns and T masks.")
+        if any(not math.isfinite(x) for x in ret) or any(
+            not isinstance(x, bool) for x in mask
+        ):
+            raise ValueError("Critic returns must be finite and masks boolean.")
+        old.extend(trajectory.values[:-1])
+        targets.extend(ret)
+        valid.extend(mask)
+    if not any(valid):
+        raise ValueError("Critic update has no active action states.")
+    expected_targets = [
+        datum.loss_fn_inputs["target_tokens"].data
+        for datum in critic_datums(trajectories, token_ids)
+    ]
+
+    def loss(datums, logprobs):
+        import torch
+
+        if len(datums) != len(expected_targets) or any(
+            list(datum.loss_fn_inputs["target_tokens"].data) != labels
+            for datum, labels in zip(datums, expected_targets, strict=True)
+        ):
+            raise ValueError("Critic datum ordering or marker targets changed.")
+        rows = values_from_logprobs(logprobs, trajectories, config)
+        prediction = torch.cat([row[:-1] for row in rows])
+        mask = torch.tensor(valid, device=prediction.device, dtype=torch.bool)
+        previous, target = prediction.new_tensor(old), prediction.new_tensor(targets)
+        if not torch.isfinite(prediction).all():
+            raise FloatingPointError("Critic values are nonfinite.")
+        objective = value_loss(
+            prediction, previous, target, mask, clip=config.critic_eps_clip
+        )
+        # Keep a differentiable dependency for every marker datum, including
+        # rows whose action positions are fully masked by the rollout.
+        objective = objective + sum(lp.sum() * 0 for lp in logprobs)
+        if not torch.isfinite(objective):
+            raise FloatingPointError("Critic loss is nonfinite.")
+        with torch.no_grad():
+            bounded = previous + (prediction - previous).clamp(
+                -config.critic_eps_clip, config.critic_eps_clip
+            )
+            clip_mask = (bounded - target).square() > (prediction - target).square()
+        return objective, {
+            "critic/loss": objective.detach().item(),
+            "critic/value_mean": prediction.detach()[mask].mean().item(),
+            "critic/return_mean": target[mask].mean().item(),
+            "critic/clip_fraction": clip_mask[mask].float().mean().item(),
+        }
+
+    return loss
 
 
 class Critic(Protocol):
@@ -35,6 +187,8 @@ class PyTRIOCritic:
     """
 
     def __init__(self, client, config, token_ids, *, metrics=None):
+        """Bind an independent PyTRIO client and two value marker token IDs."""
+
         self.client, self.config, self.token_ids = client, config, tuple(token_ids)
         if (
             len(self.token_ids) != 2
@@ -54,6 +208,8 @@ class PyTRIOCritic:
         self.checkpoint_path = None
 
     async def compute_values(self, trajectories):
+        """Read one causal T+1 value row per trajectory from remote logprobs."""
+
         if not trajectories:
             raise ValueError("Critic scoring requires trajectories.")
         if self.config.critic_n_minibatches > len(trajectories):
@@ -79,6 +235,8 @@ class PyTRIOCritic:
         ]
 
     async def update(self, trajectories, returns, masks):
+        """Fit frozen returns with clipped value regression on the remote client."""
+
         start = time.perf_counter()
         if (
             not trajectories
@@ -139,6 +297,8 @@ class PyTRIOCritic:
         return metrics
 
     async def save_checkpoint(self, step):
+        """Persist the critic adapter and publish its checkpoint when enabled."""
+
         self.checkpoint_path = await save_checkpoint_async(
             self.client, "ppo-critic", step
         )
@@ -149,5 +309,7 @@ class PyTRIOCritic:
         return self.checkpoint_path
 
     def finish(self, *, state="success", error=None):
+        """Finish the optional critic metrics reporter."""
+
         if self.metrics is not None:
             self.metrics.finish(state=state, error=error)

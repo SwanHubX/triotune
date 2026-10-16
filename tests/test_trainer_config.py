@@ -6,6 +6,8 @@ import tomllib
 import unittest
 from dataclasses import asdict
 
+from trio_cookbook.api import NormConfig as APINormConfig
+from trio_cookbook.api import PPOConfig as APIPPOConfig
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
     DPOConfig,
@@ -53,6 +55,19 @@ class TrainerConfigTests(unittest.TestCase):
             with self.subTest(config=config_class.__name__, field="tags"):
                 with self.assertRaisesRegex(ValueError, "tags"):
                     config_class(tags=[""])
+
+    def test_ppo_config_is_defined_by_the_public_api_contract(self) -> None:
+        from trio_cookbook.trainer.ppo import NormConfig, PPOConfig
+
+        self.assertIs(PPOConfig, APIPPOConfig)
+        self.assertIs(NormConfig, APINormConfig)
+        self.assertIsInstance(PPOConfig(), BaseTrainerConfig)
+        self.assertIs(
+            __import__("trio_cookbook.trainer.ppo.config", fromlist=["PPOConfig"]),
+            __import__("trio_cookbook.api.cli_args", fromlist=["PPOConfig"]),
+        )
+        self.assertFalse(PPOConfig.for_algorithm("grpo").use_critic)
+        self.assertTrue(PPOConfig.for_algorithm("ppo").use_critic)
 
     def test_optimizer_contract_exposes_decay_and_gradient_clipping(self) -> None:
         config = DPOConfig(weight_decay=0.01, grad_clip_norm=1.0)

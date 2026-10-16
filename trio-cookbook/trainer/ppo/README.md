@@ -1,7 +1,8 @@
 # PyTRIO PPO 算法族
 
 把 AReaL 的“同一训练循环，通过配置替换优势估计和损失”的设计映射到 PyTRIO。
-所有算法实现和开关都在本目录；沿用仓库的 dataset、客户端适配、日志与保存工具。
+算法组件和开关都在本目录；训练编排位于上一级 `trainer/rl_trainer.py`，配置契约位于
+`api/cli_args.py`，并沿用仓库的 dataset、客户端适配、日志与保存工具。
 这是文本、token 级 GAE 的实现，不是 AReaL 分布式运行时的完整移植。
 已有 `GRPOTrainer` 保持原行为；这里提供另一套统一的 PPO 算法族入口。
 
@@ -9,21 +10,21 @@
 
 | 文件 | 职责 | AReaL 对应实现 |
 | --- | --- | --- |
-| `config.py` | 配置校验、算法预设、独立 mean/std 范围 | `PPOActorConfig`、各算法 YAML |
+| `../api/cli_args.py` | PPO 配置校验、算法预设、独立 mean/std 范围 | `PPOActorConfig`、各算法 YAML |
 | `contracts.py` | 不补齐的轨迹、冻结后的训练 batch、运行状态 | rollout 数据和 batch metadata |
 | `rollout.py` | 并发采样、异步/同步 reward、固定参考评分、动态补采 | workflow、rollout 调度 |
-| `normalization.py` | batch/group 均值和标准差、leave-one-out | `Normalization` |
-| `advantages.py` | 奖励缩放、长度惩罚、KL、GAE、优势归一化 | actor `_compute_advantages` |
-| `gae.py` | 跳过工具位置的 GAE、截断 bootstrap | `_compute_token_level_gae` |
+| `actor.py` | 奖励缩放、长度惩罚、KL、GAE、优势归一化、策略更新 | `PPOActor`、`_compute_advantages` |
 | `loss.py` | PPO、双重裁剪、GSPO、SAPO、CISPO、聚合和行为过滤 | `functional.py` 策略损失 |
 | `datum.py` | next-token 对齐、prompt/tool mask、原生 PPO 字段 | token shift、训练数据准备 |
 | `actor.py` | 旧策略重算、冻结目标、多 minibatch/epoch 更新 | `PPOActor` |
 | `critic.py` | 独立 PyTRIO critic 的评分、回归更新和保存，保留外部协议 | `PPOCritic` |
-| `critic_loss.py` | 两个 marker logprob 读出无界 value、clipped regression、因果对齐 | value head 的另一种参数化 |
-| `reporting.py` | 为 critic 创建独立 SwanLab 日志进程 | 双模型日志 |
-| `trainer.py` | 串联 rollout → reference/value → 冻结目标 → 并发更新 actor/critic → 保存/日志 | `RLTrainer` |
+| `critic.py` | marker value 读出、clipped regression、critic 更新与保存 | `PPOCritic` |
+| `../utils/reporting.py` | 为第二个训练 run 提供进程隔离的 SwanLab 日志传输 | 公共 reporting utility |
+| `../rl_trainer.py` | 串联 rollout → reference/value → 冻结目标 → 并发更新 actor/critic → 保存/日志 | `RLTrainer` |
 
 一次 rollout update 冻结 reward、advantage、return 和 proximal logprob。
+`advantages`、`gae`、`normalization`、`critic_loss`、`reporting` 和 `trainer` 不再是 PPO
+目录中的实现文件；旧导入路径仍由兼容层映射到新的 API、actor、critic、utils 和 root trainer。
 `ppo_n_minibatches` 把完整 prompt group 分成多个 optimizer update，
 `update_epochs` 重复使用这些冻结目标。为保证组归一化和 `prompt_mean` 的含义，
 这里不会把同一个 prompt group 拆到不同 minibatch；minibatch 数不能超过有效 group 数。

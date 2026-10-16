@@ -17,6 +17,7 @@ from .checkpoint import checkpoint_path, save_checkpoint, save_checkpoint_async
 from .dataloader import iter_batches
 from .datums import causal_datum, materialize_datum, materialize_model_input
 from .metrics import MetricsAPI, metric_name, normalize_metrics
+from .reporting import isolated_metrics
 from .scoring import completion_logprobs, score_completion, score_completion_async
 from .updates import UpdateResult, run_update, run_update_async
 
@@ -34,6 +35,7 @@ __all__ = [
     "client",
     "completion_logprobs",
     "iter_batches",
+    "isolated_metrics",
     "materialize_datum",
     "materialize_model_input",
     "metric_name",

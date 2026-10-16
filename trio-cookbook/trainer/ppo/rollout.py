@@ -1,4 +1,10 @@
-"""Text rollouts and pluggable rewards; tool workflows can supply Trajectory."""
+"""PyTRIO sampling helpers for PPO-family rollouts and fixed references.
+
+This module is intentionally limited to online sampling, reward adaptation,
+group filtering, and reference scoring.  Workflows that already produce
+``Trajectory`` objects can bypass it and call ``PPOTrainer.step`` directly.
+Training and inference remain in one PyTRIO client lifecycle for now.
+"""
 
 import asyncio
 import inspect
@@ -12,7 +18,7 @@ from .contracts import Trajectory
 
 
 async def gather_cancel_on_error(coroutines):
-    """Drain siblings on failure so no background work outlives its snapshot."""
+    """Await concurrent PyTRIO requests and cancel siblings after any failure."""
     tasks = [asyncio.create_task(coro) for coro in coroutines]
     try:
         return await asyncio.gather(*tasks)
@@ -26,7 +32,12 @@ async def gather_cancel_on_error(coroutines):
 async def generate_rollouts(
     client, tokenizer, rows, reward_fn, config, *, first_group: int
 ):
-    """Reward callable: ``(row=..., completion=..., completion_ids=...) -> float``.
+    """Sample prompt groups and convert responses into validated trajectories.
+
+    ``reward_fn`` receives ``(row=..., completion=..., completion_ids=...)`` and
+    may be synchronous, asynchronous, or return an awaitable.  The sampler is
+    still the installed PyTRIO client; reward execution is only moved off the
+    event loop when the callable itself is synchronous.
 
     Sync rewards run in a worker; async rewards are awaited. Each request gets
     a distinct reproducible seed and prompt group ID, including repeated rows.
@@ -110,6 +121,8 @@ def filter_informative_groups(trajectories: list[Trajectory]) -> list[Trajectory
 
 
 async def score_reference(client, trajectories: list[Trajectory]) -> None:
+    """Score missing completion logprobs with a frozen PyTRIO reference client."""
+
     async def score(t):
         full = await call_async(
             client,

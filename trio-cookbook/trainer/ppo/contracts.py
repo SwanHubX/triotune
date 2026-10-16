@@ -1,4 +1,4 @@
-"""Unpadded trajectories; every auxiliary array describes completion tokens."""
+"""PPO data contracts shared by rollout, actor, critic, and PyTRIO datums."""
 
 from __future__ import annotations
 
@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class Trajectory:
+    """One unpadded prompt/completion sample and its aligned training fields.
+
+    Auxiliary arrays describe completion tokens; ``values`` additionally holds
+    one final bootstrap prediction for critic-based PPO.
+    """
+
     prompt_tokens: list[int]
     completion_tokens: list[int]
     logprobs: list[float]
@@ -64,6 +70,8 @@ class Trajectory:
 
 @dataclass(slots=True)
 class PreparedBatch:
+    """Frozen actor targets prepared once before minibatch optimization."""
+
     trajectories: list[Trajectory]
     advantages: list[list[float]]
     returns: list[list[float]]
@@ -74,6 +82,8 @@ class PreparedBatch:
 
 @dataclass(slots=True)
 class PPOState:
+    """Mutable lifecycle state returned by the root PPO trainer."""
+
     global_step: int = 0
     optimizer_steps: int = 0
     metrics: dict[str, float] = field(default_factory=dict)

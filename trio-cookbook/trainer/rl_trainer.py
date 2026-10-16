@@ -1,9 +1,16 @@
-"""One async rollout/actor/optional-critic loop for the PPO algorithm family."""
+"""Asynchronous rollout and optimization orchestration for PPO-family trainers.
+
+The algorithm-specific building blocks live under :mod:`trainer.ppo`; this
+module owns the lifecycle that connects them to PyTRIO clients.  A trainer can
+run actor-only updates, or coordinate an independent PyTRIO critic alongside
+the actor update.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
@@ -12,15 +19,15 @@ from typing import Any
 import numpy as np
 import pytrio as trio
 
-from ...api.client_api import call_async
-from ...utils.checkpoint import save_checkpoint_async
-from ...utils.metrics import MetricsAPI
-from .actor import PPOActor
-from .config import PPOConfig
-from .contracts import PPOState, Trajectory
-from .critic import Critic, PyTRIOCritic
-from .reporting import critic_metrics
-from .rollout import (
+from ..api.cli_args import PPOConfig
+from ..api.client_api import call_async
+from ..utils.checkpoint import save_checkpoint_async
+from ..utils.metrics import MetricsAPI
+from .ppo.actor import PPOActor
+from .ppo.contracts import PPOState, Trajectory
+from .ppo.critic import Critic, PyTRIOCritic
+from ..utils.reporting import isolated_metrics as critic_metrics
+from .ppo.rollout import (
     filter_informative_groups,
     gather_cancel_on_error,
     generate_rollouts,
@@ -37,6 +44,10 @@ class PPOTrainer:
     ``max_steps``/``save_every`` count rollout updates, not optimizer minibatches.
     """
 
+    # ------------------------------------------------------------------
+    # Trainer construction and dependency ownership
+    # ------------------------------------------------------------------
+
     def __init__(
         self,
         model: str,
@@ -51,7 +62,12 @@ class PPOTrainer:
         tokenizer=None,
         reference_client=None,
         service_client=None,
-    ):
+    ) -> None:
+        """Create a lazy PPO trainer and validate actor/critic ownership.
+
+        Clients are accepted as dependencies for tests and custom workflows;
+        missing clients are created during :meth:`initialize`.
+        """
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if (
@@ -87,9 +103,18 @@ class PPOTrainer:
         self._metrics = None
         self.state = PPOState()
 
+    # ------------------------------------------------------------------
+    # Client initialization and reference-model setup
+    # ------------------------------------------------------------------
+
     async def initialize(self) -> None:
+        """Create clients, tokenizers, reporters, and the actor exactly once."""
+
         if self._actor is not None:
             return
+
+        # Create the actor client and tokenizer lazily so construction remains
+        # side-effect free for configuration and dependency-injection tests.
         if self._client is None:
             if self._service is None:
                 self._service = trio.ServiceClient()
@@ -101,8 +126,12 @@ class PPOTrainer:
                 seed=self.args.seed,
             )
         if self._tokenizer is None:
-            # SDK exposes no asynchronous tokenizer getter.
+            # The SDK exposes no asynchronous tokenizer getter, so keep this
+            # blocking call off the event loop.
             self._tokenizer = await asyncio.to_thread(self._client.get_tokenizer)
+
+        # The built-in critic is a separate LoRA run with its own optimizer and
+        # random seed; an injected critic remains fully owned by the caller.
         if self._owns_critic:
             token_ids = self.args.critic_token_ids
             if token_ids is None:
@@ -130,6 +159,9 @@ class PPOTrainer:
                     "Actor and critic must use independent training clients."
                 )
             self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids)
+
+        # Keep actor and critic metrics in separate runs when the trainer owns
+        # both clients, while preserving one public actor metrics stream.
         name = self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-ppo-family"
         actor_args = (
             replace(self.args, run_name=f"{name}-actor")
@@ -164,6 +196,8 @@ class PPOTrainer:
         self._actor = PPOActor(self._client, self.args)
 
     async def _references(self, trajectories):
+        """Populate missing reference logprobs when KL control is enabled."""
+
         if not self.args.kl_ctl or all(
             t.reference_logprobs is not None for t in trajectories
         ):
@@ -171,15 +205,25 @@ class PPOTrainer:
         if self._reference is None:
             if self._service is None:
                 self._service = trio.ServiceClient()
-            # A separate base-model client stays fixed; never refresh it with
-            # policy weights. A custom frozen reference can also be injected.
+            # A separate base-model client stays fixed and is never refreshed
+            # with policy weights. Callers may inject a frozen reference.
             self._reference = await call_async(
                 self._service, "create_sampling_client", base_model=self.model
             )
         await score_reference(self._reference, trajectories)
 
+    # ------------------------------------------------------------------
+    # Rollout-batch preparation and actor/critic optimization
+    # ------------------------------------------------------------------
+
     async def step(self, trajectories: list[Trajectory]) -> dict[str, float]:
-        """Update one frozen rollout batch; never call concurrently on one trainer."""
+        """Update one frozen rollout batch.
+
+        The actor and critic consume the same prepared targets.  When both are
+        present they use independent clients and can therefore update in
+        parallel.  A trainer instance must not receive concurrent ``step``
+        calls.
+        """
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
         await self.initialize()
@@ -209,7 +253,7 @@ class PPOTrainer:
                 )
                 metrics.update(critic_stats)
         finally:
-            # Preserve the count even if a later remote update fails.
+            # Preserve optimizer counters even if a later remote update fails.
             self.state.optimizer_steps = self._actor.optimizer_steps
             self.state.critic_optimizer_steps = getattr(
                 self.critic, "optimizer_steps", 0
@@ -235,8 +279,12 @@ class PPOTrainer:
             await self.save_checkpoint()
         return self.state.metrics
 
+    # ------------------------------------------------------------------
+    # Checkpointing and run finalization
+    # ------------------------------------------------------------------
+
     async def save_checkpoint(self) -> str:
-        """Save both owned training runs; the return value remains actor's path."""
+        """Save owned actor and critic runs and return the actor checkpoint."""
         await self.initialize()
 
         async def actor_save():
@@ -256,17 +304,23 @@ class PPOTrainer:
         return self.state.checkpoint_path
 
     async def close(self, *, state="success", error=None) -> None:
-        """Drain reporting for owned runs; injected critics own their lifecycle."""
+        """Finish owned reporters; injected critics retain lifecycle ownership."""
         try:
             if self._owns_critic and self.critic is not None:
                 await asyncio.to_thread(self.critic.finish, state=state, error=error)
         finally:
             if self._metrics is not None:
-                # SwanLab restores signal handlers on finish; the actor's run
-                # was initialized in this process and must finish on main.
+                # SwanLab restores signal handlers on finish. The actor run was
+                # initialized in this process and must finish on the main thread.
                 self._metrics.finish(state=state, error=error)
 
+    # ------------------------------------------------------------------
+    # Dataset-driven rollout collection and training entry point
+    # ------------------------------------------------------------------
+
     async def _collect(self, rows):
+        """Generate and filter rollouts until one complete batch is available."""
+
         if self._sampling is None:
             self._sampling = await call_async(
                 self._client, "save_weights_and_get_sampling_client"
@@ -274,6 +328,8 @@ class PPOTrainer:
         accepted, empty = [], 0
         group_count = 0
         while group_count < self.args.batch_size:
+            # Dynamic sampling may reject entire prompt groups, so keep reading
+            # source rows until the target number of informative groups exists.
             source = list(itertools.islice(rows, self.args.batch_size - group_count))
             if not source:
                 break
@@ -298,6 +354,7 @@ class PPOTrainer:
         return accepted
 
     async def train(self) -> PPOState:
+        """Collect rollout batches until ``max_steps`` and return final state."""
         if self.train_dataset is None or not callable(self.reward_fn):
             raise ValueError(
                 "train() requires train_dataset and reward_fn; use step() for custom trajectories."
@@ -344,3 +401,12 @@ class PPOTrainer:
                 error.add_note(f"Reporter cleanup also failed: {cleanup_error}")
             raise
         return self.state
+
+
+# Keep ``trio_cookbook.trainer.ppo.trainer`` as an identity-preserving alias
+# for integrations that patch or pickle the historical module path.
+_ppo_module = __import__(f"{__package__}.ppo", fromlist=["*"])
+_ppo_module.PPOTrainer = PPOTrainer
+
+sys.modules[f"{__package__}.ppo.trainer"] = sys.modules[__name__]
+del _ppo_module

@@ -1,8 +1,8 @@
 # Trainer 模块
 
-PPO 算法族的独立入口位于 [`ppo/`](./ppo/README.md)：同一异步训练循环可通过配置切换
+PPO 算法族的独立入口位于 [`ppo/`](./ppo/README.md)：上一级的 `rl_trainer.py` 负责同一异步训练循环，配置可切换
 PPO、GRPO、RLOO、Dr.GRPO、LitePPO、GSPO、SAPO、CISPO 和 DAPO。
-其算法配置及模块实现均保存在该目录；标准 PPO 默认创建独立的 PyTRIO actor/critic 训练客户端，详见接口能力说明。
+其算法配置及模块实现保存在该目录；标准 PPO 默认创建独立的 PyTRIO actor/critic 训练客户端，详见接口能力说明。
 
 ## 目录与职责
 
@@ -21,6 +21,7 @@ trio_cookbook/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
 │   ├── dataloader.py    # 流式数据集的 batch 迭代
 │   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
+│   ├── reporting.py     # 进程隔离的 SwanLab secondary-run reporter
 │   ├── scoring.py       # 固定 completion 的 logprob 评分与对齐
 │   └── metrics.py       # 指标规范化、窗口聚合与 SwanLab 提交
 └── trainer/
@@ -29,6 +30,7 @@ trio_cookbook/
     ├── dpo_trainer.py   # DPO 训练编排
     ├── sft_trainer.py   # SFT 训练编排
     ├── opd_trainer.py   # OPD 训练编排
+    ├── rl_trainer.py    # PPO-family 训练编排
     ├── grpo/
     │   ├── contracts.py
     │   ├── advantages.py
@@ -41,21 +43,22 @@ trio_cookbook/
     │   └── loss.py
     ├── sft/
     │   └── state.py
-    └── opd/
-        ├── contracts.py      # 阶段数据契约、trainer 状态与 step 结果
-        ├── execution.py      # 不可变执行计划与并发事务
-        ├── rollout.py        # 学生 on-policy 采样
-        ├── teacher_phase.py  # 路由固定 teacher 并聚合 token score
-        ├── loss.py           # sampled reverse-KL 信号与远端 surrogate
-        ├── datum.py          # next-token 对齐与 prompt mask
-        ├── targets.py        # teacher score 到训练 target 的转换
-        └── metrics.py        # OPD 指标归约
+    ├── opd/
+    │   ├── contracts.py      # 阶段数据契约、trainer 状态与 step 结果
+    │   ├── execution.py      # 不可变执行计划与并发事务
+    │   ├── rollout.py        # 学生 on-policy 采样
+    │   ├── teacher_phase.py  # 路由固定 teacher 并聚合 token score
+    │   ├── loss.py           # sampled reverse-KL 信号与远端 surrogate
+    │   ├── datum.py          # next-token 对齐与 prompt mask
+    │   ├── targets.py        # teacher score 到训练 target 的转换
+    │   └── metrics.py        # OPD 指标归约
+    └── ppo/                  # PPO-family 算法组件
 ```
 
 | 模块 | 职责 |
 | --- | --- |
 | [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
-| [配置契约](../api/cli_args.py) | 定义 `BaseTrainerConfig` 以及 GRPO、DPO、SFT、OPD 配置；集中校验优化器、运行控制和日志字段。 |
+| [配置契约](../api/cli_args.py) | 定义 `BaseTrainerConfig` 以及 GRPO、DPO、SFT、OPD、PPO 配置；集中校验优化器、运行控制和日志字段。 |
 | [客户端契约](../api/client_api.py) | 统一 TrainingClient、SamplingClient 的同步／异步调用、future 解析及 SDK 参数构造；client 刷新时机由算法决定。 |
 | [输入渲染](../dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
@@ -72,6 +75,7 @@ trio_cookbook/
 | [DPO 编排](./dpo_trainer.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；损失模块实现成对目标与算法指标。 |
 | [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
 | [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target、loss 与 metric 阶段。 |
+| [PPO-family 编排](./rl_trainer.py)、[算法组件](./ppo/README.md) | 组织 rollout、reference/value、冻结目标、actor/critic 并发更新、checkpoint 和日志生命周期；算法细节保存在 `ppo/`。 |
 | [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；路由组内的固定 teacher 给同一 token 序列评分，并聚合为加权几何 ensemble。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
 | [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
 | [OPD contracts](./opd/contracts.py)、[metrics](./opd/metrics.py) | 隔离 SDK response、校验阶段间数据，并以 completion token 为分母归约蒸馏指标；验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |

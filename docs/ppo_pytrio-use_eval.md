@@ -47,19 +47,17 @@ flowchart TD
 
 | 模块 | 当前职责 |
 | --- | --- |
-| [config.py](../trio-cookbook/trainer/ppo/config.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
+| [cli_args.py](../trio-cookbook/api/cli_args.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
 | [contracts.py](../trio-cookbook/trainer/ppo/contracts.py) | `Trajectory`、`PreparedBatch`、`PPOState` |
 | [rollout.py](../trio-cookbook/trainer/ppo/rollout.py) | 文本采样、reward 调用、动态补采、固定 reference 评分 |
-| [normalization.py](../trio-cookbook/trainer/ppo/normalization.py) | 分别配置均值和标准差的 batch/group 范围、leave-one-out |
-| [advantages.py](../trio-cookbook/trainer/ppo/advantages.py) | 长度惩罚、reward 缩放与裁剪、KL reward、GAE、优势归一化 |
-| [gae.py](../trio-cookbook/trainer/ppo/gae.py) | token 级 GAE、工具位置跳过、截断 bootstrap |
+| [actor.py](../trio-cookbook/trainer/ppo/actor.py) | 奖励整形、batch/group 归一化、KL reward、token 级 GAE、优势归一化和 actor 更新 |
 | [datum.py](../trio-cookbook/trainer/ppo/datum.py) | 因果 token 对齐、prompt/tool label mask、PyTRIO Datum 构建 |
 | [loss.py](../trio-cookbook/trainer/ppo/loss.py) | PPO、SAPO、CISPO、GSPO 比率、双重裁剪、reduction、行为过滤 |
 | [actor.py](../trio-cookbook/trainer/ppo/actor.py) | proximal 重算、目标冻结、minibatch 和重复更新 |
 | [critic.py](../trio-cookbook/trainer/ppo/critic.py) | `PyTRIOCritic` 评分、更新、保存；保留外部 `Critic` 协议 |
-| [critic_loss.py](../trio-cookbook/trainer/ppo/critic_loss.py) | marker targets、无界 value 读出、clipped value regression |
-| [reporting.py](../trio-cookbook/trainer/ppo/reporting.py) | 独立 critic SwanLab reporter 进程 |
-| [trainer.py](../trio-cookbook/trainer/ppo/trainer.py) | 训练编排、日志、actor/critic checkpoint 保存 |
+| [critic.py](../trio-cookbook/trainer/ppo/critic.py) | marker targets、无界 value 读出、clipped value regression 和 critic 更新 |
+| [reporting.py](../trio-cookbook/utils/reporting.py) | 进程隔离的第二个 SwanLab run reporter（公共 utility） |
+| [rl_trainer.py](../trio-cookbook/trainer/rl_trainer.py) | 训练编排、日志、actor/critic checkpoint 保存 |
 
 初始化是惰性的；创建 `PPOTrainer` 本身不会立即创建远端训练客户端。
 训练方法使用 `async/await`，同一批 prompt 的采样请求可以并发执行。

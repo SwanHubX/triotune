@@ -7,17 +7,30 @@ No model parameters or full vocabulary logits are downloaded.
 
 from collections import defaultdict
 
-from .config import PPOConfig
+from ...api.cli_args import PPOConfig
 from .contracts import PreparedBatch
+from .datum import IGNORE_INDEX
 
 
 def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
+    """Create a PyTRIO custom-loss callback for one frozen actor batch.
+
+    The callback receives remote current-policy logprobs and returns a local
+    scalar objective plus metrics. PyTRIO converts its logprob gradients into
+    the remote weighted cross-entropy update; model parameters never leave the
+    training service.
+    """
+
     def loss(datums, logprobs):
+        """Evaluate PPO, GSPO, SAPO, or CISPO on SDK-produced logprobs."""
+
         import torch
 
         if len(datums) != len(batch.trajectories) or len(logprobs) != len(datums):
             raise ValueError("Custom loss needs one logprob tensor per trajectory.")
         sums, counts, ratios, clipped, rejected = [], [], [], [], []
+        # Evaluate each trajectory independently so variable-length completion
+        # masks remain aligned before the configured reduction is applied.
         for t, adv, prox, mask, datum, full_lp in zip(
             batch.trajectories,
             batch.advantages,
@@ -30,8 +43,8 @@ def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
             lp = full_lp.reshape(-1)
             if lp.numel() != len(t.prompt_tokens) + len(t.completion_tokens) - 1:
                 raise ValueError("Custom loss logprobs are not causally aligned.")
-            expected = [-100] * (len(t.prompt_tokens) - 1) + [
-                token if active else -100
+            expected = [IGNORE_INDEX] * (len(t.prompt_tokens) - 1) + [
+                token if active else IGNORE_INDEX
                 for token, active in zip(t.completion_tokens, mask, strict=True)
             ]
             if list(datum.loss_fn_inputs["target_tokens"].data) != expected:
@@ -74,6 +87,8 @@ def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
                 raise FloatingPointError(
                     "Importance ratios are nonfinite; reject or recollect stale trajectories."
                 )
+            # Ordinary PPO clips the surrogate; CISPO detaches the clipped
+            # ratio, while SAPO replaces the hard clip with a smooth gate.
             bounded = ratio.clamp(
                 1 - config.eps_clip,
                 1

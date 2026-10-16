@@ -4,7 +4,9 @@ from .cli_args import (
     BaseTrainerConfig,
     DPOConfig,
     GRPOConfig,
+    NormConfig,
     OPDConfig,
+    PPOConfig,
     SFTConfig,
 )
 from .client_api import (
@@ -38,7 +40,9 @@ __all__ = [
     "DPOConfig",
     "GRPOConfig",
     "LossSpec",
+    "NormConfig",
     "OPDConfig",
+    "PPOConfig",
     "PolicyLossInput",
     "SFTConfig",
     "SupervisedLossInput",

@@ -1,6 +1,6 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT、OPD 训练器及运行示例。
+本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT、OPD 和 PPO-family 训练器及运行示例。
 
 
 ## 目录结构
