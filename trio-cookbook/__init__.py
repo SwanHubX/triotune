@@ -5,9 +5,10 @@ tokenization backends, sampling and optimization stay behind the PyTRIO
 clients supplied by the caller.
 """
 
+from . import utils
+from .api.client_api import call, call_async, wait, wait_async
 from .trainer import DPOConfig, DPOTrainer, GRPOConfig, GRPOTrainer, RenderedPrompt, render_prompt
 from .trainer import OPDConfig, OPDTrainer
-from .utils import call, call_async, wait, wait_async
 
 __all__ = [
     "DPOConfig",

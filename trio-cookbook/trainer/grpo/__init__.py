@@ -1,8 +1,8 @@
 """GRPO training implementation."""
 
-from .config import GRPOConfig
-from .trainer import GRPOTrainer
-from .types import GRPOBatch, GRPODatum, GRPOResult, SequenceSample, TrainerState
+from ...api.cli_args import GRPOConfig
+from ..grpo_trainer import GRPOTrainer
+from .contracts import GRPOBatch, GRPODatum, GRPOResult, SequenceSample, TrainerState
 
 __all__ = [
     "GRPOConfig", "GRPOTrainer", "GRPOBatch", "GRPODatum",

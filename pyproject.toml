@@ -22,8 +22,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = [
     "trio_cookbook",
+    "trio_cookbook.api",
+    "trio_cookbook.dataset",
+    "trio_cookbook.dataset.swe_sft",
     "trio_cookbook.trainer",
-    "trio_cookbook.trainer.common",
     "trio_cookbook.trainer.grpo",
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",
@@ -34,7 +36,6 @@ packages = [
 [tool.setuptools.package-dir]
 trio_cookbook = "trio-cookbook"
 "trio_cookbook.trainer" = "trio-cookbook/trainer"
-"trio_cookbook.utils" = "trio-cookbook/utils"
 
 [tool.uv]
 # Keep the historical on-disk directory name while installing it under the

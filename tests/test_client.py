@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+import importlib
 import threading
 import time
 import unittest
 
 from pytrio.types.future.api_future import APIFuture
 
-from trio_cookbook.utils.client import call_async, wait_async
+from trio_cookbook.api.client_api import call_async, wait_async
 
 
 class _BlockingFuture:
@@ -41,6 +42,11 @@ class WaitAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.name, "step-1")
         self.assertTrue(loop_progressed.is_set())
         await tick_task
+
+    def test_legacy_utils_path_aliases_client_api_module(self) -> None:
+        client_api = importlib.import_module("trio_cookbook.api.client_api")
+        legacy = importlib.import_module("trio_cookbook.utils.client")
+        self.assertIs(legacy, client_api)
 
     async def test_resolves_coroutine_returning_native_future(self) -> None:
         async def submit() -> asyncio.Future[str]:

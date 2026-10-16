@@ -1,4 +1,4 @@
-"""Data contracts shared by the GRPO modules."""
+"""Data contracts exchanged across the GRPO rollout and update pipeline."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class GRPOBatch:
     """A prompt and its group of completions under one behavior policy."""
 
     prompt_id: str
-    # This is the exact rendered text sent to reward functions.  Conversational
+    # This is the exact rendered text sent to reward functions. Conversational
     # inputs are rendered with the tokenizer's chat template before a batch is
     # created, so rollout and training use the same token sequence.
     prompt: str
@@ -45,6 +45,8 @@ class GRPODatum:
 
     @property
     def loss_fn_inputs(self) -> dict[str, list[float] | list[int]]:
+        """Return fields consumed by PyTRIO's importance-sampling loss."""
+
         return {
             "target_tokens": self.target_tokens,
             "logprobs": self.logprobs,
@@ -67,6 +69,7 @@ class GRPOResult:
 @dataclass(slots=True)
 class TrainerState:
     """Mutable local state tracked across GRPO training steps."""
+
     # Number of completed trainer steps.
     global_step: int = 0
     # Version of the behavior policy used to generate the next rollout batch.

@@ -68,6 +68,7 @@ class _Client:
         self.fail_forward = False
         self.saved: list[str] = []
         self.events: list[str] = []
+        self.eval_calls = 0
 
     def get_tokenizer(self) -> _Tokenizer:
         return _Tokenizer()
@@ -79,6 +80,23 @@ class _Client:
         if self.fail_forward:
             raise RuntimeError("forward failed")
         return SimpleNamespace(metrics={"loss_mean": 0.5, "token_count": 2})
+
+    def forward(self, datums: list[object], **kwargs: object) -> object:
+        self.events.append("evaluate")
+        self.eval_calls += 1
+        assert kwargs == {"loss_fn": "cross_entropy", "auto_shift": False}
+        token_count = sum(
+            target != -100
+            for datum in datums
+            for target in datum.loss_fn_inputs["target_tokens"].data
+        )
+        return SimpleNamespace(
+            metrics={"loss_mean": 0.25, "loss_sum": 0.25 * token_count,
+                     "token_count": token_count}
+        )
+
+    async def forward_async(self, datums: list[object], **kwargs: object) -> object:
+        return _Future(self.forward(datums, **kwargs))
 
     def optim_step(self, params: object) -> object:
         self.events.append("optim")
@@ -120,8 +138,11 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.client = _Client()
         self.run = _Run()
-        service = patch("trio_cookbook.trainer.sft.trainer.trio.ServiceClient")
-        swanlab = patch("trio_cookbook.trainer.sft.trainer.swanlab.init", return_value=self.run)
+        service = patch("trio_cookbook.trainer.sft_trainer.trio.ServiceClient")
+        swanlab = patch(
+            "trio_cookbook.utils.metrics.swanlab.init",
+            return_value=self.run,
+        )
         self.service = service.start()
         swanlab.start()
         self.addCleanup(service.stop)
@@ -199,6 +220,104 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def test_validation_uses_forward_without_optimizer_or_state_step(self) -> None:
+        trainer = self.trainer()
+
+        metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
+
+        self.assertEqual(metrics["eval/loss"], 0.25)
+        self.assertEqual(metrics["eval/examples"], 2.0)
+        self.assertEqual(self.client.eval_calls, 2)
+        self.assertEqual(self.client.optim_calls, 0)
+        self.assertEqual(trainer.state.global_step, 0)
+
+    async def test_train_schedules_initial_and_periodic_validation_once(self) -> None:
+        trainer = self.trainer(
+            max_steps=1,
+            eval_before_train=True,
+            eval_steps=1,
+            eval_after_train=True,
+        )
+        trainer.train_dataset = [{"text": "train"}]
+        trainer.eval_dataset = [{"text": "valid"}]
+
+        state = await trainer.train()
+
+        self.assertEqual(state.global_step, 1)
+        self.assertEqual(self.client.optim_calls, 1)
+        self.assertEqual(self.client.eval_calls, 2)
+
+    async def test_eval_dataset_runs_every_50_completed_steps_after_pipeline_drain(self):
+        trainer = SFTTrainer(
+            "test-model",
+            args=SFTConfig(max_steps=101, eval_steps=50, eval_after_train=False),
+            train_dataset=[{"text": "train"}] * 101,
+            eval_dataset=[{"text": "held-out"}],
+        )
+        evaluated = []
+        evaluate = trainer.evaluate
+
+        async def track_evaluate(*args, **kwargs):
+            evaluated.append(trainer.state.global_step)
+            self.assertEqual(self.client.optim_calls, trainer.state.global_step)
+            return await evaluate(*args, **kwargs)
+
+        trainer.evaluate = track_evaluate
+        await trainer.train()
+
+        self.assertEqual(evaluated, [50, 100])
+        self.assertEqual(self.client.eval_calls, 2)
+        self.assertEqual(self.client.optim_calls, 101)
+
+    async def test_eval_limits_apply_to_full_eval_dataset_without_training(self):
+        trainer = self.trainer(eval_batch_size=2, eval_max_batches=1)
+        trainer.eval_dataset = [{"text": "ab"}] * 5
+
+        metrics = await trainer.evaluate()
+
+        self.assertEqual(metrics["eval/examples"], 2)
+        self.assertEqual(self.client.eval_calls, 1)
+        self.assertEqual(self.client.optim_calls, 0)
+
+    async def test_eval_steps_without_dataset_only_trains(self):
+        trainer = self.trainer(eval_steps=1, max_steps=2, eval_before_train=True)
+        trainer.train_dataset = [{"text": "train"}] * 2
+
+        await trainer.train()
+
+        self.assertEqual(self.client.optim_calls, 2)
+        self.assertEqual(self.client.eval_calls, 0)
+        with self.assertRaisesRegex(ValueError, "eval_dataset is required"):
+            await trainer.evaluate()
+
+    async def test_final_evaluation_runs_after_partial_interval(self):
+        trainer = self.trainer(max_steps=3, eval_steps=2, eval_after_train=True)
+        trainer.train_dataset = [{"text": "train"}] * 3
+        trainer.eval_dataset = [{"text": "held-out"}]
+        evaluated = []
+        publish = trainer._publish_evaluation
+
+        def track_evaluation(metrics):
+            evaluated.append(trainer.state.global_step)
+            return publish(metrics)
+
+        trainer._publish_evaluation = track_evaluation
+        await trainer.train()
+
+        self.assertEqual(evaluated, [2, 3])
+
+    async def test_failed_periodic_evaluation_stops_before_next_training_batch(self):
+        trainer = self.trainer(max_steps=3, eval_steps=1)
+        trainer.train_dataset = [{"text": "train"}] * 3
+        trainer.eval_dataset = [{"text": "held-out"}]
+        with patch.object(self.client, "forward", side_effect=RuntimeError("eval failed")):
+            with self.assertRaisesRegex(RuntimeError, "eval failed"):
+                await trainer.train()
+
+        self.assertEqual(trainer.state.global_step, 1)
+        self.assertEqual(self.client.optim_calls, 1)
+        self.assertIsNone(trainer._last_eval_step)
+
     async def test_pipeline_limits_outstanding_batches(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_in_flight"):
             SFTConfig(max_in_flight=0)
@@ -251,7 +370,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(self.client, "forward_backward_async", return_value=FailedFuture(None)),
-            patch("trio_cookbook.trainer.sft.trainer.asyncio.create_task", side_effect=tracked_task),
+            patch("trio_cookbook.trainer.sft_trainer.asyncio.create_task", side_effect=tracked_task),
         ):
             with self.assertRaisesRegex(RuntimeError, "remote forward failed"):
                 await trainer.train()
@@ -262,7 +381,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.run.finished)
 
     async def test_swanlab_options_and_disabled_reporting(self) -> None:
-        with patch("trio_cookbook.trainer.sft.trainer.swanlab.init") as init:
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
             self.trainer()
             init.assert_not_called()
             self.trainer(report_to="swanlab")

@@ -3,7 +3,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .types import GRPOBatch
+from .contracts import GRPOBatch
 
 
 FINAL_SUMMARY_KEYS = (
@@ -25,24 +25,6 @@ def _is_per_prompt_metric(name: str) -> bool:
 
     _, separator, metric_name = name.partition("/")
     return bool(separator) and metric_name.startswith(("reward/", "advantage/"))
-
-
-def _swanlab_metric_name(name: str) -> str:
-    """Map trainer metrics to the namespaces exposed in SwanLab."""
-
-    if name == "optim/lr":
-        return "train/learning_rate"
-    if name.startswith(("trainer/", "scalar/")):
-        return "train/" + name.partition("/")[2]
-    if "/" not in name:
-        return "train/" + name
-    return name
-
-
-def _is_checkpoint_metric(name: str) -> bool:
-    """Return whether a metric describes checkpoint handling."""
-
-    return name == "time/checkpoint" or name.startswith("checkpoint/")
 
 
 def _tensor_values(value: Any) -> list[float] | None:

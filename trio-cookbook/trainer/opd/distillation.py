@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
-import pytrio as trio
+from ...utils.datums import materialize_datum
+
+
+@dataclass(slots=True)
+class _ScoredCompletion:
+    """One student completion aligned with its teacher distillation signal."""
+
+    datum: Any
+    tokens: int
+    student_sum: float
+    teacher_sum: float
+    advantage_sum: float
 
 
 def validate_tokens(tokens: Sequence[int], *, source: str) -> list[int]:
@@ -45,7 +57,12 @@ def distillation_advantages(
     teacher = validate_logprobs(teacher, source="Teacher completion")
     if len(student) != len(teacher):
         raise ValueError("Student and teacher completion logprobs must align.")
-    if not math.isfinite(coef) or coef <= 0 or not math.isfinite(discount) or not 0 <= discount <= 1:
+    if (
+        not math.isfinite(coef)
+        or coef <= 0
+        or not math.isfinite(discount)
+        or not 0 <= discount <= 1
+    ):
         raise ValueError("coef must be positive and discount must be in [0, 1].")
     advantages = [coef * (q - p) for p, q in zip(student, teacher, strict=True)]
     future = 0.0
@@ -70,9 +87,9 @@ def build_opd_datum(
     if any(not math.isfinite(value) for value in advantages):
         raise ValueError("Distillation advantages must be finite.")
     padding = len(prompt) - 1
-    return trio.Datum(
-        model_input=trio.ModelInput.from_ints(prompt + completion[:-1]),
-        loss_fn_inputs={
+    return materialize_datum(
+        prompt + completion[:-1],
+        {
             # -100 excludes prompt tokens from PyTRIO's active-token loss
             # denominator as well as their gradient; zero advantages alone
             # would still dilute the completion signal for long prompts.

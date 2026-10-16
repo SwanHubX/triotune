@@ -186,8 +186,7 @@ trio-cookbook/
 ├── configs/       # TOML configurations for the built-in workflows
 ├── recipes/       # Trainer-based and standalone PyTRIO examples
 ├── scripts/       # Shell launchers and dataset preparation guides
-├── trainer/       # GRPO, DPO, SFT, OPD trainers and shared utilities
-└── utils/         # Small synchronous/asynchronous PyTRIO adapters
+└── trainer/       # Trainers plus shared config, dataset, and client contracts
 ```
 
 ## Current scope

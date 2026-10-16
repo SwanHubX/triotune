@@ -178,8 +178,7 @@ trio-cookbook/
 ├── configs/       # 内置流程的 TOML 配置
 ├── recipes/       # trainer 版本和独立 PyTRIO 案例
 ├── scripts/       # 启动脚本和数据准备说明
-├── trainer/       # GRPO、DPO、SFT、OPD trainer 与公共工具
-└── utils/         # PyTRIO 同步/异步适配工具
+└── trainer/       # trainer 及公共配置、数据和 client 契约
 ```
 
 ## 当前范围

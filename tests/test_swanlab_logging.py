@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from trio_cookbook.trainer import GRPOConfig, GRPOResult, GRPOTrainer, TrainerState
+from trio_cookbook.utils.metrics import MetricsAPI
 
 
 class _Run:
@@ -43,8 +44,8 @@ class _Sampler:
 
 def _final_trainer(run: _Run, sampler: _Sampler) -> GRPOTrainer:
     trainer = GRPOTrainer.__new__(GRPOTrainer)
-    trainer._swanlab_run = run
     trainer.config = GRPOConfig(max_steps=1, batch_size=5, output_dir=True)
+    trainer._metrics_api = MetricsAPI(run)
     trainer.state = TrainerState(global_step=1, checkpoint_path="trio://final-checkpoint")
     trainer._total_input_tokens = 0
     trainer._tokenizer = SimpleNamespace(encode=lambda text, **_: [1])
@@ -64,8 +65,8 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer.model_name = "Qwen/Qwen3.5-9B"
         trainer.config = GRPOConfig(report_to="swanlab", workspace="my-organization", tags=["grpo", "gsm8k"])
 
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
-            trainer._init_swanlab_run(lora_rank=32)
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+            trainer._init_metrics_api(lora_rank=32)
 
         self.assertEqual(init.call_args.kwargs["workspace"], "my-organization")
         self.assertEqual(init.call_args.kwargs["tags"], ["grpo", "gsm8k"])
@@ -76,17 +77,18 @@ class SwanLabLoggingTests(unittest.TestCase):
         trainer.model_name = "Qwen/Qwen3.5-9B"
         trainer.config = GRPOConfig(report_to="swanlab")
 
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
-            trainer._init_swanlab_run(lora_rank=32)
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+            trainer._init_metrics_api(lora_rank=32)
 
         self.assertIsNone(init.call_args.kwargs["workspace"])
         self.assertIsNone(init.call_args.kwargs["tags"])
 
     def test_none_report_to_uses_terminal_only(self) -> None:
         trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer.model_name = "Qwen/Qwen3.5-9B"
         trainer.config = GRPOConfig()
-        with patch("trio_cookbook.trainer.grpo.trainer.swanlab.init") as init:
-            self.assertIsNone(trainer._init_swanlab_run(lora_rank=32))
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+            self.assertFalse(trainer._init_metrics_api(lora_rank=32).enabled)
         init.assert_not_called()
 
     def test_rejects_unsupported_report_targets(self) -> None:
@@ -113,8 +115,8 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_logs_batch_metrics_without_per_prompt_metrics(self) -> None:
         run = _Run()
         trainer = GRPOTrainer.__new__(GRPOTrainer)
-        trainer._swanlab_run = run
         trainer.config = GRPOConfig()
+        trainer._metrics_api = MetricsAPI(run)
         result = GRPOResult(
             step=3,
             metrics={
@@ -153,18 +155,18 @@ class SwanLabLoggingTests(unittest.TestCase):
         self.assertEqual(run.payload["reward/boxed_answer_reward/mean"], 0.75)
         self.assertEqual(run.payload["train/learning_rate"], 4e-5)
         self.assertNotIn("optim/lr", run.payload)
-        self.assertEqual(run.payload["optim/grad_norm"], 1.25)
+        self.assertEqual(run.payload["train/grad_norm"], 1.25)
         self.assertEqual(run.payload["train/loss"], -0.1)
         self.assertEqual(run.payload["train/backend_metric"], 0.4)
         self.assertEqual(run.payload["train/other_metric"], 0.6)
         self.assertEqual(run.payload["train/loss_sum"], 2.0)
         self.assertEqual(run.payload["train/loss_mean"], 0.25)
-        self.assertEqual(run.payload["train/token_count"], 8.0)
+        self.assertEqual(run.payload["train/backend_token_count"], 8.0)
         self.assertFalse(any(key.startswith("trainer/") for key in run.payload))
         self.assertTrue(all("/" in key for key in run.payload))
         self.assertEqual(run.payload["policy/entropy"], 1.5)
         self.assertEqual(run.payload["policy/kl_sample_train"], 0.02)
-        self.assertNotIn("time/checkpoint", run.payload)
+        self.assertEqual(run.payload["time/checkpoint"], 0.5)
         self.assertNotIn("checkpoint/saved", run.payload)
         self.assertEqual(run.payload["time/step"], 3.0)
         self.assertEqual(run.step, 3)
@@ -172,8 +174,8 @@ class SwanLabLoggingTests(unittest.TestCase):
     def test_logging_step_averages_all_scalars_and_flushes_final_partial_window(self) -> None:
         run = _Run()
         trainer = GRPOTrainer.__new__(GRPOTrainer)
-        trainer._swanlab_run = run
         trainer.config = GRPOConfig(logging_step=2)
+        trainer._metrics_api = MetricsAPI(run, logging_step=2)
         for step, loss in ((1, 0.2), (2, 0.4), (3, 0.6)):
             trainer._log_swanlab(GRPOResult(
                 step=step,
@@ -194,7 +196,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             trainer._log_final_checkpoint()
 
         terminal.assert_not_called()
@@ -204,7 +206,7 @@ class SwanLabLoggingTests(unittest.TestCase):
         run, sampler = _Run(), _Sampler()
         trainer = _final_trainer(run, sampler)
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             trainer.config = GRPOConfig(output_dir=False)
             trainer._log_final_checkpoint()
             trainer.config = GRPOConfig(output_dir=True)
@@ -254,7 +256,7 @@ class SwanLabLoggingTests(unittest.TestCase):
 
         trainer.step = step
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             state = trainer.train()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")
@@ -309,7 +311,7 @@ class AsyncSwanLabLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         trainer.step_async = step_async
 
-        with patch("trio_cookbook.trainer.grpo.trainer.tqdm.write") as terminal:
+        with patch("trio_cookbook.trainer.grpo_trainer.tqdm.write") as terminal:
             state = await trainer.train_async()
 
         self.assertEqual(state.checkpoint_path, "trio://grpo-step-00000001")

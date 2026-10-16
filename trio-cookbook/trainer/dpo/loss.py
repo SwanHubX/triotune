@@ -30,12 +30,12 @@ def make_loss_fn(reference: Sequence[float], beta: float):
         objective = F.softplus(-margins).mean()
         metrics = {
             "train/loss": objective.item(),
-            "rewards/chosen": chosen_rewards.detach().mean().item(),
-            "rewards/rejected": rejected_rewards.detach().mean().item(),
-            "rewards/margins": margins.detach().mean().item(),
-            "rewards/accuracies": (margins.detach() > 0).float().mean().item(),
-            "logps/chosen": policy_chosen.detach().mean().item(),
-            "logps/rejected": policy_rejected.detach().mean().item(),
+            "reward/chosen": chosen_rewards.detach().mean().item(),
+            "reward/rejected": rejected_rewards.detach().mean().item(),
+            "reward/margin": margins.detach().mean().item(),
+            "reward/accuracy": (margins.detach() > 0).float().mean().item(),
+            "train/logp_chosen": policy_chosen.detach().mean().item(),
+            "train/logp_rejected": policy_rejected.detach().mean().item(),
         }
         return objective, metrics
 

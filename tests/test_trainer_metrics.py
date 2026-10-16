@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 from trio_cookbook.trainer import GRPOBatch, GRPOConfig, GRPOResult, GRPOTrainer, SequenceSample, TrainerState
+from trio_cookbook.utils.metrics import MetricsAPI
 from trio_cookbook.trainer.grpo.metrics import _rollout_metrics
 
 
@@ -77,7 +78,7 @@ class TrainerMetricsTests(unittest.TestCase):
         trainer.config = GRPOConfig(save_every=1)
         trainer.state = TrainerState()
         trainer._total_input_tokens = 0
-        trainer._swanlab_run = None
+        trainer._metrics_api = MetricsAPI()
         group = GRPOBatch(
             prompt_id="0",
             prompt="question",

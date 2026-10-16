@@ -1,4 +1,4 @@
-"""Shared checkpoint names and validated synchronous/asynchronous saves.
+"""Cross-cutting checkpoint names and validated sync/async saves.
 
 Save cadence and state publication belong to each algorithm. In particular,
 SFT submits queued saves in its trainer to preserve the SDK's request ordering.
@@ -6,7 +6,7 @@ SFT submits queued saves in its trainer to preserve the SDK's request ordering.
 
 from typing import Any
 
-from ...utils.client import call, call_async
+from ..api.client_api import call, call_async
 
 
 def checkpoint_name(algorithm: str, step: int) -> str:

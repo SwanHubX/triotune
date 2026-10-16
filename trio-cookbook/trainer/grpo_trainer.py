@@ -8,7 +8,6 @@ implements group-centered advantages with PyTRIO ``importance_sampling``.
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import math
 import time
@@ -19,24 +18,31 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
-from ...utils.client import call, call_async, optimizer_params, sampling_params, submit_async, wait, wait_async
-from ..common.checkpoint import save_checkpoint, save_checkpoint_async
-from ..common.logging import accumulate_metrics, averaged_metrics, finish_run, start_run
-from ..common.prompts import render_prompt
-from .advantages import group_advantages
-from .config import GRPOConfig
-from .datum import build_aligned_datum, to_client_datum
-from .metrics import (
+from ..api.client_api import (
+    call,
+    call_async,
+    optimizer_params,
+    sampling_params,
+    submit_async,
+    wait,
+    wait_async,
+)
+from ..api.cli_args import GRPOConfig
+from ..dataset import prepare_prompt
+from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.dataloader import iter_batches
+from ..utils.metrics import MetricsAPI
+from .grpo.advantages import group_advantages
+from .grpo.datum import build_aligned_datum, to_client_datum
+from .grpo.metrics import (
     FINAL_SUMMARY_KEYS,
-    _is_checkpoint_metric,
     _is_per_prompt_metric,
     _rollout_metrics,
     _sample_train_kl,
-    _swanlab_metric_name,
 )
-from .rewards import RewardEvaluator, RewardFunc
-from .rollout import SamplingAdapter
-from .types import GRPOBatch, GRPOResult, TrainerState
+from .grpo.rewards import RewardEvaluator, RewardFunc
+from .grpo.rollout import SamplingAdapter
+from .grpo.contracts import GRPOBatch, GRPOResult, TrainerState
 
 
 class GRPOTrainer:
@@ -46,6 +52,10 @@ class GRPOTrainer:
     to ``ServiceClient.create_lora_training_client`` as the base model. Dataset
     prompts may be plain text, pre-tokenized integer IDs, or text-only chat
     messages. Chat messages are rendered with the tokenizer chat template.
+
+    eval_dataset holds replayable prompt rows in the same format as training.
+    GRPOConfig.eval_steps schedules fresh policy rollouts and reward evaluation
+    between optimizer updates, without policy optimization.
     """
 
     def __init__(
@@ -54,11 +64,12 @@ class GRPOTrainer:
         reward_funcs: RewardFunc | Sequence[RewardFunc] | None = None,
         args: GRPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
-    ):
-        ## Model
-        # Create the PyTRIO client for the requested base model.
+    ) -> None:
+        """Create the training client, tokenizer, reward adapter and run state."""
+
         if not isinstance(model_name, str) or not model_name.strip():
             raise TypeError(
                 "model_name must be a non-empty PyTRIO model name. For the "
@@ -70,6 +81,7 @@ class GRPOTrainer:
 
         self.model_name = model_name.strip()
         self.config = args or GRPOConfig()
+        self.eval_dataset = eval_dataset
 
         # 训练模型：先只写lora的吧，后续再增加全量的（暂定lora的意思，不要修改该注释）
         self._service_client = trio.ServiceClient()
@@ -79,77 +91,74 @@ class GRPOTrainer:
             rank=lora_rank,
             seed=self.config.seed,
         )
-        # 可能有格式要求？AI写的代码，后续检查格式具体形式（任务1:检查数据集格式）
         self.train_dataset = train_dataset
         self._tokenizer = self._training_client.get_tokenizer()
         if not callable(getattr(self._tokenizer, "encode", None)):
-            raise TypeError("PyTRIO TrainingClient tokenizer must provide a callable encode() method.")
-        # 多个reward结果按照权重相加，而不是直接全部固定1倍率
+            raise TypeError(
+                "PyTRIO TrainingClient tokenizer must provide a callable encode() method."
+            )
+        # Multiple rewards are combined with their configured coefficients.
         self.reward_evaluator = RewardEvaluator(
             reward_funcs,
             self.config.reward_weights,
             prompt_key=self.config.prompt_key,
         )
         self.state = TrainerState()
+        self._last_eval_step: int | None = None
         self._total_input_tokens = 0
-        self._metric_window: dict[str, tuple[float, int]] = {}
         self._decode = self._make_decode(self._tokenizer)
-        self._swanlab_run = self._init_swanlab_run(lora_rank)
+        self._metrics_api = self._init_metrics_api(lora_rank)
 
-    def _init_swanlab_run(self, lora_rank: int) -> Any | None:
-        if self.config.report_to is None:
-            return None
+    # ------------------------------------------------------------------
+    # Run reporting and final qualitative samples
+    # ------------------------------------------------------------------
+
+    def _init_metrics_api(self, lora_rank: int) -> MetricsAPI:
+        """Create the shared metric reporter with GRPO run metadata."""
+
         model_slug = self.model_name.rsplit("/", 1)[-1].replace("/", "-")
-        return start_run(
+        return MetricsAPI.from_config(
             self.config,
             default_name=f"{model_slug}-grpo",
             metadata={"model_name": self.model_name, "lora_rank": lora_rank},
+            logging_step=self.config.logging_step,
         )
 
     def _log_swanlab(self, result: GRPOResult) -> None:
-        if self._swanlab_run is None:
-            return
-        payload: dict[str, float] = {}
-        for key, value in result.metrics.items():
-            name = str(key)
-            if _is_per_prompt_metric(name) or _is_checkpoint_metric(name):
-                continue
-            number = float(value)
-            if math.isfinite(number):
-                payload[_swanlab_metric_name(name)] = number
-        payload.update(
+        """Accumulate batch metrics while omitting prompt-local diagnostics."""
+
+        self._metrics_api.record(
             {
+                **result.metrics,
                 "train/num_datums": float(result.num_datums),
                 "train/skipped_groups": float(result.skipped_groups),
-            }
+            },
+            step=result.step,
+            exclude=_is_per_prompt_metric,
         )
-        if not hasattr(self, "_metric_window"):
-            self._metric_window = {}
-        accumulate_metrics(self._metric_window, payload)
-        if result.step % self.config.logging_step == 0:
-            self._flush_swanlab(result.step)
 
     def _flush_swanlab(self, step: int) -> None:
-        if self._swanlab_run is None or not hasattr(self, "_metric_window"):
-            return
-        payload = averaged_metrics(self._metric_window)
-        self._metric_window.clear()
-        if payload:
-            self._swanlab_run.log({**payload, "train/step": float(step)}, step=step)
+        """Publish the current metric window and clear its accumulators."""
+
+        self._metrics_api.flush(step=step)
 
     def _log_final_checkpoint(self) -> None:
+        """Publish the final checkpoint URI when output logging is enabled."""
+
         if (
             self.config.output_dir
-            and self._swanlab_run is not None
+            and self._metrics_api.enabled
             and self.state.checkpoint_path is not None
         ):
-            self._swanlab_run.log_text(
+            self._metrics_api.log_text(
                 key="checkpoint/path",
                 data=self.state.checkpoint_path,
                 step=self.state.global_step,
             )
 
     def _report_final_state(self) -> None:
+        """Write a compact terminal and SwanLab summary of the final state."""
+
         summary = {
             key: self.state.metrics[key]
             for key in FINAL_SUMMARY_KEYS
@@ -161,14 +170,18 @@ class GRPOTrainer:
         ]
         for line in lines:
             tqdm.write(line)
-        if self._swanlab_run is not None:
-            self._swanlab_run.log_text(
+        if self._metrics_api.enabled:
+            self._metrics_api.log_text(
                 key="train/final_summary",
                 data="\n".join(lines),
                 step=self.state.global_step,
             )
 
-    def _log_training_summary(self, started: float, initial_step: int, initial_tokens: int) -> None:
+    def _log_training_summary(
+        self, started: float, initial_step: int, initial_tokens: int
+    ) -> None:
+        """Record throughput for work completed by this train invocation."""
+
         completed_steps = self.state.global_step - initial_step
         if completed_steps == 0:
             return
@@ -181,30 +194,50 @@ class GRPOTrainer:
             "train/total_input_tokens": float(input_tokens),
         }
         self.state.metrics.update(summary)
-        if self._swanlab_run is not None:
-            self._swanlab_run.log(summary, step=self.state.global_step)
+        self._metrics_api.publish(summary, step=self.state.global_step)
 
     @staticmethod
     def _sample_text(response: Any, decode: Callable[[list[int]], str]) -> str:
+        """Return sampler text, decoding tokens only when text is absent."""
+
         sequences = response.sequences
         if not sequences:
             raise ValueError("Final inference returned no sequences.")
         sequence = sequences[0]
         return sequence.text if sequence.text is not None else decode(sequence.tokens)
 
-    def _write_final_samples(self, groups: Sequence[GRPOBatch], responses: Sequence[Any]) -> None:
+    def _write_final_samples(
+        self, groups: Sequence[GRPOBatch], responses: Sequence[Any]
+    ) -> None:
+        """Decode and publish one qualitative completion per prompt."""
+
         texts = []
         for group, response in zip(groups, responses, strict=True):
             question = group.row.get("question")
             title = question if isinstance(question, str) and question else group.prompt
-            texts.append(swanlab.Text(self._sample_text(response, self._decode), caption=title))
-        self._swanlab_run.log_text(key="sample/text", data=texts, step=self.state.global_step)
+            texts.append(
+                swanlab.Text(
+                    self._sample_text(response, self._decode),
+                    caption=title,
+                )
+            )
+        self._metrics_api.log_text(
+            key="sample/text",
+            data=texts,
+            step=self.state.global_step,
+        )
 
     def _log_final_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
-        if self._swanlab_run is None or not rows:
+        """Generate a small synchronous sample table from final weights."""
+
+        if not self._metrics_api.enabled or not rows:
             return
         client = self._new_sampling_client()
-        params = sampling_params(self.config, trio.SamplingParams, stop=self._stop_sequences())
+        params = sampling_params(
+            self.config,
+            trio.SamplingParams,
+            stop=self._stop_sequences(),
+        )
         groups = self._groups(rows[:4])
         responses = [
             call(
@@ -218,11 +251,19 @@ class GRPOTrainer:
         ]
         self._write_final_samples(groups, responses)
 
-    async def _log_final_samples_async(self, rows: Sequence[Mapping[str, Any]]) -> None:
-        if self._swanlab_run is None or not rows:
+    async def _log_final_samples_async(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Generate final qualitative samples without blocking the event loop."""
+
+        if not self._metrics_api.enabled or not rows:
             return
         client = await self._new_sampling_client_async()
-        params = sampling_params(self.config, trio.SamplingParams, stop=self._stop_sequences())
+        params = sampling_params(
+            self.config,
+            trio.SamplingParams,
+            stop=self._stop_sequences(),
+        )
         groups = self._groups(rows[:4])
         responses = await asyncio.gather(
             *(
@@ -238,24 +279,39 @@ class GRPOTrainer:
         )
         self._write_final_samples(groups, responses)
 
-    def _finish_swanlab(self, state: str = "success", error: str | None = None) -> None:
-        if self._swanlab_run is None:
-            return
-        finish_run(self._swanlab_run, state=state, error=error)
-        self._swanlab_run = None
+    def _finish_swanlab(
+        self, state: str = "success", error: str | None = None
+    ) -> None:
+        """Finish the owned run once and release its handle."""
+
+        self._metrics_api.finish(state=state, error=error)
 
     @staticmethod
     def _make_decode(tokenizer: Any) -> Callable[[list[int]], str]:
-        # tokenizer.decode
+        """Capture the tokenizer's standard special-token-skipping decode."""
+
         return lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
+    # ------------------------------------------------------------------
+    # Sampling-client lifecycle and rollout preparation
+    # ------------------------------------------------------------------
+
     def _new_sampling_client(self) -> Any:
+        """Snapshot current training weights into a fresh behavior policy."""
+
         return call(self._training_client, "save_weights_and_get_sampling_client")
 
     async def _new_sampling_client_async(self) -> Any:
-        return await call_async(self._training_client, "save_weights_and_get_sampling_client")
+        """Asynchronously snapshot current weights into a behavior policy."""
+
+        return await call_async(
+            self._training_client,
+            "save_weights_and_get_sampling_client",
+        )
 
     def _stop_sequences(self) -> list[str] | None:
+        """Resolve model EOS markers without emitting duplicates."""
+
         if not self.config.stop:
             return None
         return list(
@@ -267,16 +323,19 @@ class GRPOTrainer:
         )
 
     def _groups(self, rows: Sequence[Mapping[str, Any]]) -> list[GRPOBatch]:
+        """Render input rows into prompt groups before remote sampling."""
+
         groups = []
         for index, row in enumerate(rows):
-            # 数据行默认使用 messages 字段，值可以是文本、token ID 或对话消息。
-            if self.config.prompt_key not in row:
-                raise KeyError(f"Dataset row {index} is missing {self.config.prompt_key!r}.")
-            rendered = render_prompt(
-                row[self.config.prompt_key],
+            # The dataset layer accepts text, token IDs, or chat messages and
+            # renders each prompt exactly once for rewards and model sampling.
+            rendered = prepare_prompt(
+                row,
                 self._tokenizer,
+                prompt_key=self.config.prompt_key,
                 add_generation_prompt=self.config.add_generation_prompt,
                 chat_template_kwargs=self.config.chat_template_kwargs,
+                row_index=index,
             )
             groups.append(
                 GRPOBatch(
@@ -291,7 +350,11 @@ class GRPOTrainer:
             )
         return groups
 
-    def _sample_groups(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
+    def _sample_groups(
+        self, groups: list[GRPOBatch], client: Any
+    ) -> list[GRPOBatch]:
+        """Sample every group with one immutable behavior-policy client."""
+
         # 同步生成一批 prompt 的 rollout，也就是为每个 prompt 采样多个回答
         adapter = SamplingAdapter(
             client,
@@ -301,7 +364,11 @@ class GRPOTrainer:
         )
         return [adapter.sample(group, self.config) for group in groups]
 
-    async def _sample_groups_async(self, groups: list[GRPOBatch], client: Any) -> list[GRPOBatch]:
+    async def _sample_groups_async(
+        self, groups: list[GRPOBatch], client: Any
+    ) -> list[GRPOBatch]:
+        """Asynchronously sample every group with one behavior-policy client."""
+
         adapter = SamplingAdapter(
             client,
             params_factory=trio.SamplingParams,
@@ -314,7 +381,17 @@ class GRPOTrainer:
             )
         )
 
-    def _build_datums(self, groups: Sequence[GRPOBatch], reward_groups: Sequence[Sequence[float]]) -> tuple[list[Any], int, dict[str, float]]:
+    # ------------------------------------------------------------------
+    # Advantage alignment and remote policy update
+    # ------------------------------------------------------------------
+
+    def _build_datums(
+        self,
+        groups: Sequence[GRPOBatch],
+        reward_groups: Sequence[Sequence[float]],
+    ) -> tuple[list[Any], int, dict[str, float]]:
+        """Center rewards and align accepted completions to PyTRIO datums."""
+
         # 将输入转换成Datum格式
         datums: list[Any] = []
         skipped = 0
@@ -336,7 +413,12 @@ class GRPOTrainer:
             )
             if self.config.scale_rewards == "batch":
                 advantages = [value / batch_denominator for value in advantages]
-            metrics.update({f"{group.prompt_id}/{key}": value for key, value in group_metrics.items()})
+            metrics.update(
+                {
+                    f"{group.prompt_id}/{key}": value
+                    for key, value in group_metrics.items()
+                }
+            )
             if self.config.skip_zero_advantage and all(value == 0.0 for value in advantages):
                 skipped += 1
                 continue
@@ -358,6 +440,8 @@ class GRPOTrainer:
         forward_result: Any,
         optimizer_result: Any,
     ) -> dict[str, float]:
+        """Normalize backend metrics and estimate sampled train-policy drift."""
+
         metrics: dict[str, float] = {"optim/lr": self.config.learning_rate}
         for value in (forward_result, optimizer_result):
             raw = getattr(value, "metrics", None) if value is not None else None
@@ -384,6 +468,8 @@ class GRPOTrainer:
         return metrics
 
     def _train_datums(self, datums: list[Any]) -> dict[str, float]:
+        """Run failure-safe synchronous forward/backward then optimizer."""
+
         if not datums:
             return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
         # Wait for forward/backward before submitting the optimizer. If the
@@ -392,9 +478,15 @@ class GRPOTrainer:
         forward_method = getattr(self._training_client, "forward_backward", None)
         optim_method = getattr(self._training_client, "optim_step", None)
         if forward_method is None or optim_method is None:
-            raise AttributeError("PyTRIO training_client needs forward_backward() and optim_step().")
+            raise AttributeError(
+                "PyTRIO training_client needs forward_backward() and optim_step()."
+            )
         forward_started = time.perf_counter()
-        forward_future = forward_method(datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
+        forward_future = forward_method(
+            datums,
+            loss_fn=self.config.loss_fn,
+            loss_fn_config=self.config.loss_fn_config,
+        )
         forward = wait(forward_future)
         forward_time = time.perf_counter() - forward_started
         optim_started = time.perf_counter()
@@ -406,16 +498,28 @@ class GRPOTrainer:
         return metrics
 
     async def _train_datums_async(self, datums: list[Any]) -> dict[str, float]:
+        """Run failure-safe asynchronous forward/backward then optimizer."""
+
         if not datums:
             return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
         forward_started = time.perf_counter()
-        forward = await submit_async(self._training_client, "forward_backward", datums, loss_fn=self.config.loss_fn, loss_fn_config=self.config.loss_fn_config)
+        forward = await submit_async(
+            self._training_client,
+            "forward_backward",
+            datums,
+            loss_fn=self.config.loss_fn,
+            loss_fn_config=self.config.loss_fn_config,
+        )
         # Do not submit optim_step until forward/backward has completed
         # successfully; this keeps the optimizer boundary failure-safe.
         forward_result = await wait_async(forward)
         forward_time = time.perf_counter() - forward_started
         optim_started = time.perf_counter()
-        optim = await submit_async(self._training_client, "optim_step", optimizer_params(self.config, trio.AdamParams))
+        optim = await submit_async(
+            self._training_client,
+            "optim_step",
+            optimizer_params(self.config, trio.AdamParams),
+        )
         optim_result = await wait_async(optim)
         optim_time = time.perf_counter() - optim_started
         metrics = self._training_metrics(datums, forward_result, optim_result)
@@ -425,6 +529,8 @@ class GRPOTrainer:
 
     @staticmethod
     def _progress_postfix(result: GRPOResult) -> dict[str, str]:
+        """Select compact scalars for the terminal progress bar."""
+
         keys = {
             "loss": "train/loss",
             "reward": "reward/mean",
@@ -439,6 +545,8 @@ class GRPOTrainer:
         }
 
     def _save_state(self, *, final: bool = False) -> str | None:
+        """Save at the configured interval or when finalization requests it."""
+
         if self.config.save_every == 0 or (
             not final and self.state.global_step % self.config.save_every != 0
         ):
@@ -448,16 +556,23 @@ class GRPOTrainer:
         return path
 
     async def _save_state_async(self, *, final: bool = False) -> str | None:
+        """Asynchronous counterpart to :meth:`_save_state`."""
+
         if self.config.save_every == 0 or (
             not final and self.state.global_step % self.config.save_every != 0
         ):
             return None
-        path = await save_checkpoint_async(self._training_client, "grpo", self.state.global_step)
+        path = await save_checkpoint_async(
+            self._training_client,
+            "grpo",
+            self.state.global_step,
+        )
         self.state.checkpoint_path = path
         return path
 
     def step(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
-        # 执行一次完整的GRPO训练step
+        """Run rollout, reward, advantage alignment and one optimizer update."""
+
         step_started = time.perf_counter()
         groups = self._groups(rows)
         prompt_prepare_time = time.perf_counter() - step_started
@@ -510,12 +625,17 @@ class GRPOTrainer:
         return result
 
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> GRPOResult:
+        """Asynchronous counterpart to :meth:`step`."""
+
         step_started = time.perf_counter()
         groups = self._groups(rows)
         prompt_prepare_time = time.perf_counter() - step_started
 
         rollout_started = time.perf_counter()
-        sampled = await self._sample_groups_async(groups, await self._new_sampling_client_async())
+        sampled = await self._sample_groups_async(
+            groups,
+            await self._new_sampling_client_async(),
+        )
         rollout_time = time.perf_counter() - rollout_started
 
         reward_started = time.perf_counter()
@@ -561,10 +681,139 @@ class GRPOTrainer:
         self._log_swanlab(result)
         return result
 
+    # ------------------------------------------------------------------
+    # Validation: rollout and reward only, never backward
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _evaluation_metrics(
+        groups: Sequence[GRPOBatch],
+        reward_groups: Sequence[Sequence[float]],
+        reward_metrics: Mapping[str, float],
+    ) -> dict[str, float]:
+        """Reduce rollout rewards and lengths without constructing training datums."""
+
+        rewards = [reward for values in reward_groups for reward in values]
+        samples = [sample for group in groups for sample in group.samples]
+        if not rewards or len(rewards) != len(samples):
+            raise ValueError("GRPO validation rewards must align with sampled completions.")
+        lengths = [len(sample.tokens) for sample in samples]
+        logprobs = [value for sample in samples for value in sample.logprobs]
+        metrics = {
+            "eval/reward": sum(rewards) / len(rewards),
+            "eval/prompts": float(len(groups)),
+            "eval/completions": float(len(samples)),
+            "eval/completion_length": sum(lengths) / len(lengths),
+        }
+        if logprobs:
+            metrics["eval/entropy"] = -sum(logprobs) / len(logprobs)
+        metrics.update(
+            {
+                "eval/" + name: value
+                for name, value in reward_metrics.items()
+            }
+        )
+        return metrics
+
+    def _evaluation_batches(
+        self, dataset: Iterable[Mapping[str, Any]]
+    ) -> Iterable[list[Mapping[str, Any]]]:
+        """Yield prompt batches using GRPO evaluation limits."""
+
+        config = self.config
+        batch_size = config.eval_batch_size or config.batch_size
+        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
+
+    def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Store and report GRPO rollout metrics at the current policy step."""
+
+        values = {str(name): float(value) for name, value in metrics.items()}
+        self._last_eval_step = self.state.global_step
+        self.state.metrics.update(values)
+        self._metrics_api.publish(values, step=self.state.global_step)
+        return values
+
+    def evaluate(
+        self,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, float]:
+        """Sample the current policy and score validation prompts without training."""
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("eval_dataset is required for evaluate().")
+        client = self._new_sampling_client()
+        totals: dict[str, float] = {}
+        prompts_total = 0
+        for rows in self._evaluation_batches(dataset):
+            groups = self._sample_groups(self._groups(rows), client)
+            rewards, reward_metrics = self.reward_evaluator.score(groups)
+            metrics = self._evaluation_metrics(groups, rewards, reward_metrics)
+            count = len(groups)
+            for name, value in metrics.items():
+                if name not in {"eval/prompts", "eval/completions"}:
+                    totals[name] = totals.get(name, 0.0) + value * count
+            totals["eval/completions"] = totals.get("eval/completions", 0.0) + metrics[
+                "eval/completions"
+            ]
+            prompts_total += count
+        if prompts_total == 0:
+            raise ValueError("eval_dataset must contain at least one prompt.")
+        metrics = {
+            name: value / prompts_total
+            for name, value in totals.items()
+            if name != "eval/completions"
+        }
+        metrics["eval/prompts"] = float(prompts_total)
+        metrics["eval/completions"] = totals["eval/completions"]
+        return self._publish_evaluation(metrics)
+
+    async def evaluate_async(
+        self,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, float]:
+        """Asynchronous counterpart to :meth:`evaluate`."""
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("eval_dataset is required for evaluate_async().")
+        client = await self._new_sampling_client_async()
+        totals: dict[str, float] = {}
+        prompts_total = 0
+        for rows in self._evaluation_batches(dataset):
+            groups = await self._sample_groups_async(self._groups(rows), client)
+            rewards, reward_metrics = await self.reward_evaluator.score_async(groups)
+            metrics = self._evaluation_metrics(groups, rewards, reward_metrics)
+            count = len(groups)
+            for name, value in metrics.items():
+                if name not in {"eval/prompts", "eval/completions"}:
+                    totals[name] = totals.get(name, 0.0) + value * count
+            totals["eval/completions"] = totals.get("eval/completions", 0.0) + metrics[
+                "eval/completions"
+            ]
+            prompts_total += count
+        if prompts_total == 0:
+            raise ValueError("eval_dataset must contain at least one prompt.")
+        metrics = {
+            name: value / prompts_total
+            for name, value in totals.items()
+            if name != "eval/completions"
+        }
+        metrics["eval/prompts"] = float(prompts_total)
+        metrics["eval/completions"] = totals["eval/completions"]
+        return self._publish_evaluation(metrics)
+
+    # ------------------------------------------------------------------
+    # Full dataset training
+    # ------------------------------------------------------------------
+
     def train(self) -> TrainerState:
+        """Consume one dataset pass through the synchronous training path."""
+
         started = time.perf_counter()
         initial_step = self.state.global_step
         initial_tokens = self._total_input_tokens
+        eval_dataset = getattr(self, "eval_dataset", None)
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -574,18 +823,47 @@ class GRPOTrainer:
         try:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train().")
-            iterator = iter(self.train_dataset)
+            if (
+                eval_dataset is not None
+                and self.config.eval_before_train
+                and getattr(self, "_last_eval_step", None) is None
+            ):
+                self.evaluate()
+            batches = iter_batches(self.train_dataset, self.config.batch_size)
             last_rows: list[Mapping[str, Any]] = []
-            while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
-                rows = list(itertools.islice(iterator, self.config.batch_size))
+            while (
+                self.config.max_steps is None
+                or self.state.global_step < self.config.max_steps
+            ):
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = self.step(rows)
                 last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
-            if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
+                if (
+                    eval_dataset is not None
+                    and self.config.eval_steps > 0
+                    and self.state.global_step
+                    % self.config.eval_steps
+                    == 0
+                    and getattr(self, "_last_eval_step", None)
+                    != self.state.global_step
+                ):
+                    self.evaluate()
+            if (
+                last_rows
+                and self.config.save_every
+                and self.state.global_step % self.config.save_every
+            ):
                 self._save_state(final=True)
+            if (
+                eval_dataset is not None
+                and self.config.eval_after_train
+                and getattr(self, "_last_eval_step", None) != self.state.global_step
+            ):
+                self.evaluate()
             self._flush_swanlab(self.state.global_step)
             self._log_training_summary(started, initial_step, initial_tokens)
             self._report_final_state()
@@ -601,9 +879,12 @@ class GRPOTrainer:
         return self.state
 
     async def train_async(self) -> TrainerState:
+        """Consume one dataset pass through the asynchronous training path."""
+
         started = time.perf_counter()
         initial_step = self.state.global_step
         initial_tokens = self._total_input_tokens
+        eval_dataset = getattr(self, "eval_dataset", None)
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -613,18 +894,47 @@ class GRPOTrainer:
         try:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
-            iterator = iter(self.train_dataset)
+            if (
+                eval_dataset is not None
+                and self.config.eval_before_train
+                and getattr(self, "_last_eval_step", None) is None
+            ):
+                await self.evaluate_async()
+            batches = iter_batches(self.train_dataset, self.config.batch_size)
             last_rows: list[Mapping[str, Any]] = []
-            while self.config.max_steps is None or self.state.global_step < self.config.max_steps:
-                rows = list(itertools.islice(iterator, self.config.batch_size))
+            while (
+                self.config.max_steps is None
+                or self.state.global_step < self.config.max_steps
+            ):
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = await self.step_async(rows)
                 last_rows = rows
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
-            if last_rows and self.config.save_every and self.state.global_step % self.config.save_every:
+                if (
+                    eval_dataset is not None
+                    and self.config.eval_steps > 0
+                    and self.state.global_step
+                    % self.config.eval_steps
+                    == 0
+                    and getattr(self, "_last_eval_step", None)
+                    != self.state.global_step
+                ):
+                    await self.evaluate_async()
+            if (
+                last_rows
+                and self.config.save_every
+                and self.state.global_step % self.config.save_every
+            ):
                 await self._save_state_async(final=True)
+            if (
+                eval_dataset is not None
+                and self.config.eval_after_train
+                and getattr(self, "_last_eval_step", None) != self.state.global_step
+            ):
+                await self.evaluate_async()
             self._flush_swanlab(self.state.global_step)
             self._log_training_summary(started, initial_step, initial_tokens)
             self._report_final_state()

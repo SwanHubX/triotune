@@ -1,11 +1,9 @@
-"""Framework-agnostic PyTRIO client helpers.
+"""Cross-cutting implementations shared by trainer algorithms."""
 
-Only utilities that can be reused by more than one training algorithm belong
-here.  Algorithm contracts and GRPO data structures remain under
-``trio-cookbook.trainer``.
-"""
+import sys
 
-from .client import (
+from ..api import client_api as client
+from ..api.client_api import (
     call,
     call_async,
     optimizer_params,
@@ -15,12 +13,30 @@ from .client import (
     wait,
     wait_async,
 )
+from .checkpoint import checkpoint_path, save_checkpoint, save_checkpoint_async
+from .dataloader import iter_batches
+from .datums import causal_datum, materialize_datum
+from .metrics import MetricsAPI, metric_name, normalize_metrics
+
+# ``trio_cookbook.utils.client`` was public before client contracts moved into
+# ``api``. Keep that import path without duplicating its implementation here.
+sys.modules[f"{__name__}.client"] = client
 
 __all__ = [
+    "MetricsAPI",
     "call",
     "call_async",
+    "checkpoint_path",
+    "client",
+    "causal_datum",
+    "iter_batches",
+    "materialize_datum",
+    "metric_name",
+    "normalize_metrics",
     "optimizer_params",
     "sampling_params",
+    "save_checkpoint",
+    "save_checkpoint_async",
     "sdk_object",
     "submit_async",
     "wait",

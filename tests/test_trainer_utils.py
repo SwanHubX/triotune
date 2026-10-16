@@ -1,21 +1,24 @@
-"""Shared support must preserve metric windows and SDK future handling."""
+"""Cross-cutting trainer utilities preserve metrics and checkpoint behavior."""
 
 import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from trio_cookbook.trainer.common.checkpoint import (
+from trio_cookbook.utils.checkpoint import (
     checkpoint_path,
     save_checkpoint,
     save_checkpoint_async,
 )
-from trio_cookbook.trainer.common.logging import (
+from trio_cookbook.utils.dataloader import iter_batches
+from trio_cookbook.utils.datums import causal_datum, materialize_datum
+from trio_cookbook.utils.metrics import (
     accumulate_metrics,
     averaged_metrics,
     finish_run,
     start_run,
 )
+from trio_cookbook.utils.metrics import MetricsAPI, normalize_metrics
 from trio_cookbook.trainer.grpo import GRPOConfig
 
 
@@ -32,8 +35,13 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(averaged_metrics(window), {"loss": 10.0})
 
     def test_run_initialization_retains_config_and_metadata(self):
-        args = GRPOConfig(run_name="custom", tags=["grpo"], workspace="team")
-        with patch("trio_cookbook.trainer.common.logging.swanlab.init") as init:
+        args = GRPOConfig(
+            report_to="swanlab",
+            run_name="custom",
+            tags=["grpo"],
+            workspace="team",
+        )
+        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
             self.assertIs(start_run(args, default_name="fallback", metadata={"model": "test"}), init.return_value)
         self.assertEqual(init.call_args.kwargs["name"], "custom")
         self.assertEqual(init.call_args.kwargs["workspace"], "team")
@@ -46,6 +54,121 @@ class LoggingTests(unittest.TestCase):
         run = Mock()
         finish_run(run, state="crashed", error="remote failure")
         run.finish.assert_called_once_with(state="crashed", error="remote failure")
+
+    def test_metrics_api_normalizes_and_averages_arbitrary_metrics(self):
+        run = Mock()
+        api = MetricsAPI(run, logging_step=2)
+
+        api.record(
+            {
+                "loss_mean": 2.0,
+                "optim/lr": 1e-5,
+                "reward/score": 0.5,
+                "ignored": float("nan"),
+                "flag": True,
+            },
+            step=1,
+        )
+        api.record(
+            {"loss_mean": 4.0, "reward/score": 1.5},
+            step=2,
+        )
+
+        run.log.assert_called_once_with(
+            {
+                "train/loss_mean": 3.0,
+                "train/learning_rate": 1e-5,
+                "reward/score": 1.0,
+                "train/step": 2.0,
+            },
+            step=2,
+        )
+
+    def test_metrics_api_publishes_eval_and_finishes_once(self):
+        run = Mock()
+        api = MetricsAPI(run)
+
+        self.assertEqual(
+            api.publish({"eval/loss": 0.25}, step=3),
+            {"eval/loss": 0.25},
+        )
+        api.log_text(key="checkpoint/path", data="trio://saved", step=3)
+        api.finish()
+        api.finish()
+
+        run.log.assert_called_once_with(
+            {"eval/loss": 0.25, "train/step": 3.0},
+            step=3,
+        )
+        run.log_text.assert_called_once_with(
+            key="checkpoint/path",
+            data="trio://saved",
+            step=3,
+        )
+        run.finish.assert_called_once_with(state="success", error=None)
+
+    def test_normalize_metrics_supports_algorithm_namespaces(self):
+        self.assertEqual(
+            normalize_metrics(
+                {
+                    "train/loss": 1,
+                    "eval/loss": 2,
+                    "policy/entropy": 3,
+                    "distill/reverse_kl": 4,
+                    "grad_norm": 5,
+                    "text": "not-a-scalar",
+                }
+            ),
+            {
+                "train/loss": 1.0,
+                "eval/loss": 2.0,
+                "policy/entropy": 3.0,
+                "distill/reverse_kl": 4.0,
+                "train/grad_norm": 5.0,
+            },
+        )
+
+    def test_iter_batches_is_lazy_and_limits_validation_batches(self):
+        rows = (index for index in range(5))
+        self.assertEqual(list(iter_batches(rows, 2)), [[0, 1], [2, 3], [4]])
+        self.assertEqual(
+            list(iter_batches(range(10), 3, max_batches=2)),
+            [[0, 1, 2], [3, 4, 5]],
+        )
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            list(iter_batches([], 0))
+
+    def test_generic_datum_helpers_preserve_algorithm_loss_inputs(self):
+        calls = []
+
+        def model_input(tokens):
+            calls.append(("model", list(tokens)))
+            return ("model", list(tokens))
+
+        def datum_factory(*, model_input, loss_fn_inputs):
+            calls.append(("datum", model_input, loss_fn_inputs))
+            return {"model_input": model_input, "loss_fn_inputs": loss_fn_inputs}
+
+        datum = causal_datum(
+            [10, 11, 12],
+            [-100, 12],
+            model_input_factory=model_input,
+            datum_factory=datum_factory,
+        )
+        self.assertEqual(datum["model_input"], ("model", [10, 11]))
+        self.assertEqual(datum["loss_fn_inputs"], {"target_tokens": [-100, 12]})
+        self.assertEqual(calls[0], ("model", [10, 11]))
+
+        generic = materialize_datum(
+            [1, 2],
+            {"target_tokens": [2], "advantages": [0.5]},
+            model_input_factory=model_input,
+            datum_factory=datum_factory,
+        )
+        self.assertEqual(
+            generic["loss_fn_inputs"],
+            {"target_tokens": [2], "advantages": [0.5]},
+        )
 
 
 class CheckpointTests(unittest.TestCase):
