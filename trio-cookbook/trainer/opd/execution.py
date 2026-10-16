@@ -105,6 +105,7 @@ class OPDExecutionPlan:
         loss = SampledReverseKLLoss(
             coefficient=config.kl_coef,
             discount_factor=config.discount_factor,
+            importance_ratio_cap=config.importance_ratio_cap,
         )
         return cls(
             rollout_phase=OPDRolloutPhase(),

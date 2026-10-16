@@ -117,6 +117,7 @@ class _Training:
         self.fail_forward = False
         self.fail_optim = False
         self.block_forward = False
+        self.forward_kwargs = None
 
     def get_tokenizer(self):
         return _Tokenizer()
@@ -130,7 +131,7 @@ class _Training:
     async def forward_backward_async(self, datums, **kwargs):
         self.events.append("forward")
         self.datums = datums
-        assert kwargs == {"loss_fn": "importance_sampling", "auto_shift": False}
+        self.forward_kwargs = kwargs
         if self.block_forward:
             self.service.forward_started.set()
             await asyncio.Event().wait()
@@ -263,6 +264,8 @@ class OPDConfigTests(unittest.TestCase):
             {"max_concurrent_scoring": 1.5}, {"max_completion_length": 0},
             {"kl_coef": math.nan}, {"kl_coef": 0}, {"discount_factor": 1.1},
             {"discount_factor": math.inf}, {"beta2": 1}, {"learning_rate": 0},
+            {"importance_ratio_cap": 0}, {"importance_ratio_cap": math.nan},
+            {"importance_ratio_cap": True},
             {"eps": -1}, {"save_every": -1}, {"logging_step": 0}, {"seed": -1},
             {"prompt_key": ""}, {"project": ""}, {"stop": []}, {"stop": "END"},
             {"report_to": "other"}, {"chat_template_kwargs": {"tokenize": True}},
@@ -328,7 +331,28 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(result.metrics["distill/reverse_kl_sampled"], -0.25)
         self.assertEqual(result.metrics["train/loss"], 0.3)
         self.assertEqual(result.metrics["train/loss"], result.metrics["loss_mean"])
+        self.assertEqual(result.metrics["policy/importance_ratio_cap"], 5.0)
+        self.assertEqual(
+            self.service.training.forward_kwargs,
+            {
+                "loss_fn": "cispo",
+                "auto_shift": False,
+                "loss_fn_config": {
+                    "clip_low_threshold": 0.0,
+                    "clip_high_threshold": 5.0,
+                },
+            },
+        )
         self.assertEqual(self.service.training.events, ["snapshot", "forward", "optim"])
+
+    def test_none_ratio_cap_uses_unbounded_importance_sampling(self):
+        result = self.trainer(importance_ratio_cap=None).step([{"messages": "P"}])
+
+        self.assertEqual(
+            self.service.training.forward_kwargs,
+            {"loss_fn": "importance_sampling", "auto_shift": False},
+        )
+        self.assertNotIn("policy/importance_ratio_cap", result.metrics)
 
     def test_validation_scores_student_and_teacher_without_optimizer(self):
         trainer = self.trainer()

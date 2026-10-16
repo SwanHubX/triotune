@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ...api.loss_api import BuiltinPyTrioObjective, LossSpec, Objective
 from .contracts import validate_logprobs
-
 
 # ---------------------------------------------------------------------------
 # Token-level sampled reverse-KL signal
@@ -82,18 +81,14 @@ class SampledReverseKLLoss:
 
     Replacing this object inside :class:`OPDExecutionPlan` is the intended
     research extension point for another token-credit rule or compatible
-    policy surrogate.  The default remains un-clipped importance sampling.
+    policy surrogate. The default uses a one-sided detached importance-ratio
+    cap matching AReaL's score-function carrier; ``None`` selects unbounded IS.
     """
 
     coefficient: float = 1.0
     discount_factor: float = 0.0
-    objective: Objective = field(
-        # PyTRIO computes the current/behavior likelihood ratio remotely. The
-        # local module supplies behavior logprobs and detached token advantages.
-        default_factory=lambda: BuiltinPyTrioObjective(
-            LossSpec("importance_sampling")
-        )
-    )
+    objective: Objective | None = None
+    importance_ratio_cap: float | None = 5.0
 
     def __post_init__(self) -> None:
         # Validate the scalars once when the execution plan is bound.  Use a
@@ -104,6 +99,32 @@ class SampledReverseKLLoss:
             coef=self.coefficient,
             discount=self.discount_factor,
         )
+        if self.importance_ratio_cap is not None:
+            if (
+                isinstance(self.importance_ratio_cap, bool)
+                or not isinstance(self.importance_ratio_cap, (int, float))
+                or not math.isfinite(float(self.importance_ratio_cap))
+                or self.importance_ratio_cap <= 0
+            ):
+                raise ValueError(
+                    "importance_ratio_cap must be finite and positive or None."
+                )
+
+        if self.objective is None:
+            if self.importance_ratio_cap is None:
+                spec = LossSpec("importance_sampling")
+            else:
+                # CISPO applies detach(clamp(exp(current - behavior), 0, cap))
+                # as the coefficient on current logprob. This bounds the update
+                # without zeroing the score-function gradient above the cap.
+                spec = LossSpec(
+                    "cispo",
+                    {
+                        "clip_low_threshold": 0.0,
+                        "clip_high_threshold": float(self.importance_ratio_cap),
+                    },
+                )
+            object.__setattr__(self, "objective", BuiltinPyTrioObjective(spec))
         if not callable(getattr(self.objective, "forward_backward_async", None)):
             raise TypeError("objective must implement forward_backward_async().")
 

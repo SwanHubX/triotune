@@ -51,17 +51,43 @@ class _TeacherPhase:
 
 class OPDModuleTests(unittest.TestCase):
     def test_default_plan_binds_loss_configuration_once(self):
-        config = OPDConfig(kl_coef=2.0, discount_factor=0.5)
+        config = OPDConfig(
+            kl_coef=2.0,
+            discount_factor=0.5,
+            importance_ratio_cap=2.5,
+        )
         plan = OPDExecutionPlan.from_config(config)
 
         self.assertEqual(plan.target_builder.loss.coefficient, 2.0)
         self.assertEqual(plan.target_builder.loss.discount_factor, 0.5)
-        self.assertEqual(plan.objective.request_kwargs(), {
-            "loss_fn": "importance_sampling",
-            "auto_shift": False,
-        })
+        self.assertEqual(
+            plan.objective.request_kwargs(),
+            {
+                "loss_fn": "cispo",
+                "auto_shift": False,
+                "loss_fn_config": {
+                    "clip_low_threshold": 0.0,
+                    "clip_high_threshold": 2.5,
+                },
+            },
+        )
         config.kl_coef = 9.0
+        config.importance_ratio_cap = None
         self.assertEqual(plan.target_builder.loss.coefficient, 2.0)
+        self.assertEqual(plan.target_builder.loss.importance_ratio_cap, 2.5)
+
+    def test_none_ratio_cap_restores_unbounded_importance_sampling(self):
+        plan = OPDExecutionPlan.from_config(
+            OPDConfig(importance_ratio_cap=None)
+        )
+
+        self.assertEqual(
+            plan.objective.request_kwargs(),
+            {"loss_fn": "importance_sampling", "auto_shift": False},
+        )
+        for cap in (0, -1, float("nan"), True):
+            with self.subTest(cap=cap), self.assertRaises(ValueError):
+                SampledReverseKLLoss(importance_ratio_cap=cap)
 
     def test_custom_phases_run_in_stable_order_with_default_target(self):
         rollout = _RolloutPhase()

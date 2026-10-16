@@ -599,6 +599,9 @@ class OPDConfig(_StepLoggingConfig):
             Reverse-KL signal coefficient.
         discount_factor (`float`, defaults to `0.0`):
             Future-signal discount.
+        importance_ratio_cap (`float` or `None`, defaults to `5.0`):
+            One-sided upper bound for the detached current/behavior importance
+            ratio. ``None`` restores unbounded importance sampling.
         prompt_key (`str`, defaults to `"messages"`):
             Dataset prompt column.
         add_generation_prompt (`bool`, defaults to `True`):
@@ -622,6 +625,7 @@ class OPDConfig(_StepLoggingConfig):
     # Sampled reverse-KL signal and temporal credit assignment.
     kl_coef: float = 1.0
     discount_factor: float = 0.0
+    importance_ratio_cap: float | None = 5.0
     # Prompt rendering and generation termination.
     prompt_key: str = "messages"
     add_generation_prompt: bool = True
@@ -650,6 +654,8 @@ class OPDConfig(_StepLoggingConfig):
             self._integer("seed", minimum=0)
         self._positive("kl_coef")
         self._unit_interval("discount_factor", include_zero=True)
+        if self.importance_ratio_cap is not None:
+            self._positive("importance_ratio_cap")
         self._non_empty_string("prompt_key")
         if not isinstance(self.add_generation_prompt, bool):
             raise ValueError("add_generation_prompt must be boolean.")

@@ -394,6 +394,10 @@ class OPDTrainer:
                 "time/optim": update.optimizer_seconds,
             }
         )
+        if self.args.importance_ratio_cap is not None:
+            metrics["policy/importance_ratio_cap"] = float(
+                self.args.importance_ratio_cap
+            )
         checkpoint_path = None
         save_started = time.perf_counter()
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:

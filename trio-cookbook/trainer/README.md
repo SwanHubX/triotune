@@ -69,7 +69,7 @@ trio_cookbook/
 | [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
 | [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target、loss 与 metric 阶段。 |
 | [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；路由组内的固定 teacher 给同一 token 序列评分，并聚合为加权几何 ensemble。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
-| [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO `importance_sampling` 所需的 next-token 对齐字段。 |
+| [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
 | [OPD contracts](./opd/contracts.py)、[metrics](./opd/metrics.py) | 隔离 SDK response、校验阶段间数据，并以 completion token 为分母归约蒸馏指标；验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
 
 ```text
@@ -258,7 +258,7 @@ student rollout
   → weighted geometric teacher ensemble
   → sampled reverse-KL token advantage
   → prompt-masked PyTRIO policy Datum
-  → importance_sampling forward/backward
+  → CISPO capped-importance-ratio forward/backward
   → optimizer step
 ```
 
@@ -293,6 +293,11 @@ trainer = OPDTrainer(
 group 权重保持未归一化：loss 使用
 `Σj wj log p_teacher_j - (Σj wj) log p_behavior`，而 teacher logprob 指标使用
 归一化后的加权均值，便于比较不同权重规模的实验。
+
+`OPDConfig.importance_ratio_cap` 默认为 `5.0`。它通过 CISPO 使用
+`detach(clamp(exp(log p_current - log p_behavior), 0, cap))` 作为
+score-function 系数；设为 `None` 可恢复原来的 unbounded
+`importance_sampling`，用于兼容或消融实验。
 
 研究代码也可以只替换一个执行阶段：
 
