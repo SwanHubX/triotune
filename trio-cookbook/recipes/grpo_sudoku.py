@@ -47,7 +47,6 @@ import swanlab
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
-
 LOSS_FNS = ("importance_sampling", "ppo")
 ANSWER_PATTERN = re.compile(
     r"^<think>[\s\S]*?</think>\s*<answer>([\s\S]*?)</answer>$"
@@ -567,7 +566,7 @@ def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Da
 
     observation_len = len(prompt_tokens) - 1
     input_tokens = prompt_tokens + sample.tokens[:-1]
-    target_tokens = [0] * observation_len + sample.tokens
+    target_tokens = [-100] * observation_len + sample.tokens
     old_logprobs = [0.0] * observation_len + sample.logprobs
     advantages = [0.0] * observation_len + [sample.advantage] * len(sample.tokens)
     if not len(input_tokens) == len(target_tokens) == len(old_logprobs) == len(advantages):

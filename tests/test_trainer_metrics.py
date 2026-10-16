@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
-from trio_cookbook.trainer import GRPOBatch, GRPOConfig, GRPOResult, GRPOTrainer, SequenceSample, TrainerState
-from trio_cookbook.utils.metrics import MetricsAPI
+from trio_cookbook.api.loss_api import PolicyLossInput
+from trio_cookbook.trainer import (
+    GRPOBatch,
+    GRPOConfig,
+    GRPOResult,
+    GRPOTrainer,
+    SequenceSample,
+    TrainerState,
+)
 from trio_cookbook.trainer.grpo.metrics import _rollout_metrics
+from trio_cookbook.utils.metrics import MetricsAPI
 
 
 class TrainerMetricsTests(unittest.TestCase):
@@ -154,7 +162,16 @@ class TrainerMetricsTests(unittest.TestCase):
                 return self.optim_step(params)
 
         trainer._training_client = Client()
-        for metrics in (trainer._train_datums([object()]), asyncio.run(trainer._train_datums_async([object()]))):
+        datum = PolicyLossInput(
+            model_tokens=[1],
+            target_tokens=[2],
+            behavior_logprobs=[-0.5],
+            advantages=[1.0],
+        ).to_datum()
+        for metrics in (
+            trainer._train_datums([datum]),
+            asyncio.run(trainer._train_datums_async([datum])),
+        ):
             self.assertEqual(metrics["train/loss"], 0.5)
             self.assertGreaterEqual(metrics["time/forward_backward"], 0)
             self.assertGreaterEqual(metrics["time/optim"], 0)

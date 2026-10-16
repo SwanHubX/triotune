@@ -21,9 +21,9 @@ advantage 都保持一致；rollout、Datum 对齐、远端 forward/backward、�
         --seed 42 \
         --swanlab-mode online
 
-当前 cookbook 的 GRPOConfig 只支持 ``importance_sampling``；这也是
-独立版 recipe 的默认训练方式。LoRA 权重会由 GRPOTrainer 按
-``save-every`` 配置保存。
+当前 recipe 沿用 ``importance_sampling`` 默认值；GRPOConfig 还支持
+``ppo``、``cispo`` 和 ``dro``。LoRA 权重会由 GRPOTrainer 按 ``save-every``
+配置保存。
 """
 
 from __future__ import annotations
@@ -40,9 +40,8 @@ from typing import Any
 import pytrio as trio
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
-
-from trio_cookbook.trainer.grpo import GRPOBatch, GRPOConfig as BaseGRPOConfig, GRPOResult, GRPOTrainer
-
+from trio_cookbook.trainer.grpo import GRPOBatch, GRPOResult, GRPOTrainer
+from trio_cookbook.trainer.grpo import GRPOConfig as BaseGRPOConfig
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_FILE = REPOSITORY_ROOT / "tests" / "sudoku_4x4_qa.jsonl"

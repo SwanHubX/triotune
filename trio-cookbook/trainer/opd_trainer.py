@@ -17,10 +17,12 @@ from tqdm import tqdm
 
 from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
+from ..api.loss_api import BuiltinPyTrioObjective, LossSpec
 from ..dataset import PromptExample, prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.updates import run_update_async
 from .opd.distillation import (
     _ScoredCompletion,
     build_opd_datum,
@@ -79,6 +81,9 @@ class OPDTrainer:
         self.teacher_model = teacher_model.strip()
         self.teacher_model_path = teacher_model_path
         self.args = args or OPDConfig()
+        self._objective = BuiltinPyTrioObjective(
+            LossSpec("importance_sampling")
+        )
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.state = OPDState()
@@ -361,21 +366,12 @@ class OPDTrainer:
         # A failed/cancelled backward can leave partial remote gradients. Keep
         # the trainer unusable until both backward and optimizer have succeeded.
         self._requires_restart = True
-        forward = await call_async(
+        update = await run_update_async(
             self._training_client,
-            "forward_backward",
+            self._objective,
             datums,
-            loss_fn="importance_sampling",
-            auto_shift=False,
-        )
-        forwarded = time.perf_counter()
-        # This dependency is deliberate: optim must never follow failed backward.
-        optim = await call_async(
-            self._training_client,
-            "optim_step",
             optimizer_params(self.args, trio.AdamParams),
         )
-        optimized = time.perf_counter()
         self.state.global_step += 1
         self.state.behavior_policy_version += 1
         self._sampling_seed_offset += len(prompts)
@@ -383,7 +379,7 @@ class OPDTrainer:
         self._requires_restart = False
         input_tokens = sum(datum.model_input.length for datum in datums)
         completion_tokens = sum(sample.tokens for sample in scored)
-        metrics = self._remote_metrics(forward, optim)
+        metrics = self._remote_metrics(update.forward, update.optimizer)
         metrics.update(
             {
                 "optim/lr": self.args.learning_rate,
@@ -411,8 +407,8 @@ class OPDTrainer:
                 "time/prepare": prepared - started,
                 "time/snapshot": snapshotted - prepared,
                 "time/rollout_teacher": referenced - snapshotted,
-                "time/forward_backward": forwarded - referenced,
-                "time/optim": optimized - forwarded,
+                "time/forward_backward": update.forward_seconds,
+                "time/optim": update.optimizer_seconds,
             }
         )
         checkpoint_path = None

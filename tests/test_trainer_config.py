@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import tomllib
 import unittest
 from dataclasses import asdict
-import tomllib
 
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
@@ -94,6 +94,33 @@ class TrainerConfigTests(unittest.TestCase):
         serialized = asdict(config)
         self.assertNotIn("evaluation", serialized)
         self.assertEqual(SFTConfig(**serialized), config)
+
+    def test_grpo_accepts_only_builtin_policy_losses(self) -> None:
+        cases = {
+            "importance_sampling": {},
+            "ppo": {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+            "cispo": {"clip_low_threshold": 0.0, "clip_high_threshold": 4.0},
+            "dro": {"beta": 0.05},
+        }
+        for loss_fn, loss_fn_config in cases.items():
+            with self.subTest(loss_fn=loss_fn):
+                config = GRPOConfig(
+                    loss_fn=loss_fn,
+                    loss_fn_config=loss_fn_config,
+                )
+                self.assertEqual(config.loss_fn, loss_fn)
+                self.assertEqual(config.loss_fn_config, loss_fn_config)
+
+        with self.assertRaisesRegex(ValueError, "policy loss"):
+            GRPOConfig(loss_fn="cross_entropy")
+        with self.assertRaisesRegex(ValueError, "clip thresholds"):
+            GRPOConfig(
+                loss_fn="ppo",
+                loss_fn_config={
+                    "clip_low_threshold": 2.0,
+                    "clip_high_threshold": 1.0,
+                },
+            )
 
 
 

@@ -2,7 +2,7 @@
 
 Callers provide a PyTRIO-supported model name, and the trainer owns the service,
 training, and sampling clients needed by the GRPO loop.  This module currently
-implements group-centered advantages with PyTRIO ``importance_sampling``.
+implements group-centered advantages with a configurable PyTRIO policy loss.
 """
 
 from __future__ import annotations
@@ -18,21 +18,21 @@ import pytrio as trio
 import swanlab
 from tqdm import tqdm
 
+from ..api.cli_args import GRPOConfig
 from ..api.client_api import (
     call,
     call_async,
     optimizer_params,
     sampling_params,
-    submit_async,
-    wait,
-    wait_async,
 )
-from ..api.cli_args import GRPOConfig
+from ..api.loss_api import BuiltinPyTrioObjective, LossSpec
 from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.updates import run_update, run_update_async
 from .grpo.advantages import group_advantages
+from .grpo.contracts import GRPOBatch, GRPOResult, TrainerState
 from .grpo.datum import build_aligned_datum, to_client_datum
 from .grpo.metrics import (
     FINAL_SUMMARY_KEYS,
@@ -42,7 +42,6 @@ from .grpo.metrics import (
 )
 from .grpo.rewards import RewardEvaluator, RewardFunc
 from .grpo.rollout import SamplingAdapter
-from .grpo.contracts import GRPOBatch, GRPOResult, TrainerState
 
 
 class GRPOTrainer:
@@ -81,6 +80,9 @@ class GRPOTrainer:
 
         self.model_name = model_name.strip()
         self.config = args or GRPOConfig()
+        self._objective = BuiltinPyTrioObjective(
+            LossSpec(self.config.loss_fn, self.config.loss_fn_config)
+        )
         self.eval_dataset = eval_dataset
 
         # 训练模型：先只写lora的吧，后续再增加全量的（暂定lora的意思，不要修改该注释）
@@ -385,6 +387,16 @@ class GRPOTrainer:
     # Advantage alignment and remote policy update
     # ------------------------------------------------------------------
 
+    def _training_objective(self) -> BuiltinPyTrioObjective:
+        """Return the objective matching the current public configuration."""
+
+        spec = LossSpec(self.config.loss_fn, self.config.loss_fn_config)
+        objective = getattr(self, "_objective", None)
+        if objective is None or objective.spec != spec:
+            objective = BuiltinPyTrioObjective(spec)
+            self._objective = objective
+        return objective
+
     def _build_datums(
         self,
         groups: Sequence[GRPOBatch],
@@ -472,29 +484,15 @@ class GRPOTrainer:
 
         if not datums:
             return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
-        # Wait for forward/backward before submitting the optimizer. If the
-        # forward request fails, no optimizer request must be sent: otherwise
-        # PyTRIO may apply stale or partial gradients from a previous batch.
-        forward_method = getattr(self._training_client, "forward_backward", None)
-        optim_method = getattr(self._training_client, "optim_step", None)
-        if forward_method is None or optim_method is None:
-            raise AttributeError(
-                "PyTRIO training_client needs forward_backward() and optim_step()."
-            )
-        forward_started = time.perf_counter()
-        forward_future = forward_method(
+        update = run_update(
+            self._training_client,
+            self._training_objective(),
             datums,
-            loss_fn=self.config.loss_fn,
-            loss_fn_config=self.config.loss_fn_config,
+            optimizer_params(self.config, trio.AdamParams),
         )
-        forward = wait(forward_future)
-        forward_time = time.perf_counter() - forward_started
-        optim_started = time.perf_counter()
-        optim = wait(optim_method(optimizer_params(self.config, trio.AdamParams)))
-        optim_time = time.perf_counter() - optim_started
-        metrics = self._training_metrics(datums, forward, optim)
-        metrics["time/forward_backward"] = forward_time
-        metrics["time/optim"] = optim_time
+        metrics = self._training_metrics(datums, update.forward, update.optimizer)
+        metrics["time/forward_backward"] = update.forward_seconds
+        metrics["time/optim"] = update.optimizer_seconds
         return metrics
 
     async def _train_datums_async(self, datums: list[Any]) -> dict[str, float]:
@@ -502,29 +500,15 @@ class GRPOTrainer:
 
         if not datums:
             return {"optim/lr": self.config.learning_rate, "train/skipped": 1.0}
-        forward_started = time.perf_counter()
-        forward = await submit_async(
+        update = await run_update_async(
             self._training_client,
-            "forward_backward",
+            self._training_objective(),
             datums,
-            loss_fn=self.config.loss_fn,
-            loss_fn_config=self.config.loss_fn_config,
-        )
-        # Do not submit optim_step until forward/backward has completed
-        # successfully; this keeps the optimizer boundary failure-safe.
-        forward_result = await wait_async(forward)
-        forward_time = time.perf_counter() - forward_started
-        optim_started = time.perf_counter()
-        optim = await submit_async(
-            self._training_client,
-            "optim_step",
             optimizer_params(self.config, trio.AdamParams),
         )
-        optim_result = await wait_async(optim)
-        optim_time = time.perf_counter() - optim_started
-        metrics = self._training_metrics(datums, forward_result, optim_result)
-        metrics["time/forward_backward"] = forward_time
-        metrics["time/optim"] = optim_time
+        metrics = self._training_metrics(datums, update.forward, update.optimizer)
+        metrics["time/forward_backward"] = update.forward_seconds
+        metrics["time/optim"] = update.optimizer_seconds
         return metrics
 
     @staticmethod

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
-from ...utils.datums import materialize_datum
+from ...api.loss_api import PolicyLossInput
 
 
 @dataclass(slots=True)
@@ -87,14 +87,12 @@ def build_opd_datum(
     if any(not math.isfinite(value) for value in advantages):
         raise ValueError("Distillation advantages must be finite.")
     padding = len(prompt) - 1
-    return materialize_datum(
-        prompt + completion[:-1],
-        {
-            # -100 excludes prompt tokens from PyTRIO's active-token loss
-            # denominator as well as their gradient; zero advantages alone
-            # would still dilute the completion signal for long prompts.
-            "target_tokens": [-100] * padding + completion,
-            "logprobs": [0.0] * padding + student,
-            "advantages": [0.0] * padding + list(advantages),
-        },
-    )
+    return PolicyLossInput(
+        model_tokens=prompt + completion[:-1],
+        # -100 excludes prompt tokens from PyTRIO's active-token loss
+        # denominator as well as their gradient; zero advantages alone
+        # would still dilute the completion signal for long prompts.
+        target_tokens=[-100] * padding + completion,
+        behavior_logprobs=[0.0] * padding + student,
+        advantages=[0.0] * padding + list(advantages),
+    ).to_datum()

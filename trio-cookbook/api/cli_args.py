@@ -11,9 +11,11 @@ eval_batch_size/eval_max_batches. Trainers receive eval_dataset separately.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import math
+from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .loss_api import POLICY_LOSS_FNS, LossSpec
 
 
 @dataclass(slots=True)
@@ -323,8 +325,8 @@ class GRPOConfig(_StepLoggingConfig):
         top_k (`int`, defaults to `-1`):
             Top-k cutoff; ``-1`` disables top-k filtering in PyTRIO.
         loss_fn (`str`, defaults to `"importance_sampling"`):
-            Remote policy loss. The current aligned Datum contract supports only
-            PyTRIO's importance-sampling objective.
+            PyTRIO policy objective: ``importance_sampling``, ``ppo``, ``cispo``
+            or ``dro``. Rollout and group-centered advantage semantics remain GRPO.
         loss_fn_config (`dict[str, Any]`, defaults to `{}`):
             Additional options forwarded to the remote loss implementation.
         reward_weights (`list[float]` or `None`, defaults to `None`):
@@ -393,8 +395,11 @@ class GRPOConfig(_StepLoggingConfig):
         if not isinstance(self.output_dir, bool):
             raise TypeError("output_dir must be a boolean.")
         self._chat_template_options({"tokenize", "add_generation_prompt"})
-        if self.loss_fn != "importance_sampling":
-            raise ValueError("GRPO supports loss_fn='importance_sampling' only.")
+        loss = LossSpec(self.loss_fn, self.loss_fn_config)
+        if loss.name not in POLICY_LOSS_FNS:
+            raise ValueError("GRPO requires a PyTRIO policy loss.")
+        self.loss_fn = loss.name
+        self.loss_fn_config = loss.loss_fn_config
 
     @property
     def sampling_params(self) -> dict[str, Any]:
@@ -536,39 +541,72 @@ class OPDConfig(_StepLoggingConfig):
     """Configure sampled, token-level reverse-KL distillation.
 
     Parameters:
-        batch_size (`int`, defaults to `4`): Prompts per optimizer update.
-        max_steps (`int` or `None`, defaults to `None`): Optimizer step limit.
-        learning_rate (`float`, defaults to `1e-5`): Remote Adam learning rate.
-        beta1 (`float`, defaults to `0.9`): Adam first-moment coefficient.
-        beta2 (`float`, defaults to `0.95`): Adam second-moment coefficient.
-        eps (`float`, defaults to `1e-8`): Adam denominator smoothing value.
-        weight_decay (`float`, defaults to `0.0`): AdamW decay coefficient.
-        grad_clip_norm (`float`, defaults to `0.0`): Gradient clipping ceiling.
-        seed (`int` or `None`, defaults to `None`): Sampling seed base.
-        save_every (`int`, defaults to `0`): Periodic checkpoint interval.
-        report_to (`"swanlab"` or `None`, defaults to `None`): Reporting backend.
-        project (`str`, defaults to `"trio-cookbook-opd"`): SwanLab project.
-        workspace (`str` or `None`, defaults to `None`): SwanLab workspace.
-        tags (`list[str]` or `None`, defaults to `None`): SwanLab tags.
-        run_name (`str` or `None`, defaults to `None`): SwanLab run name.
-        log_dir (`str` or `None`, defaults to `None`): SwanLab log directory.
-        eval_steps (`int`, defaults to `0`): Evaluation interval in optimizer steps.
-        eval_before_train (`bool`, defaults to `False`): Evaluate before training.
-        eval_after_train (`bool`, defaults to `True`): Evaluate the final step once.
-        eval_batch_size (`int` or `None`, defaults to `None`): Evaluation batch size.
-        eval_max_batches (`int` or `None`, defaults to `None`): Evaluation batch limit.
-        logging_step (`int`, defaults to `1`): Metric aggregation interval.
-        num_generations (`int`, defaults to `1`): Completions per prompt.
-        max_completion_length (`int`, defaults to `512`): Completion token limit.
-        max_length (`int` or `None`, defaults to `2048`): Total token budget.
-        max_concurrent_sampling (`int`, defaults to `16`): Sampling concurrency.
-        max_concurrent_scoring (`int`, defaults to `32`): Teacher concurrency.
-        kl_coef (`float`, defaults to `1.0`): Reverse-KL signal coefficient.
-        discount_factor (`float`, defaults to `0.0`): Future-signal discount.
-        prompt_key (`str`, defaults to `"messages"`): Dataset prompt column.
-        add_generation_prompt (`bool`, defaults to `True`): Add assistant prefix.
-        chat_template_kwargs (`dict[str, Any]`, defaults to `{}`): Template options.
-        stop (`list[str]` or `None`, defaults to `None`): Sampling stop strings.
+        batch_size (`int`, defaults to `4`):
+            Prompts per optimizer update.
+        max_steps (`int` or `None`, defaults to `None`):
+            Optimizer step limit.
+        learning_rate (`float`, defaults to `1e-5`):
+            Remote Adam learning rate.
+        beta1 (`float`, defaults to `0.9`):
+            Adam first-moment coefficient.
+        beta2 (`float`, defaults to `0.95`):
+            Adam second-moment coefficient.
+        eps (`float`, defaults to `1e-8`):
+            Adam denominator smoothing value.
+        weight_decay (`float`, defaults to `0.0`):
+            AdamW decay coefficient.
+        grad_clip_norm (`float`, defaults to `0.0`):
+            Gradient clipping ceiling.
+        seed (`int` or `None`, defaults to `None`):
+            Sampling seed base.
+        save_every (`int`, defaults to `0`):
+            Periodic checkpoint interval.
+        report_to (`"swanlab"` or `None`, defaults to `None`):
+            Reporting backend.
+        project (`str`, defaults to `"trio-cookbook-opd"`):
+            SwanLab project.
+        workspace (`str` or `None`, defaults to `None`):
+            SwanLab workspace.
+        tags (`list[str]` or `None`, defaults to `None`):
+            SwanLab tags.
+        run_name (`str` or `None`, defaults to `None`):
+            SwanLab run name.
+        log_dir (`str` or `None`, defaults to `None`):
+            SwanLab log directory.
+        eval_steps (`int`, defaults to `0`):
+            Evaluation interval in optimizer steps.
+        eval_before_train (`bool`, defaults to `False`):
+            Evaluate before training.
+        eval_after_train (`bool`, defaults to `True`):
+            Evaluate the final step once.
+        eval_batch_size (`int` or `None`, defaults to `None`):
+            Evaluation batch size.
+        eval_max_batches (`int` or `None`, defaults to `None`):
+            Evaluation batch limit.
+        logging_step (`int`, defaults to `1`):
+            Metric aggregation interval.
+        num_generations (`int`, defaults to `1`):
+            Completions per prompt.
+        max_completion_length (`int`, defaults to `512`):
+            Completion token limit.
+        max_length (`int` or `None`, defaults to `2048`):
+            Total token budget.
+        max_concurrent_sampling (`int`, defaults to `16`):
+            Sampling concurrency.
+        max_concurrent_scoring (`int`, defaults to `32`):
+            Teacher concurrency.
+        kl_coef (`float`, defaults to `1.0`):
+            Reverse-KL signal coefficient.
+        discount_factor (`float`, defaults to `0.0`):
+            Future-signal discount.
+        prompt_key (`str`, defaults to `"messages"`):
+            Dataset prompt column.
+        add_generation_prompt (`bool`, defaults to `True`):
+            Add assistant prefix.
+        chat_template_kwargs (`dict[str, Any]`, defaults to `{}`):
+            Template options.
+        stop (`list[str]` or `None`, defaults to `None`):
+            Sampling stop strings.
     """
 
     # Algorithm-specific overrides of shared defaults.

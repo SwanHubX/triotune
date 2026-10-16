@@ -11,7 +11,7 @@ import math
 from collections.abc import Callable
 from typing import Any
 
-from ...utils.datums import materialize_datum
+from ...api.loss_api import PolicyLossInput
 from .contracts import GRPODatum, SequenceSample
 
 
@@ -41,7 +41,7 @@ def build_aligned_datum(
     if not math.isfinite(float(advantage)):
         raise ValueError("Advantages must be finite.")
     model_tokens = prompt_tokens + sample.tokens[:-1]
-    target_tokens = [0] * (len(prompt_tokens) - 1) + sample.tokens
+    target_tokens = [-100] * (len(prompt_tokens) - 1) + sample.tokens
     old_logprobs = [0.0] * (len(prompt_tokens) - 1) + sample.logprobs
     advantages = [0.0] * (len(prompt_tokens) - 1) + [float(advantage)] * len(sample.tokens)
     n = len(model_tokens)
@@ -72,8 +72,13 @@ def to_client_datum(datum: GRPODatum, factory: Callable[..., Any] | None = None)
     """Materialize a SDK Datum without importing tinker/trl at module import."""
 
     validate_datum(datum)
-    return materialize_datum(
-        datum.model_input,
-        datum.loss_fn_inputs,
+    to_ints = getattr(datum.model_input, "to_ints", None)
+    model_tokens = to_ints() if callable(to_ints) else datum.model_input
+    return PolicyLossInput(
+        model_tokens=model_tokens,
+        target_tokens=datum.target_tokens,
+        behavior_logprobs=datum.logprobs,
+        advantages=datum.advantages,
+    ).to_datum(
         datum_factory=factory,
     )

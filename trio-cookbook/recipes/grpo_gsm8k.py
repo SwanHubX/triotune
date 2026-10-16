@@ -54,12 +54,11 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset, load_dataset
 import numpy as np
 import pytrio as trio
 import swanlab
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
-
 
 LOSS_FNS = ("importance_sampling", "ppo")
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -335,7 +334,7 @@ def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Da
     # 从最后一个 prompt token 开始预测 completion 的每个 token。
     observation_len = len(prompt_tokens) - 1
     input_tokens = prompt_tokens + sample.tokens[:-1]
-    target_tokens = [0] * observation_len + sample.tokens
+    target_tokens = [-100] * observation_len + sample.tokens
     padded_logprobs = [0.0] * observation_len + sample.logprobs
     padded_advantages = [0.0] * observation_len + [sample.advantage] * len(sample.tokens)
 

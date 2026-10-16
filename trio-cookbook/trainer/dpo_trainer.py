@@ -31,7 +31,8 @@ from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
-from .dpo.loss import make_loss_fn as _loss_fn
+from ..utils.updates import run_update, run_update_async
+from .dpo.loss import DPOObjective
 from .dpo.state import DPOResult, DPOState
 
 
@@ -438,26 +439,19 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = self._reference_scores(pairs)
         referenced = time.perf_counter()
-        forward = call(
+        update = run_update(
             self._training_client,
-            "forward_backward_custom",
+            DPOObjective(reference, self.args.beta),
             datums,
-            _loss_fn(reference, self.args.beta),
-        )
-        forwarded = time.perf_counter()
-        optim = call(
-            self._training_client,
-            "optim_step",
             optimizer_params(self.args, trio.AdamParams),
         )
-        optimized = time.perf_counter()
-        metrics = self._metrics(forward, optim)
+        metrics = self._metrics(update.forward, update.optimizer)
         metrics.update({
             "data/tokens": sum(datum.model_input.length for datum in datums),
             "time/prepare": prepared - started,
             "time/reference": referenced - prepared,
-            "time/forward_backward": forwarded - referenced,
-            "time/optim": optimized - forwarded,
+            "time/forward_backward": update.forward_seconds,
+            "time/optim": update.optimizer_seconds,
         })
         return self._finish_step(metrics, len(pairs), started)
 
@@ -470,24 +464,19 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = await self._reference_scores_async(pairs)
         referenced = time.perf_counter()
-        forward = await call_async(
+        update = await run_update_async(
             self._training_client,
-            "forward_backward_custom",
+            DPOObjective(reference, self.args.beta),
             datums,
-            _loss_fn(reference, self.args.beta),
+            optimizer_params(self.args, trio.AdamParams),
         )
-        forwarded = time.perf_counter()
-        optim = await call_async(
-            self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams)
-        )
-        optimized = time.perf_counter()
-        metrics = self._metrics(forward, optim)
+        metrics = self._metrics(update.forward, update.optimizer)
         metrics.update({
             "data/tokens": sum(datum.model_input.length for datum in datums),
             "time/prepare": prepared - started,
             "time/reference": referenced - prepared,
-            "time/forward_backward": forwarded - referenced,
-            "time/optim": optimized - forwarded,
+            "time/forward_backward": update.forward_seconds,
+            "time/optim": update.optimizer_seconds,
         })
         self.state.global_step += 1
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
