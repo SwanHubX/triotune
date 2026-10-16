@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from trio_cookbook.recipes import sft_huanhuan, sft_huanhuan_trio
-from trio_cookbook.trainer import EvaluationConfig, SFTConfig, SFTTrainer
+from trio_cookbook.trainer import SFTConfig, SFTTrainer
 
 
 class _Tokenizer:
@@ -234,20 +234,89 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     async def test_train_schedules_initial_and_periodic_validation_once(self) -> None:
         trainer = self.trainer(
             max_steps=1,
-            evaluation=EvaluationConfig(
-                before_train=True,
-                every_steps=1,
-                after_train=True,
-            ),
+            eval_before_train=True,
+            eval_steps=1,
+            eval_after_train=True,
         )
         trainer.train_dataset = [{"text": "train"}]
-        trainer.valid_dataset = [{"text": "valid"}]
+        trainer.eval_dataset = [{"text": "valid"}]
 
         state = await trainer.train()
 
         self.assertEqual(state.global_step, 1)
         self.assertEqual(self.client.optim_calls, 1)
         self.assertEqual(self.client.eval_calls, 2)
+
+    async def test_eval_dataset_runs_every_50_completed_steps_after_pipeline_drain(self):
+        trainer = SFTTrainer(
+            "test-model",
+            args=SFTConfig(max_steps=101, eval_steps=50, eval_after_train=False),
+            train_dataset=[{"text": "train"}] * 101,
+            eval_dataset=[{"text": "held-out"}],
+        )
+        evaluated = []
+        evaluate = trainer.evaluate
+
+        async def track_evaluate(*args, **kwargs):
+            evaluated.append(trainer.state.global_step)
+            self.assertEqual(self.client.optim_calls, trainer.state.global_step)
+            return await evaluate(*args, **kwargs)
+
+        trainer.evaluate = track_evaluate
+        await trainer.train()
+
+        self.assertEqual(evaluated, [50, 100])
+        self.assertEqual(self.client.eval_calls, 2)
+        self.assertEqual(self.client.optim_calls, 101)
+
+    async def test_eval_limits_apply_to_full_eval_dataset_without_training(self):
+        trainer = self.trainer(eval_batch_size=2, eval_max_batches=1)
+        trainer.eval_dataset = [{"text": "ab"}] * 5
+
+        metrics = await trainer.evaluate()
+
+        self.assertEqual(metrics["eval/examples"], 2)
+        self.assertEqual(self.client.eval_calls, 1)
+        self.assertEqual(self.client.optim_calls, 0)
+
+    async def test_eval_steps_without_dataset_only_trains(self):
+        trainer = self.trainer(eval_steps=1, max_steps=2, eval_before_train=True)
+        trainer.train_dataset = [{"text": "train"}] * 2
+
+        await trainer.train()
+
+        self.assertEqual(self.client.optim_calls, 2)
+        self.assertEqual(self.client.eval_calls, 0)
+        with self.assertRaisesRegex(ValueError, "eval_dataset is required"):
+            await trainer.evaluate()
+
+    async def test_final_evaluation_runs_after_partial_interval(self):
+        trainer = self.trainer(max_steps=3, eval_steps=2, eval_after_train=True)
+        trainer.train_dataset = [{"text": "train"}] * 3
+        trainer.eval_dataset = [{"text": "held-out"}]
+        evaluated = []
+        publish = trainer._publish_evaluation
+
+        def track_evaluation(metrics):
+            evaluated.append(trainer.state.global_step)
+            return publish(metrics)
+
+        trainer._publish_evaluation = track_evaluation
+        await trainer.train()
+
+        self.assertEqual(evaluated, [2, 3])
+
+    async def test_failed_periodic_evaluation_stops_before_next_training_batch(self):
+        trainer = self.trainer(max_steps=3, eval_steps=1)
+        trainer.train_dataset = [{"text": "train"}] * 3
+        trainer.eval_dataset = [{"text": "held-out"}]
+        with patch.object(self.client, "forward", side_effect=RuntimeError("eval failed")):
+            with self.assertRaisesRegex(RuntimeError, "eval failed"):
+                await trainer.train()
+
+        self.assertEqual(trainer.state.global_step, 1)
+        self.assertEqual(self.client.optim_calls, 1)
+        self.assertIsNone(trainer._last_eval_step)
 
     async def test_pipeline_limits_outstanding_batches(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_in_flight"):

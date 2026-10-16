@@ -40,6 +40,10 @@ class OPDTrainer:
     Token-to-ID vocabularies must match; prompts are rendered using the student
     template and the exact same tokens are scored by the teacher.
 
+    eval_dataset holds replayable prompts. OPDConfig.eval_steps schedules student
+    rollouts and fixed-teacher scoring between updates. Evaluation does not
+    advance the optimizer step or the behavior-policy version.
+
     Async methods are the primary implementation; sync methods run them with
     asyncio.run. Client construction is synchronous (use asyncio.to_thread in
     an async application). Calls on one trainer must not overlap.
@@ -51,7 +55,7 @@ class OPDTrainer:
         teacher_model: str,
         args: OPDConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
         teacher_model_path: str | None = None,
@@ -76,7 +80,7 @@ class OPDTrainer:
         self.teacher_model_path = teacher_model_path
         self.args = args or OPDConfig()
         self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
+        self.eval_dataset = eval_dataset
         self.state = OPDState()
         self._last_eval_step: int | None = None
         self._service_client = trio.ServiceClient()
@@ -444,9 +448,9 @@ class OPDTrainer:
     ) -> Iterable[list[Mapping[str, Any]]]:
         """Yield prompt batches using OPD evaluation limits."""
 
-        config = self.args.evaluation
-        batch_size = config.batch_size or self.args.batch_size
-        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
+        config = self.args
+        batch_size = config.eval_batch_size or config.batch_size
+        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store sampled distillation metrics without changing policy version."""
@@ -482,7 +486,7 @@ class OPDTrainer:
             teacher_sum += sum(sample.teacher_sum for sample in scored)
             advantage_sum += sum(sample.advantage_sum for sample in scored)
         if prompt_count == 0 or token_count == 0:
-            raise ValueError("valid_dataset must contain trainable OPD prompts.")
+            raise ValueError("eval_dataset must contain trainable OPD prompts.")
         metrics = {
             "eval/reverse_kl_sampled": (student_sum - teacher_sum) / token_count,
             "eval/student_logprob": student_sum / token_count,
@@ -496,13 +500,13 @@ class OPDTrainer:
 
     async def evaluate_async(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Evaluate the current student against the fixed teacher."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate_async().")
+            raise ValueError("eval_dataset is required for evaluate_async().")
         self._enter()
         try:
             return await self._evaluate_async(dataset)
@@ -511,11 +515,11 @@ class OPDTrainer:
 
     def evaluate(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Synchronous entry point for :meth:`evaluate_async`."""
 
-        return self._run_sync(self.evaluate_async, valid_dataset)
+        return self._run_sync(self.evaluate_async, eval_dataset)
 
     # ------------------------------------------------------------------
     # Full dataset training and synchronous facades
@@ -536,11 +540,11 @@ class OPDTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.before_train
+                self.eval_dataset is not None
+                and self.args.eval_before_train
                 and self._last_eval_step is None
             ):
-                await self._evaluate_async(self.valid_dataset)
+                await self._evaluate_async(self.eval_dataset)
             batches = iter_batches(self.train_dataset, self.args.batch_size)
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
                 rows = next(batches, None)
@@ -553,12 +557,12 @@ class OPDTrainer:
                 )
                 progress.update(1)
                 if (
-                    self.valid_dataset is not None
-                    and self.args.evaluation.every_steps > 0
-                    and self.state.global_step % self.args.evaluation.every_steps == 0
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and self.state.global_step % self.args.eval_steps == 0
                     and self._last_eval_step != self.state.global_step
                 ):
-                    await self._evaluate_async(self.valid_dataset)
+                    await self._evaluate_async(self.eval_dataset)
             if self.state.global_step > initial_step:
                 if not self.args.save_every or self.state.global_step % self.args.save_every:
                     await self._save_state_async()
@@ -585,11 +589,11 @@ class OPDTrainer:
                         step=self.state.global_step,
                     )
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.after_train
+                self.eval_dataset is not None
+                and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
-                await self._evaluate_async(self.valid_dataset)
+                await self._evaluate_async(self.eval_dataset)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise

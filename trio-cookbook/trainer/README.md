@@ -177,22 +177,20 @@ trainer = SFTTrainer(
 ## SFT 训练
 
 ```python
-from trio_cookbook.trainer import EvaluationConfig, SFTConfig, SFTTrainer
+import asyncio
+
+from trio_cookbook.trainer import SFTConfig, SFTTrainer
 
 trainer = SFTTrainer(
     model="Qwen/Qwen3.5-4B",
     args=SFTConfig(
-        evaluation=EvaluationConfig(
-            before_train=True,
-            every_steps=100,
-            after_train=True,
-            batch_size=None,  # None 表示复用训练 batch_size。
-            max_batches=20,
-        )
+        eval_steps=50,
+        eval_after_train=False,
     ),
-    train_dataset=sft_pair_rows,
-    valid_dataset=sft_pair_rows,  # 周期验证时必须可以重新迭代。
+    train_dataset=train_rows,
+    eval_dataset=eval_rows,
 )
+state = asyncio.run(trainer.train())
 ```
 
 ## GRPO 训练

@@ -52,6 +52,10 @@ class GRPOTrainer:
     to ``ServiceClient.create_lora_training_client`` as the base model. Dataset
     prompts may be plain text, pre-tokenized integer IDs, or text-only chat
     messages. Chat messages are rendered with the tokenizer chat template.
+
+    eval_dataset holds replayable prompt rows in the same format as training.
+    GRPOConfig.eval_steps schedules fresh policy rollouts and reward evaluation
+    between optimizer updates, without policy optimization.
     """
 
     def __init__(
@@ -60,7 +64,7 @@ class GRPOTrainer:
         reward_funcs: RewardFunc | Sequence[RewardFunc] | None = None,
         args: GRPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
     ) -> None:
@@ -77,7 +81,7 @@ class GRPOTrainer:
 
         self.model_name = model_name.strip()
         self.config = args or GRPOConfig()
-        self.valid_dataset = valid_dataset
+        self.eval_dataset = eval_dataset
 
         # 训练模型：先只写lora的吧，后续再增加全量的（暂定lora的意思，不要修改该注释）
         self._service_client = trio.ServiceClient()
@@ -716,9 +720,9 @@ class GRPOTrainer:
     ) -> Iterable[list[Mapping[str, Any]]]:
         """Yield prompt batches using GRPO evaluation limits."""
 
-        config = self.config.evaluation
-        batch_size = config.batch_size or self.config.batch_size
-        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
+        config = self.config
+        batch_size = config.eval_batch_size or config.batch_size
+        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store and report GRPO rollout metrics at the current policy step."""
@@ -731,13 +735,13 @@ class GRPOTrainer:
 
     def evaluate(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Sample the current policy and score validation prompts without training."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate().")
+            raise ValueError("eval_dataset is required for evaluate().")
         client = self._new_sampling_client()
         totals: dict[str, float] = {}
         prompts_total = 0
@@ -754,7 +758,7 @@ class GRPOTrainer:
             ]
             prompts_total += count
         if prompts_total == 0:
-            raise ValueError("valid_dataset must contain at least one prompt.")
+            raise ValueError("eval_dataset must contain at least one prompt.")
         metrics = {
             name: value / prompts_total
             for name, value in totals.items()
@@ -766,13 +770,13 @@ class GRPOTrainer:
 
     async def evaluate_async(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Asynchronous counterpart to :meth:`evaluate`."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate_async().")
+            raise ValueError("eval_dataset is required for evaluate_async().")
         client = await self._new_sampling_client_async()
         totals: dict[str, float] = {}
         prompts_total = 0
@@ -789,7 +793,7 @@ class GRPOTrainer:
             ]
             prompts_total += count
         if prompts_total == 0:
-            raise ValueError("valid_dataset must contain at least one prompt.")
+            raise ValueError("eval_dataset must contain at least one prompt.")
         metrics = {
             name: value / prompts_total
             for name, value in totals.items()
@@ -809,7 +813,7 @@ class GRPOTrainer:
         started = time.perf_counter()
         initial_step = self.state.global_step
         initial_tokens = self._total_input_tokens
-        valid_dataset = getattr(self, "valid_dataset", None)
+        eval_dataset = getattr(self, "eval_dataset", None)
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -820,8 +824,8 @@ class GRPOTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train().")
             if (
-                valid_dataset is not None
-                and self.config.evaluation.before_train
+                eval_dataset is not None
+                and self.config.eval_before_train
                 and getattr(self, "_last_eval_step", None) is None
             ):
                 self.evaluate()
@@ -839,10 +843,10 @@ class GRPOTrainer:
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
                 if (
-                    valid_dataset is not None
-                    and self.config.evaluation.every_steps > 0
+                    eval_dataset is not None
+                    and self.config.eval_steps > 0
                     and self.state.global_step
-                    % self.config.evaluation.every_steps
+                    % self.config.eval_steps
                     == 0
                     and getattr(self, "_last_eval_step", None)
                     != self.state.global_step
@@ -855,8 +859,8 @@ class GRPOTrainer:
             ):
                 self._save_state(final=True)
             if (
-                valid_dataset is not None
-                and self.config.evaluation.after_train
+                eval_dataset is not None
+                and self.config.eval_after_train
                 and getattr(self, "_last_eval_step", None) != self.state.global_step
             ):
                 self.evaluate()
@@ -880,7 +884,7 @@ class GRPOTrainer:
         started = time.perf_counter()
         initial_step = self.state.global_step
         initial_tokens = self._total_input_tokens
-        valid_dataset = getattr(self, "valid_dataset", None)
+        eval_dataset = getattr(self, "eval_dataset", None)
         progress = tqdm(
             total=self.config.max_steps,
             desc="GRPO train",
@@ -891,8 +895,8 @@ class GRPOTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
             if (
-                valid_dataset is not None
-                and self.config.evaluation.before_train
+                eval_dataset is not None
+                and self.config.eval_before_train
                 and getattr(self, "_last_eval_step", None) is None
             ):
                 await self.evaluate_async()
@@ -910,10 +914,10 @@ class GRPOTrainer:
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
                 if (
-                    valid_dataset is not None
-                    and self.config.evaluation.every_steps > 0
+                    eval_dataset is not None
+                    and self.config.eval_steps > 0
                     and self.state.global_step
-                    % self.config.evaluation.every_steps
+                    % self.config.eval_steps
                     == 0
                     and getattr(self, "_last_eval_step", None)
                     != self.state.global_step
@@ -926,8 +930,8 @@ class GRPOTrainer:
             ):
                 await self._save_state_async(final=True)
             if (
-                valid_dataset is not None
-                and self.config.evaluation.after_train
+                eval_dataset is not None
+                and self.config.eval_after_train
                 and getattr(self, "_last_eval_step", None) != self.state.global_step
             ):
                 await self.evaluate_async()

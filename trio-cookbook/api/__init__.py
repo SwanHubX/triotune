@@ -13,7 +13,6 @@ from .client_api import (
 from .cli_args import (
     BaseTrainerConfig,
     DPOConfig,
-    EvaluationConfig,
     GRPOConfig,
     OPDConfig,
     SFTConfig,
@@ -22,7 +21,6 @@ from .cli_args import (
 __all__ = [
     "BaseTrainerConfig",
     "DPOConfig",
-    "EvaluationConfig",
     "GRPOConfig",
     "OPDConfig",
     "SFTConfig",

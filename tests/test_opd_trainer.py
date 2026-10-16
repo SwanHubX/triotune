@@ -276,6 +276,39 @@ class OPDTrainerTests(unittest.TestCase):
     def trainer(self, **kwargs):
         return OPDTrainer("student", "teacher", args=OPDConfig(**kwargs))
 
+    def test_eval_dataset_schedule_in_sync_and_async_training(self):
+        rows = [{"messages": "P"}]
+        for async_mode in (False, True):
+            with self.subTest(async_mode=async_mode):
+                trainer = OPDTrainer(
+                    "student",
+                    "teacher",
+                    args=OPDConfig(
+                        batch_size=1,
+                        max_steps=4,
+                        eval_steps=2,
+                        eval_before_train=True,
+                        eval_after_train=True,
+                    ),
+                    train_dataset=rows * 4,
+                    eval_dataset=rows,
+                )
+                evaluated = []
+                publish = trainer._publish_evaluation
+
+                def track_evaluation(metrics):
+                    evaluated.append(trainer.state.global_step)
+                    return publish(metrics)
+
+                trainer._publish_evaluation = track_evaluation
+                if async_mode:
+                    asyncio.run(trainer.train_async())
+                else:
+                    trainer.train()
+
+                self.assertEqual(evaluated, [0, 2, 4])
+                self.assertEqual(trainer.state.behavior_policy_version, 4)
+
     def test_sync_step_alignment_and_metrics(self):
         trainer = self.trainer()
         result = trainer.step([{"messages": "PQ"}])

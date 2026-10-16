@@ -6,7 +6,6 @@ import sys
 from ..api.cli_args import (
     BaseTrainerConfig,
     DPOConfig,
-    EvaluationConfig,
     GRPOConfig,
     OPDConfig,
     SFTConfig,
@@ -126,7 +125,6 @@ __all__ = [
     "DPOResult",
     "DPOState",
     "DPOTrainer",
-    "EvaluationConfig",
     "GRPOBatch",
     "GRPOConfig",
     "GRPODatum",

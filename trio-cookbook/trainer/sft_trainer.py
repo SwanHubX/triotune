@@ -28,6 +28,11 @@ class SFTTrainer:
     prompt/completion pair, or pre-tokenized IDs. ``assistant_only_loss``
     requires a chat template that returns assistant token masks. Packing and
     multimodal inputs are unsupported. Public training methods are coroutines.
+
+    eval_dataset contains held-out rows in the same format as train_dataset.
+    It must be replayable for periodic evaluation. SFTConfig.eval_steps counts
+    completed optimizer updates; evaluation drains outstanding training batches
+    and runs forward only, leaving optimizer state and global_step unchanged.
     """
 
     def __init__(
@@ -35,7 +40,7 @@ class SFTTrainer:
         model: str,
         args: SFTConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
     ) -> None:
@@ -46,7 +51,7 @@ class SFTTrainer:
         self.model = model.strip()
         self.args = args or SFTConfig()
         self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
+        self.eval_dataset = eval_dataset
         self._client = trio.ServiceClient().create_lora_training_client(
             base_model=self.model, rank=lora_rank, seed=self.args.seed
         )
@@ -98,9 +103,9 @@ class SFTTrainer:
     ) -> Iterable[list[Mapping[str, Any]]]:
         """Yield SFT validation batches under this trainer's evaluation limits."""
 
-        config = self.args.evaluation
-        batch_size = config.batch_size or self.args.batch_size
-        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
+        config = self.args
+        batch_size = config.eval_batch_size or config.batch_size
+        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store and log SFT validation metrics without advancing the step."""
@@ -113,13 +118,13 @@ class SFTTrainer:
 
     async def evaluate(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Measure token-weighted validation loss without backward or optimizer calls."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate().")
+            raise ValueError("eval_dataset is required for evaluate().")
         loss_sum = 0.0
         token_count = 0
         example_count = 0
@@ -152,7 +157,7 @@ class SFTTrainer:
             example_count += len(rows)
             batch_count += 1
         if batch_count == 0:
-            raise ValueError("valid_dataset must contain at least one row.")
+            raise ValueError("eval_dataset must contain at least one row.")
         metrics = {
             "eval/loss": loss_sum / token_count,
             "eval/tokens": float(token_count),
@@ -289,8 +294,8 @@ class SFTTrainer:
 
         try:
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.before_train
+                self.eval_dataset is not None
+                and self.args.eval_before_train
                 and self._last_eval_step is None
             ):
                 await self.evaluate()
@@ -307,11 +312,13 @@ class SFTTrainer:
                 previous.add_done_callback(report)
                 pending.append(previous)
                 if (
-                    self.valid_dataset is not None
-                    and self.args.evaluation.every_steps > 0
-                    and submitted % self.args.evaluation.every_steps == 0
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and submitted % self.args.eval_steps == 0
                     and self._last_eval_step != submitted
                 ):
+                    # All updates through this boundary must finish before forward
+                    # evaluation reads the model; do not enqueue the next batch yet.
                     await asyncio.gather(*pending)
                     pending.clear()
                     await self.evaluate()
@@ -321,8 +328,8 @@ class SFTTrainer:
             ):
                 await self._save_state()
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.after_train
+                self.eval_dataset is not None
+                and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate()

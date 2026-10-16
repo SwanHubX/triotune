@@ -72,6 +72,10 @@ class DPOTrainer:
     ``model`` and optional ``ref_model`` are PyTRIO base-model IDs. With no
     ``ref_model``, the fixed reference is the unmodified base model. A custom
     reference must use the same tokenizer vocabulary as the trained model.
+
+    eval_dataset holds replayable preference rows in the same format as training.
+    DPOConfig.eval_steps schedules current-policy versus fixed-reference scoring
+    between optimizer updates, without backward or optimizer calls.
     """
 
     def __init__(
@@ -80,7 +84,7 @@ class DPOTrainer:
         ref_model: str | None = None,
         args: DPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
     ) -> None:
@@ -96,7 +100,7 @@ class DPOTrainer:
         self.ref_model = ref_model.strip() if ref_model is not None else self.model
         self.args = args or DPOConfig()
         self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
+        self.eval_dataset = eval_dataset
         self._service_client = trio.ServiceClient()
         self._training_client = self._service_client.create_lora_training_client(
             base_model=self.model, rank=lora_rank, seed=self.args.seed
@@ -262,9 +266,9 @@ class DPOTrainer:
     ) -> Iterable[list[Mapping[str, Any]]]:
         """Yield preference batches using DPO evaluation limits."""
 
-        config = self.args.evaluation
-        batch_size = config.batch_size or self.args.batch_size
-        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
+        config = self.args
+        batch_size = config.eval_batch_size or config.batch_size
+        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store DPO validation metrics without changing optimizer state."""
@@ -277,13 +281,13 @@ class DPOTrainer:
 
     def evaluate(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Evaluate current-policy preference accuracy and DPO loss."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate().")
+            raise ValueError("eval_dataset is required for evaluate().")
         policy_client = call(
             self._training_client, "save_weights_and_get_sampling_client"
         )
@@ -300,7 +304,7 @@ class DPOTrainer:
                     totals[name] = totals.get(name, 0.0) + value * count
             pairs_total += count
         if pairs_total == 0:
-            raise ValueError("valid_dataset must contain at least one preference pair.")
+            raise ValueError("eval_dataset must contain at least one preference pair.")
         metrics = {
             name: value / pairs_total for name, value in totals.items()
         }
@@ -309,13 +313,13 @@ class DPOTrainer:
 
     async def evaluate_async(
         self,
-        valid_dataset: Iterable[Mapping[str, Any]] | None = None,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, float]:
         """Asynchronous counterpart to :meth:`evaluate`."""
 
-        dataset = valid_dataset if valid_dataset is not None else self.valid_dataset
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
-            raise ValueError("valid_dataset is required for evaluate_async().")
+            raise ValueError("eval_dataset is required for evaluate_async().")
         policy_client = await call_async(
             self._training_client, "save_weights_and_get_sampling_client"
         )
@@ -334,7 +338,7 @@ class DPOTrainer:
                     totals[name] = totals.get(name, 0.0) + value * count
             pairs_total += count
         if pairs_total == 0:
-            raise ValueError("valid_dataset must contain at least one preference pair.")
+            raise ValueError("eval_dataset must contain at least one preference pair.")
         metrics = {
             name: value / pairs_total for name, value in totals.items()
         }
@@ -649,8 +653,8 @@ class DPOTrainer:
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.before_train
+                self.eval_dataset is not None
+                and self.args.eval_before_train
                 and self._last_eval_step is None
             ):
                 self.evaluate()
@@ -663,9 +667,9 @@ class DPOTrainer:
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
                 if (
-                    self.valid_dataset is not None
-                    and self.args.evaluation.every_steps > 0
-                    and self.state.global_step % self.args.evaluation.every_steps == 0
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and self.state.global_step % self.args.eval_steps == 0
                     and self._last_eval_step != self.state.global_step
                 ):
                     self.evaluate()
@@ -674,8 +678,8 @@ class DPOTrainer:
             ):
                 self._save_state()
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.after_train
+                self.eval_dataset is not None
+                and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 self.evaluate()
@@ -703,8 +707,8 @@ class DPOTrainer:
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.before_train
+                self.eval_dataset is not None
+                and self.args.eval_before_train
                 and self._last_eval_step is None
             ):
                 await self.evaluate_async()
@@ -717,9 +721,9 @@ class DPOTrainer:
                 progress.set_postfix(self._progress_postfix(result), refresh=False)
                 progress.update(1)
                 if (
-                    self.valid_dataset is not None
-                    and self.args.evaluation.every_steps > 0
-                    and self.state.global_step % self.args.evaluation.every_steps == 0
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and self.state.global_step % self.args.eval_steps == 0
                     and self._last_eval_step != self.state.global_step
                 ):
                     await self.evaluate_async()
@@ -728,8 +732,8 @@ class DPOTrainer:
             ):
                 await self._save_state_async()
             if (
-                self.valid_dataset is not None
-                and self.args.evaluation.after_train
+                self.eval_dataset is not None
+                and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate_async()

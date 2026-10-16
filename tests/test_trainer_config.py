@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import asdict
+import tomllib
 
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
     DPOConfig,
-    EvaluationConfig,
     GRPOConfig,
     OPDConfig,
     SFTConfig,
@@ -63,25 +64,36 @@ class TrainerConfigTests(unittest.TestCase):
                 DPOConfig(**{field: -1.0})
 
     def test_evaluation_schedule_rejects_invalid_limits(self) -> None:
-        for kwargs in (
-            {"every_steps": -1},
-            {"every_steps": True},
-            {"batch_size": 0},
-            {"max_batches": 0},
-            {"before_train": "yes"},
-        ):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                EvaluationConfig(**kwargs)
+        for config_class in (GRPOConfig, DPOConfig, SFTConfig, OPDConfig):
+            for kwargs in (
+                {"eval_steps": -1},
+                {"eval_steps": True},
+                {"eval_steps": 1.5},
+                {"eval_batch_size": 0},
+                {"eval_batch_size": True},
+                {"eval_max_batches": 0},
+                {"eval_before_train": "yes"},
+                {"eval_after_train": 1},
+            ):
+                with self.subTest(config=config_class.__name__, kwargs=kwargs):
+                    with self.assertRaises(ValueError):
+                        config_class(**kwargs)
 
-    def test_algorithm_config_accepts_nested_evaluation_mapping(self) -> None:
-        config = SFTConfig(
-            evaluation={"before_train": True, "every_steps": 5, "max_batches": 2}
+    def test_flat_eval_settings_roundtrip_through_toml_and_config(self) -> None:
+        settings = tomllib.loads(
+            '[sft]\neval_steps = 50\neval_batch_size = 2\n'
+            'eval_max_batches = 20\neval_after_train = false\n'
         )
+        config = SFTConfig(**settings["sft"])
 
-        self.assertIsInstance(config.evaluation, EvaluationConfig)
-        self.assertTrue(config.evaluation.before_train)
-        self.assertEqual(config.evaluation.every_steps, 5)
-        self.assertEqual(config.evaluation.max_batches, 2)
+        self.assertEqual(config.eval_steps, 50)
+        self.assertEqual(config.eval_batch_size, 2)
+        self.assertEqual(config.eval_max_batches, 20)
+        self.assertFalse(config.eval_before_train)
+        self.assertFalse(config.eval_after_train)
+        serialized = asdict(config)
+        self.assertNotIn("evaluation", serialized)
+        self.assertEqual(SFTConfig(**serialized), config)
 
 
 

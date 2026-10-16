@@ -2,59 +2,18 @@
 
 This module is the trainer's contract layer: common run controls live on
 ``BaseTrainerConfig`` while algorithm subclasses add only their own behavior.
-The classes intentionally retain the existing flat constructor fields so
-recipes and TOML mappings remain compatible.
+Configuration fields can be supplied directly from recipe/TOML mappings.
+Evaluation uses flat eval_* fields instead of the former nested evaluation
+object: every_steps becomes eval_steps, before_train/after_train become
+eval_before_train/eval_after_train, and batch_size/max_batches become
+eval_batch_size/eval_max_batches. Trainers receive eval_dataset separately.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 import math
 from typing import Any, Literal
-
-
-@dataclass(slots=True)
-class EvaluationConfig:
-    """Schedule bounded validation passes independently from training updates.
-
-    Parameters:
-        before_train (`bool`, defaults to `False`):
-            Evaluate the initial model once before the first optimizer update.
-        every_steps (`int`, defaults to `0`):
-            Run validation after every N completed updates. Zero disables
-            periodic validation.
-        after_train (`bool`, defaults to `True`):
-            Evaluate the final model unless that step was already evaluated.
-        batch_size (`int` or `None`, defaults to `None`):
-            Validation rows per request. ``None`` reuses training batch size.
-        max_batches (`int` or `None`, defaults to `None`):
-            Optional cap for expensive generation-based evaluation. ``None``
-            consumes the validation iterable once.
-    """
-
-    before_train: bool = False
-    every_steps: int = 0
-    after_train: bool = True
-    batch_size: int | None = None
-    max_batches: int | None = None
-
-    def __post_init__(self) -> None:
-        """Reject schedules that cannot make progress or bound work correctly."""
-
-        for name in ("before_train", "after_train"):
-            if not isinstance(getattr(self, name), bool):
-                raise ValueError(f"evaluation.{name} must be boolean.")
-        if isinstance(self.every_steps, bool) or not isinstance(self.every_steps, int):
-            raise ValueError("evaluation.every_steps must be a nonnegative integer.")
-        if self.every_steps < 0:
-            raise ValueError("evaluation.every_steps must be a nonnegative integer.")
-        for name in ("batch_size", "max_batches"):
-            value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 1
-            ):
-                raise ValueError(f"evaluation.{name} must be positive or None.")
 
 
 @dataclass(slots=True)
@@ -100,9 +59,18 @@ class BaseTrainerConfig:
             Explicit run name. ``None`` lets the trainer derive one from the model.
         log_dir (`str` or `None`, defaults to `None`):
             Local SwanLab output directory; ``None`` uses the SDK default.
-        evaluation (`EvaluationConfig`, defaults to `EvaluationConfig()`):
-            Validation cadence and work limits. It has no effect until a
-            trainer receives ``valid_dataset``.
+        eval_steps (`int`, defaults to `0`):
+            Evaluate eval_dataset after every N completed optimizer updates.
+            Zero disables periodic evaluation. Requires a trainer eval_dataset.
+        eval_before_train (`bool`, defaults to `False`):
+            Evaluate once before the first training update when data is available.
+        eval_after_train (`bool`, defaults to `True`):
+            Evaluate at the final step unless already evaluated there. Set False
+            to evaluate only at eval_steps boundaries.
+        eval_batch_size (`int` or `None`, defaults to `None`):
+            Evaluation rows per batch; None reuses training batch_size.
+        eval_max_batches (`int` or `None`, defaults to `None`):
+            Optional batch limit per evaluation pass; None consumes all eval rows.
     """
 
     # Training loop: one step consumes one algorithm-specific batch.
@@ -129,8 +97,12 @@ class BaseTrainerConfig:
     run_name: str | None = None
     log_dir: str | None = None
 
-    # Validation scheduling is shared; metric computation remains algorithm-specific.
-    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    # The training loop evaluates eval_dataset; each algorithm computes its metrics.
+    eval_steps: int = 0
+    eval_before_train: bool = False
+    eval_after_train: bool = True
+    eval_batch_size: int | None = None
+    eval_max_batches: int | None = None
 
     def __post_init__(self) -> None:
         """Validate shared invariants before an algorithm validates its fields.
@@ -163,10 +135,13 @@ class BaseTrainerConfig:
             or any(not isinstance(tag, str) or not tag.strip() for tag in self.tags)
         ):
             raise ValueError("tags must be a list of non-empty strings when provided.")
-        if isinstance(self.evaluation, Mapping):
-            self.evaluation = EvaluationConfig(**dict(self.evaluation))
-        if not isinstance(self.evaluation, EvaluationConfig):
-            raise ValueError("evaluation must be an EvaluationConfig instance.")
+        self._integer("eval_steps", minimum=0)
+        for name in ("eval_before_train", "eval_after_train"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean.")
+        for name in ("eval_batch_size", "eval_max_batches"):
+            if getattr(self, name) is not None:
+                self._integer(name, minimum=1)
 
     def _integer(self, name: str, *, minimum: int) -> None:
         """Validate an integer field with an inclusive lower bound.
@@ -577,7 +552,11 @@ class OPDConfig(_StepLoggingConfig):
         tags (`list[str]` or `None`, defaults to `None`): SwanLab tags.
         run_name (`str` or `None`, defaults to `None`): SwanLab run name.
         log_dir (`str` or `None`, defaults to `None`): SwanLab log directory.
-        evaluation (`EvaluationConfig`, defaults to `EvaluationConfig()`): Validation schedule.
+        eval_steps (`int`, defaults to `0`): Evaluation interval in optimizer steps.
+        eval_before_train (`bool`, defaults to `False`): Evaluate before training.
+        eval_after_train (`bool`, defaults to `True`): Evaluate the final step once.
+        eval_batch_size (`int` or `None`, defaults to `None`): Evaluation batch size.
+        eval_max_batches (`int` or `None`, defaults to `None`): Evaluation batch limit.
         logging_step (`int`, defaults to `1`): Metric aggregation interval.
         num_generations (`int`, defaults to `1`): Completions per prompt.
         max_completion_length (`int`, defaults to `512`): Completion token limit.
@@ -648,7 +627,6 @@ class OPDConfig(_StepLoggingConfig):
 __all__ = [
     "BaseTrainerConfig",
     "DPOConfig",
-    "EvaluationConfig",
     "GRPOConfig",
     "OPDConfig",
     "SFTConfig",
