@@ -4,6 +4,11 @@ The input contract follows common OpenAI-style agent traces. Records may hold
 ``messages`` directly or contain one or more entries under ``conversations``.
 Tool definitions stay attached to the conversation and are passed to the
 tokenizer rather than serialized into ordinary message text.
+
+Processing order: read records -> extract conversations -> group assistant/tool
+segments -> apply selection policies -> normalize messages -> return candidates.
+Candidates contain message-level supervision exclusions; prepare.py converts
+them into token masks. This module does not call the tokenizer.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from typing import Any
 from .schema import SWEConversation, SWESFTConfig, SWESFTReport
 
 
+# Accept both <think> and <thinking> spellings before normalizing their content.
 _THINK_BLOCK = re.compile(
     r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE
 )
@@ -24,9 +30,18 @@ _THINK_OPEN = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
 
 
+# ------------------------------------------------------------------
+# Internal message segments and tokenization candidates
+# ------------------------------------------------------------------
+
+
 @dataclass(slots=True, frozen=True)
 class _AssistantSegment:
-    """An assistant message together with its immediately following tools."""
+    """An assistant and its following tool messages, in [assistant_index, end_index).
+
+    Tool errors are evaluated with the assistant decision that produced them.
+    Both indices refer to the source message list; end_index is exclusive.
+    """
 
     assistant_index: int
     end_index: int
@@ -34,23 +49,43 @@ class _AssistantSegment:
 
 @dataclass(slots=True)
 class _Candidate:
-    """Messages to tokenize and assistant ordinal positions to exclude."""
+    """Selected messages/tools plus assistant ordinals excluded from supervision.
+
+    masked_assistant_indices counts assistant turns only (0, 1, ...), unlike
+    _AssistantSegment indices into the complete message list. Tokens for these
+    turns remain available as context even though their labels are masked.
+    """
 
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] | None
     masked_assistant_indices: set[int]
 
 
+# ------------------------------------------------------------------
+# Reasoning and tool-call normalization for chat templates
+# ------------------------------------------------------------------
+
+
 def _normalize_thinking_tags(content: str) -> str:
+    """Canonicalize supported reasoning tags without changing their inner text."""
+
     content = _THINK_OPEN.sub("<think>", content)
     return _THINK_CLOSE.sub("</think>", content)
 
 
 def _without_thinking(content: str) -> str:
+    """Remove complete reasoning blocks and trim surrounding whitespace."""
+
     return _THINK_BLOCK.sub("", _normalize_thinking_tags(content)).strip()
 
 
 def _tool_calls(value: Any, *, location: str) -> list[dict[str, Any]]:
+    """Copy tool calls after validating their function name and argument shape.
+
+    Arguments may remain JSON strings or mappings; optional JSON decoding is
+    performed later for templates that require argument objects.
+    """
+
     if not isinstance(value, (list, tuple)) or not value:
         raise TypeError(f"{location} must be a non-empty list.")
     calls = []
@@ -84,7 +119,18 @@ def normalize_message(
     location: str,
     strip_thinking: bool,
 ) -> dict[str, Any]:
-    """Keep fields used by chat templates and normalize reasoning content."""
+    """Copy template-facing message fields and normalize assistant reasoning.
+
+    Args:
+        message: Raw message; assistant tool-call content may be null.
+        location: Source description included in field validation errors.
+        strip_thinking: Remove assistant reasoning instead of preserving it.
+
+    Separate reasoning_content is embedded in a canonical <think> block unless
+    inline reasoning already exists. Tool-call IDs and names remain available
+    for template linkage. Diagnostic fields such as is_error are inspected on
+    raw segments before this function drops them from template-facing output.
+    """
 
     if not isinstance(message, Mapping):
         raise TypeError(f"{location} must be a mapping.")
@@ -105,6 +151,7 @@ def normalize_message(
         if strip_thinking:
             normalized_content = _without_thinking(normalized_content)
         elif reasoning and reasoning.strip() and not has_inline:
+            # Avoid duplicating reasoning when the source already embedded a block.
             block = f"<think>\n{reasoning.strip()}\n</think>"
             normalized_content = (
                 block
@@ -128,10 +175,21 @@ def normalize_message(
     return cleaned
 
 
+# ------------------------------------------------------------------
+# Record expansion and assistant/tool segment inspection
+# ------------------------------------------------------------------
+
+
 def conversations_from_record(
     record: Mapping[str, Any], *, record_index: int
 ) -> list[SWEConversation]:
-    """Extract every conversation instead of silently dropping earlier ones."""
+    """Expand flat messages or nested conversations into SWEConversation objects.
+
+    Missing/empty conversations uses the record itself as the conversation.
+    Nested conversations inherit record-level tools unless they supply their
+    own tools field. Field containers are validated and copied; individual
+    message content is normalized later after segment filtering.
+    """
 
     if not isinstance(record, Mapping):
         raise TypeError(f"Record {record_index} must be a mapping.")
@@ -166,6 +224,8 @@ def conversations_from_record(
 
 
 def _segments(messages: list[dict[str, Any]]) -> list[_AssistantSegment]:
+    """Group each assistant with immediately following tools for error inspection."""
+
     segments = []
     index = 0
     while index < len(messages):
@@ -181,6 +241,8 @@ def _segments(messages: list[dict[str, Any]]) -> list[_AssistantSegment]:
 
 
 def _has_tool_error(messages: list[dict[str, Any]], segment: _AssistantSegment) -> bool:
+    """Check whether any following tool result explicitly sets is_error=True."""
+
     return any(
         message.get("role") == "tool" and message.get("is_error") is True
         for message in messages[segment.assistant_index + 1 : segment.end_index]
@@ -188,6 +250,8 @@ def _has_tool_error(messages: list[dict[str, Any]], segment: _AssistantSegment) 
 
 
 def _empty_tool_call(message: Mapping[str, Any]) -> bool:
+    """Detect a tool-calling assistant with neither visible content nor reasoning."""
+
     return bool(message.get("tool_calls")) and not (
         (message.get("content") or "").strip()
         or (message.get("reasoning_content") or "").strip()
@@ -195,6 +259,12 @@ def _empty_tool_call(message: Mapping[str, Any]) -> bool:
 
 
 def _bare_tool_call(message: Mapping[str, Any]) -> bool:
+    """Detect tool calls with content but no nonempty inline/separate reasoning.
+
+    This is an optional dataset-quality filter. A tool call with empty content
+    is handled by _empty_tool_call instead.
+    """
+
     if not message.get("tool_calls"):
         return False
     content = _normalize_thinking_tags(message.get("content") or "")
@@ -203,9 +273,20 @@ def _bare_tool_call(message: Mapping[str, Any]) -> bool:
     return bool(content.strip()) and not has_thinking and not reasoning.strip()
 
 
+# ------------------------------------------------------------------
+# Filtering decisions and target/context reasoning policies
+# ------------------------------------------------------------------
+
+
 def _rejection_reason(
     messages: list[dict[str, Any]], segment: _AssistantSegment, config: SWESFTConfig
 ) -> str | None:
+    """Return the first enabled rejection reason for an assistant/tool segment.
+
+    Priority is tool error, empty call, then bare call. Each inspected segment
+    contributes at most one reason when the report is updated.
+    """
+
     assistant = messages[segment.assistant_index]
     if config.filter_error_segments and _has_tool_error(messages, segment):
         return "error"
@@ -217,6 +298,8 @@ def _rejection_reason(
 
 
 def _count_rejection(report: SWESFTReport, reason: str) -> None:
+    """Increment the report counter for a reason produced by _rejection_reason."""
+
     if reason == "error":
         report.error_segments += 1
     elif reason == "empty_tool_call":
@@ -231,6 +314,13 @@ def _clean_messages(
     target_assistant_index: int | None,
     config: SWESFTConfig,
 ) -> list[dict[str, Any]]:
+    """Apply distinct reasoning policies to the supervised turn and its context.
+
+    A target index selects the final decision in a pair candidate. None applies
+    the target policy to all assistant turns, as used for full trajectories.
+    This choice is separate from which turns will eventually receive loss.
+    """
+
     cleaned = []
     for index, message in enumerate(messages):
         is_assistant = message.get("role") == "assistant"
@@ -250,12 +340,26 @@ def _clean_messages(
     return cleaned
 
 
+# ------------------------------------------------------------------
+# Candidate selection: pre-split pair, progressive pairs, full trajectory
+# ------------------------------------------------------------------
+
+
 def candidates_from_conversation(
     conversation: SWEConversation,
     config: SWESFTConfig,
     report: SWESFTReport,
 ) -> list[_Candidate]:
-    """Create progressive pairs or one full-trajectory candidate."""
+    """Select message sequences and assistant turns eligible for SFT loss.
+
+    pre_split keeps one existing sequence and supervises its last assistant.
+    pair creates a context prefix ending at each accepted assistant decision.
+    trajectory keeps all messages and masks rejected assistant turns in place.
+
+    Updates candidate/rejection counters on report. Conversations without an
+    assistant produce no candidates. Source messages are inspected before
+    normalization so tool-error metadata can inform each filtering decision.
+    """
 
     raw_messages = conversation.messages
     segments = _segments(raw_messages)
@@ -263,6 +367,7 @@ def candidates_from_conversation(
         return []
 
     if config.pre_split:
+        # Earlier assistants remain context; only the last assistant is a target.
         target = segments[-1]
         reason = _rejection_reason(raw_messages, target, config)
         report.candidates += 1
@@ -305,6 +410,7 @@ def candidates_from_conversation(
             )
         return candidates
 
+    # Full-trajectory mode preserves observations and rejected decisions as context.
     report.candidates += 1
     masked = set()
     for segment_index, segment in enumerate(segments):
@@ -325,8 +431,17 @@ def candidates_from_conversation(
     ]
 
 
+# ------------------------------------------------------------------
+# Template argument adaptation and trajectory source loading
+# ------------------------------------------------------------------
+
+
 def parse_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert JSON-string tool arguments for templates that require objects."""
+    """Decode JSON-string arguments on copied calls; preserve existing objects.
+
+    Malformed JSON raises before tokenization. The source message/call mappings
+    are not mutated, allowing reuse under a different template configuration.
+    """
 
     parsed = []
     for message in messages:
@@ -350,7 +465,13 @@ def parse_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def records_from_source(source: Any) -> Iterable[Mapping[str, Any]]:
-    """Read JSONL lazily or pass through an existing iterable of records."""
+    """Read SWE records from a mapping, JSONL path, or existing iterable.
+
+    This is the trajectory-specific source adapter. File rows are checked as
+    JSON objects while iterating; existing iterables are passed through and
+    conversations_from_record validates their records. The file generator is
+    single-pass, whereas the source iterable retains its original semantics.
+    """
 
     if isinstance(source, Mapping):
         return (source,)
@@ -358,6 +479,8 @@ def records_from_source(source: Any) -> Iterable[Mapping[str, Any]]:
         path = source.__fspath__() if hasattr(source, "__fspath__") else source
 
         def read_jsonl() -> Iterable[Mapping[str, Any]]:
+            """Yield nonempty JSONL records, reporting malformed lines at their source."""
+
             with open(path, encoding="utf-8") as stream:
                 for line_number, line in enumerate(stream, start=1):
                     if not line.strip():

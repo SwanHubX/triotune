@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
 from trio_cookbook.dataset import (
     PreferenceExample,
     PromptExample,
     SupervisedExample,
+    load_rows,
     prepare_preference,
     prepare_prompt,
     prepare_rows,
@@ -52,6 +55,16 @@ class Tokenizer:
 
 
 class PromptProcessingTests(unittest.TestCase):
+    def test_load_rows_reads_mapping_and_jsonl_sources(self):
+        self.assertEqual(list(load_rows({"messages": "Q"})), [{"messages": "Q"}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rows.jsonl"
+            path.write_text('{"messages": "Q"}\n\n{"messages": "R"}\n')
+            self.assertEqual(
+                list(load_rows(path)),
+                [{"messages": "Q"}, {"messages": "R"}],
+            )
+
     def test_text_tokens_and_chat_share_one_result_type(self) -> None:
         tokenizer = Tokenizer()
         examples = [

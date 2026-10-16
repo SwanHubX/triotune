@@ -1,22 +1,33 @@
-"""Unified row validation, tokenization, masking, and length handling.
+"""Convert raw rows into prompt, supervised, or preference example contracts.
 
-The public functions accept the small set of dataset shapes documented in the
-trainer README.  They intentionally avoid dataset-name-specific branches: a
-JSONL file, Hugging Face ``Dataset``, or ordinary iterable behaves the same as
-long as each row follows the fixed field contract.
+Each prepare_* function processes one mapping. prompt.py supplies shared text
+and chat rendering; examples.py validates the resulting token structures.
+prepare_rows additionally loads a source through load.py and collects all
+results. None of these functions schedules batches or creates SDK Datums.
+
+Length policies are format-specific: prompts and preference pairs reject
+overlong inputs; SFT truncates input_ids and labels together from the right.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
 
 from .examples import IGNORE_INDEX, PreferenceExample, PromptExample, SupervisedExample
+from .load import load_rows
 from .prompt import _token_list, render_prompt
 
 
+# ------------------------------------------------------------------
+# Shared row, mask, sequence-length, and EOS validation
+# ------------------------------------------------------------------
+
+
 def _row(row: Any, *, index: int | None = None) -> Mapping[str, Any]:
+    """Require a mapping and include the optional zero-based row index in errors."""
+
     if isinstance(row, Mapping):
         return row
     location = "Dataset row" if index is None else f"Dataset row {index}"
@@ -24,7 +35,7 @@ def _row(row: Any, *, index: int | None = None) -> Mapping[str, Any]:
 
 
 def _binary_mask(value: Any, *, length: int, field: str) -> list[int]:
-    """Normalize list-like masks and reject silent broadcasting or flattening."""
+    """Require exactly one 0/1 value per token, preserving positional alignment."""
 
     if hasattr(value, "tolist"):
         value = value.tolist()
@@ -36,6 +47,8 @@ def _binary_mask(value: Any, *, length: int, field: str) -> list[int]:
 
 
 def _max_length(value: int | None) -> int | None:
+    """Normalize an optional sequence limit, allowing at least one causal target."""
+
     if value is not None and (
         isinstance(value, bool) or not isinstance(value, Integral) or value < 2
     ):
@@ -55,6 +68,11 @@ def _append_eos(tokens: list[int], tokenizer: Any, *, enabled: bool) -> None:
         tokens.append(int(eos))
 
 
+# ------------------------------------------------------------------
+# Generation prompts: render the context and reserve completion space
+# ------------------------------------------------------------------
+
+
 def prepare_prompt(
     row: Mapping[str, Any],
     tokenizer: Any,
@@ -66,12 +84,20 @@ def prepare_prompt(
     min_completion_tokens: int = 0,
     row_index: int | None = None,
 ) -> PromptExample:
-    """Prepare one prompt-only row for generation algorithms such as GRPO/OPD.
+    """Prepare a generation context as PromptExample(text, tokens).
 
-    ``min_completion_tokens`` reserves space inside ``max_length``.  OPD uses
-    one reserved token because a prompt that fills the complete context cannot
-    produce a training target; GRPO can omit the limit when its service handles
-    the generation context budget.
+    Args:
+        row: Raw mapping with a prompt_key field; unrelated fields are untouched.
+        tokenizer: Tokenizer used by render_prompt for this prompt's input form.
+        prompt_key: Field containing text, token IDs, or text-only chat messages.
+        add_generation_prompt: Include the chat template's assistant prefix.
+        chat_template_kwargs: Additional template-specific rendering options.
+        max_length: Optional budget for prompt plus reserved completion tokens.
+        min_completion_tokens: Space to reserve within that budget, commonly 1 for OPD.
+        row_index: Optional source index used only to locate invalid rows.
+
+    The prompt is never truncated. Exceeding the budget raises an error so the
+    trainer cannot silently change the context used for generation/scoring.
     """
 
     row = _row(row, index=row_index)
@@ -106,6 +132,11 @@ def prepare_prompt(
     return example
 
 
+# ------------------------------------------------------------------
+# Preference pairs: share one prompt and keep responses separate
+# ------------------------------------------------------------------
+
+
 def _completion_tokens(
     value: Any,
     prompt: Any,
@@ -113,7 +144,12 @@ def _completion_tokens(
     tokenizer: Any,
     chat_template_kwargs: Mapping[str, Any] | None,
 ) -> list[int]:
-    """Tokenize a DPO response without duplicating its shared prompt."""
+    """Return completion-only tokens from text, token IDs, or chat responses.
+
+    For chat responses, render prompt + response together and remove the exact
+    prompt-token prefix. Reject templates that rewrite the prefix, since a
+    guessed boundary would associate loss with the wrong tokens.
+    """
 
     if isinstance(value, str):
         tokens = _token_list(
@@ -161,7 +197,17 @@ def prepare_preference(
     max_length: int | None = None,
     row_index: int | None = None,
 ) -> PreferenceExample:
-    """Prepare one DPO row and mask each prompt prefix from preference loss."""
+    """Prepare one ordered preference pair with a shared rendered prompt.
+
+    prompt_key, chosen_key, and rejected_key select the three input fields.
+    Responses are tokenized separately, optionally terminated with EOS, and
+    checked against max_length including the shared prompt. Overlong pairs
+    raise instead of truncating one alternative differently from the other.
+
+    Returns PreferenceExample(prompt, chosen, rejected) with completion-only
+    response fields. Prompt labels are masked later by its sequence() method
+    or by the DPO trainer when constructing a supervised sequence.
+    """
 
     row = _row(row, index=row_index)
     max_length = _max_length(max_length)
@@ -180,6 +226,7 @@ def prepare_preference(
         row_index=row_index,
     )
     completions: list[list[int]] = []
+    # Preserve chosen/rejected ordering for the downstream pairwise objective.
     for key in (chosen_key, rejected_key):
         tokens = _completion_tokens(
             row[key], row[prompt_key], prompt.input_ids, tokenizer, chat_template_kwargs
@@ -190,6 +237,11 @@ def prepare_preference(
             raise ValueError(f"{location} {key} exceeds max_length={max_length}.")
         completions.append(tokens)
     return PreferenceExample(prompt.input_ids, completions[0], completions[1])
+
+
+# ------------------------------------------------------------------
+# Supervised examples: derive unshifted labels and supervision masks
+# ------------------------------------------------------------------
 
 
 def prepare_sft(
@@ -203,13 +255,24 @@ def prepare_sft(
     add_eos_token: bool = True,
     chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> SupervisedExample:
-    """Prepare one fixed-format SFT row and derive its token loss mask.
+    """Convert one supported SFT row to equal-length input_ids and labels.
 
-    Supported rows contain one of ``input_ids``, ``messages``, a
-    ``prompt``/``completion`` pair, or ``text_field``.  Pretokenized rows may
-    supply ``labels`` (using -100 for masked positions), ``loss_mask`` (using
-    0/1 values), or both when the two masks agree.  This lets the serialized
-    result round-trip through the same validation path.
+    Args:
+        row: Pretokenized IDs, a prompt/completion pair, messages, or plain text.
+        tokenizer: Encodes raw content and supplies optional assistant masks.
+        text_field: Plain-text fallback column, used after other supported shapes.
+        max_length: Right-truncate both inputs and labels to this token limit.
+        completion_only_loss: Mask the prompt in paired rows; None enables this
+            automatically for pairs and disables it for other raw input forms.
+        assistant_only_loss: Require a conversational template with assistant masks.
+        add_eos_token: Append EOS only to raw non-conversational sequences if absent.
+        chat_template_kwargs: Additional options passed to chat rendering.
+
+    Pretokenized rows retain their IDs and labels; no EOS is appended. They
+    can provide labels (-100 masks targets), loss_mask (0/1), or both if the
+    masks agree. assistant_only_loss requires raw conversational inputs.
+    The returned SupervisedExample remains unshifted and verifies that a
+    supervised next-token target survives masking and truncation.
     """
 
     row = _row(row)
@@ -218,6 +281,7 @@ def prepare_sft(
         raise ValueError("text_field must be a non-empty string.")
     conversational = False
     if "input_ids" in row:
+        # Cached/pretokenized rows already encode supervision boundaries.
         tokens = _token_list(row["input_ids"], source="input_ids")
         if completion_only_loss and "labels" not in row and "loss_mask" not in row:
             raise ValueError(
@@ -234,11 +298,13 @@ def prepare_sft(
         else:
             labels = list(tokens)
         if "labels" in row and "loss_mask" in row:
+            # Reject conflicting supervision descriptions rather than picking one.
             mask = _binary_mask(row["loss_mask"], length=len(tokens), field="loss_mask")
             label_mask = [int(label != IGNORE_INDEX) for label in labels]
             if mask != label_mask:
                 raise ValueError("labels and loss_mask describe different supervised tokens.")
     else:
+        # Raw-input precedence: complete prompt/completion pair, messages, text.
         paired = "prompt" in row and "completion" in row
         prompt_tokens: list[int] = []
         if paired:
@@ -271,6 +337,8 @@ def prepare_sft(
 
         assistant_mask: list[int] | None
         if conversational and assistant_only_loss:
+            # Token spans come from the template; string matching cannot reliably
+            # recover boundaries around role markers, reasoning, and special tokens.
             output = tokenizer.apply_chat_template(
                 value,
                 tokenize=True,
@@ -306,6 +374,7 @@ def prepare_sft(
         if paired and tokens[: len(prompt_tokens)] != prompt_tokens:
             raise ValueError("The tokenized prompt is not a prefix of the full example.")
         if not conversational:
+            # Chat templates own their terminators; avoid appending a second one.
             before_eos = len(tokens)
             _append_eos(tokens, tokenizer, enabled=add_eos_token)
             if len(tokens) != before_eos and assistant_mask is not None:
@@ -316,6 +385,7 @@ def prepare_sft(
             completion_only = paired
         if completion_only and not paired:
             raise ValueError("completion_only_loss requires prompt/completion rows.")
+        # When both policies apply, train only assistant tokens in the completion.
         labels = [
             token
             if (not completion_only or index >= len(prompt_tokens))
@@ -329,22 +399,38 @@ def prepare_sft(
     if assistant_only_loss and not conversational:
         raise ValueError("assistant_only_loss requires conversational data.")
     if max_length is not None:
+        # Slice both fields together; SupervisedExample checks remaining targets.
         tokens, labels = tokens[:max_length], labels[:max_length]
     return SupervisedExample(input_ids=tokens, labels=labels)
 
 
+# ------------------------------------------------------------------
+# Dataset convenience entry point: load and collect prepared examples
+# ------------------------------------------------------------------
+
+
 def prepare_rows(
-    rows: Iterable[Mapping[str, Any]],
+    rows: Any,
     tokenizer: Any,
     *,
     format: str,
     **kwargs: Any,
 ) -> list[PromptExample | SupervisedExample | PreferenceExample]:
-    """Prepare an iterable through one explicit, algorithm-selected format.
+    """Load rows and eagerly prepare them using an explicitly selected format.
 
-    The algorithm chooses the format because a ``messages`` row can validly be
-    either an SFT conversation or a generation prompt; guessing from its
-    contents would make preprocessing dependent on accidental data values.
+    Args:
+        rows: One mapping, a JSONL path, or an existing iterable accepted by load_rows.
+        tokenizer: Tokenizer forwarded to the selected single-row processor.
+        format: 'prompt', 'sft', or 'preference'; no content-based algorithm guessing.
+        **kwargs: Format-specific options forwarded to the selected processor.
+
+    Returns:
+        An in-memory list of example objects in source order, not runtime batches.
+        Use the single-row functions directly when preparing a stream incrementally.
+
+    A messages field can represent either a supervised dialogue or a generation
+    prompt, so the caller must specify the intended format. The first invalid
+    row stops preparation; no filtering or silent recovery is performed here.
     """
 
     processors = {
@@ -357,7 +443,7 @@ def prepare_rows(
     except KeyError as error:
         raise ValueError("format must be 'prompt', 'sft', or 'preference'.") from error
     prepared = []
-    for index, row in enumerate(rows):
+    for index, row in enumerate(load_rows(rows)):
         if format in {"prompt", "preference"}:
             prepared.append(processor(row, tokenizer, row_index=index, **kwargs))
         else:

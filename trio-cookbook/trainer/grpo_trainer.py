@@ -8,7 +8,6 @@ implements group-centered advantages with PyTRIO ``importance_sampling``.
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import math
 import time
@@ -31,6 +30,7 @@ from ..api.client_api import (
 from ..api.cli_args import GRPOConfig
 from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
 from .grpo.advantages import group_advantages
 from .grpo.datum import build_aligned_datum, to_client_datum
@@ -717,15 +717,8 @@ class GRPOTrainer:
         """Yield prompt batches using GRPO evaluation limits."""
 
         config = self.config.evaluation
-        iterator = iter(dataset)
         batch_size = config.batch_size or self.config.batch_size
-        produced = 0
-        while config.max_batches is None or produced < config.max_batches:
-            rows = list(itertools.islice(iterator, batch_size))
-            if not rows:
-                break
-            produced += 1
-            yield rows
+        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store and report GRPO rollout metrics at the current policy step."""
@@ -832,13 +825,13 @@ class GRPOTrainer:
                 and getattr(self, "_last_eval_step", None) is None
             ):
                 self.evaluate()
-            iterator = iter(self.train_dataset)
+            batches = iter_batches(self.train_dataset, self.config.batch_size)
             last_rows: list[Mapping[str, Any]] = []
             while (
                 self.config.max_steps is None
                 or self.state.global_step < self.config.max_steps
             ):
-                rows = list(itertools.islice(iterator, self.config.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = self.step(rows)
@@ -903,13 +896,13 @@ class GRPOTrainer:
                 and getattr(self, "_last_eval_step", None) is None
             ):
                 await self.evaluate_async()
-            iterator = iter(self.train_dataset)
+            batches = iter_batches(self.train_dataset, self.config.batch_size)
             last_rows: list[Mapping[str, Any]] = []
             while (
                 self.config.max_steps is None
                 or self.state.global_step < self.config.max_steps
             ):
-                rows = list(itertools.islice(iterator, self.config.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = await self.step_async(rows)

@@ -8,7 +8,6 @@ pairwise loss locally, and sends its gradients back to the training service.
 from __future__ import annotations
 
 import asyncio
-import itertools
 import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -29,6 +28,8 @@ from ..dataset import (
     prepare_prompt,
 )
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.dataloader import iter_batches
+from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
 from .dpo.loss import make_loss_fn as _loss_fn
 from .dpo.state import DPOResult, DPOState
@@ -41,10 +42,7 @@ def _datum(prompt: list[int], completion: list[int]) -> Any:
         input_ids=prompt + completion,
         labels=[IGNORE_INDEX] * len(prompt) + completion,
     )
-    return trio.Datum(
-        model_input=trio.ModelInput.from_ints(example.model_input),
-        loss_fn_inputs={"target_tokens": example.target_tokens},
-    )
+    return causal_datum(example.input_ids, example.target_tokens)
 
 
 def _reference_logprob(
@@ -265,15 +263,8 @@ class DPOTrainer:
         """Yield preference batches using DPO evaluation limits."""
 
         config = self.args.evaluation
-        iterator = iter(dataset)
         batch_size = config.batch_size or self.args.batch_size
-        produced = 0
-        while config.max_batches is None or produced < config.max_batches:
-            rows = list(itertools.islice(iterator, batch_size))
-            if not rows:
-                break
-            produced += 1
-            yield rows
+        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store DPO validation metrics without changing optimizer state."""
@@ -653,7 +644,7 @@ class DPOTrainer:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
         started = time.perf_counter()
-        iterator = iter(self.train_dataset)
+        batches = iter_batches(self.train_dataset, self.args.batch_size)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
         last_rows: list[Mapping[str, Any]] = []
         try:
@@ -664,7 +655,7 @@ class DPOTrainer:
             ):
                 self.evaluate()
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
-                rows = list(itertools.islice(iterator, self.args.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = self.step(rows)
@@ -707,7 +698,7 @@ class DPOTrainer:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train_async().")
         started = time.perf_counter()
-        iterator = iter(self.train_dataset)
+        batches = iter_batches(self.train_dataset, self.args.batch_size)
         progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
         last_rows: list[Mapping[str, Any]] = []
         try:
@@ -718,7 +709,7 @@ class DPOTrainer:
             ):
                 await self.evaluate_async()
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
-                rows = list(itertools.islice(iterator, self.args.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = await self.step_async(rows)

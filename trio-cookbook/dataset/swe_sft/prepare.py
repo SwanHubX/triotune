@@ -1,4 +1,10 @@
-"""Convert normalized SWE agent trajectories into PyTRIO SFT examples."""
+"""Map selected SWE assistant turns onto supervised token spans.
+
+trajectory.py selects messages and identifies assistant turns to exclude.
+This module obtains the template's assistant-token mask, checks turn/span
+alignment, applies exclusions, and stores unshifted SupervisedExample objects.
+The resulting SWESFTDataset supplies pretokenized rows to SFTTrainer.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +23,18 @@ from .trajectory import (
 )
 
 
+# ------------------------------------------------------------------
+# Tokenizer shape normalization and assistant-span tracking
+# ------------------------------------------------------------------
+
+
 def _flat_list(value: Any, *, field: str) -> list[Any]:
+    """Copy tokenizer output to a list, removing a single leading batch wrapper.
+
+    Token and mask element values are checked by _tokenize_candidate. This
+    helper handles array-like outputs without depending on Torch or NumPy.
+    """
+
     if hasattr(value, "tolist"):
         value = value.tolist()
     if (
@@ -32,10 +49,11 @@ def _flat_list(value: Any, *, field: str) -> list[Any]:
 
 
 def _assistant_spans(mask: list[int]) -> list[tuple[int, int]]:
-    """Return contiguous assistant spans produced by generation tracking."""
+    """Return half-open [start, end) ranges of contiguous enabled mask values."""
 
     spans = []
     start = None
+    # A trailing zero closes an assistant span that reaches the end of the mask.
     for index, enabled in enumerate([*mask, 0]):
         if enabled and start is None:
             start = index
@@ -45,11 +63,24 @@ def _assistant_spans(mask: list[int]) -> list[tuple[int, int]]:
     return spans
 
 
+# ------------------------------------------------------------------
+# Candidate rendering and message-to-token supervision alignment
+# ------------------------------------------------------------------
+
+
 def _tokenize_candidate(
     candidate: _Candidate,
     tokenizer: Any,
     config: SWESFTConfig,
 ) -> tuple[list[int], list[int]]:
+    """Render one candidate and return equally sized token IDs and loss mask.
+
+    The template must return one contiguous tracked span per assistant message.
+    This requirement maps message ordinals in masked_assistant_indices to exact
+    token positions. Misaligned templates raise rather than guessing boundaries.
+    Tool, user, and system tokens remain context with loss_mask=0.
+    """
+
     messages = candidate.messages
     if config.parse_tool_call_arguments:
         messages = parse_tool_call_arguments(messages)
@@ -90,6 +121,7 @@ def _tokenize_candidate(
         raise ValueError("assistant_masks must contain only 0 and 1 values.")
 
     spans = _assistant_spans([int(bit) for bit in assistant_mask])
+    # Candidate exclusions refer to assistant ordinals, not message-list indices.
     assistant_count = sum(
         message.get("role") == "assistant" for message in messages
     )
@@ -105,22 +137,37 @@ def _tokenize_candidate(
     return [int(token) for token in input_ids], loss_mask
 
 
+# ------------------------------------------------------------------
+# Public pipeline: load records, select candidates, tokenize, and report
+# ------------------------------------------------------------------
+
+
 def prepare_swe_sft_dataset(
     source: Any,
     tokenizer: Any,
     config: SWESFTConfig | None = None,
 ) -> SWESFTDataset:
-    """Prepare a JSONL path or iterable of SWE trajectory records.
+    """Collect assistant-supervised examples from SWE trajectory records.
 
-    The returned object is an iterable of pretokenized mappings accepted
-    directly by :class:`SFTTrainer`. Intentional filters are counted in
-    ``dataset.report``; malformed records or tokenizer alignment failures raise
-    immediately because silently training the wrong tokens is unsafe.
+    Args:
+        source: A single record, JSONL path, or iterable accepted by records_from_source.
+        tokenizer: Chat tokenizer supporting tools and assistant-token tracking.
+        config: Candidate selection, reasoning, filtering, and length policies.
+
+    Returns:
+        An in-memory SWESFTDataset with reusable pretokenized rows and a report.
+        Multiple conversations and assistant turns may yield multiple examples
+        per source record. The source is consumed fully before returning.
+
+    Configured filters update report counters. Overlong candidates are dropped
+    whole to preserve tool-call structure. Malformed input/template alignment
+    raises immediately; producing no trainable examples also raises with counts.
     """
 
     config = config or SWESFTConfig()
     report = SWESFTReport()
     examples = []
+    # Read each record once; nested conversations are processed independently.
     for record_index, record in enumerate(records_from_source(source)):
         report.records += 1
         conversations = conversations_from_record(record, record_index=record_index)
@@ -130,6 +177,7 @@ def prepare_swe_sft_dataset(
             for candidate in candidates:
                 input_ids, loss_mask = _tokenize_candidate(candidate, tokenizer, config)
                 if config.max_length is not None and len(input_ids) > config.max_length:
+                    # Unlike generic SFT truncation, keep tool trajectories intact.
                     report.filtered_overlong += 1
                     continue
                 # Position zero has no preceding model input and can never be

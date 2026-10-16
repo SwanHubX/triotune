@@ -7,7 +7,6 @@ reverse-KL policy-gradient surrogate, not full-vocabulary KL distillation.
 from __future__ import annotations
 
 import asyncio
-import itertools
 import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -20,6 +19,7 @@ from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
 from ..dataset import PromptExample, prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
+from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
 from .opd.distillation import (
     _ScoredCompletion,
@@ -445,15 +445,8 @@ class OPDTrainer:
         """Yield prompt batches using OPD evaluation limits."""
 
         config = self.args.evaluation
-        iterator = iter(dataset)
         batch_size = config.batch_size or self.args.batch_size
-        produced = 0
-        while config.max_batches is None or produced < config.max_batches:
-            rows = list(itertools.islice(iterator, batch_size))
-            if not rows:
-                break
-            produced += 1
-            yield rows
+        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store sampled distillation metrics without changing policy version."""
@@ -548,9 +541,9 @@ class OPDTrainer:
                 and self._last_eval_step is None
             ):
                 await self._evaluate_async(self.valid_dataset)
-            iterator = iter(self.train_dataset)
+            batches = iter_batches(self.train_dataset, self.args.batch_size)
             while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
-                rows = list(itertools.islice(iterator, self.args.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 result = await self._step_async(rows)

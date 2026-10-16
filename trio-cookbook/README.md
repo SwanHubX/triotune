@@ -17,7 +17,7 @@ trio-cookbook/
 │   ├── dpo/          # 偏好数据、成对损失与训练编排
 │   ├── sft/          # 标签处理与异步流水线训练
 │   └── opd/          # 教师评分、蒸馏信号与训练编排
-└── utils/            # 指标、日志与 checkpoint 跨模块实现
+└── utils/            # batch、Datum、指标与 checkpoint 跨模块实现
 ```
 
 训练器模块的详细职责见 [trainer/README.md](trainer/README.md)；脚本参数及独立版示例见

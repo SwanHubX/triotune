@@ -14,6 +14,8 @@ from ..api.client_api import (
     wait_async,
 )
 from .checkpoint import checkpoint_path, save_checkpoint, save_checkpoint_async
+from .dataloader import iter_batches
+from .datums import causal_datum, materialize_datum
 from .metrics import MetricsAPI, metric_name, normalize_metrics
 
 # ``trio_cookbook.utils.client`` was public before client contracts moved into
@@ -26,6 +28,9 @@ __all__ = [
     "call_async",
     "checkpoint_path",
     "client",
+    "causal_datum",
+    "iter_batches",
+    "materialize_datum",
     "metric_name",
     "normalize_metrics",
     "optimizer_params",

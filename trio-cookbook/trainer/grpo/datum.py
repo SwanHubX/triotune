@@ -11,6 +11,7 @@ import math
 from collections.abc import Callable
 from typing import Any
 
+from ...utils.datums import materialize_datum
 from .contracts import GRPODatum, SequenceSample
 
 
@@ -71,17 +72,8 @@ def to_client_datum(datum: GRPODatum, factory: Callable[..., Any] | None = None)
     """Materialize a SDK Datum without importing tinker/trl at module import."""
 
     validate_datum(datum)
-    inputs = datum.loss_fn_inputs
-    if factory is not None:
-        return factory(model_input=datum.model_input, loss_fn_inputs=inputs)
-    # Installed PyTRIO packages can provide their own public Datum class.  The
-    # fallback dataclass remains useful for fake clients and unit tests.
-    for module_name in ("pytrio", "tinker"):
-        try:
-            module = __import__(module_name)
-        except ImportError:
-            continue
-        cls = getattr(module, "Datum", None)
-        if cls is not None:
-            return cls(model_input=datum.model_input, loss_fn_inputs=inputs)
-    return datum
+    return materialize_datum(
+        datum.model_input,
+        datum.loss_fn_inputs,
+        datum_factory=factory,
+    )

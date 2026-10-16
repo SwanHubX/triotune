@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
-import pytrio as trio
+from ...utils.datums import materialize_datum
 
 
 @dataclass(slots=True)
@@ -87,9 +87,9 @@ def build_opd_datum(
     if any(not math.isfinite(value) for value in advantages):
         raise ValueError("Distillation advantages must be finite.")
     padding = len(prompt) - 1
-    return trio.Datum(
-        model_input=trio.ModelInput.from_ints(prompt + completion[:-1]),
-        loss_fn_inputs={
+    return materialize_datum(
+        prompt + completion[:-1],
+        {
             # -100 excludes prompt tokens from PyTRIO's active-token loss
             # denominator as well as their gradient; zero advantages alone
             # would still dilute the completion signal for long prompts.

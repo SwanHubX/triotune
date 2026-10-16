@@ -15,6 +15,8 @@ trio_cookbook/
 │   └── swe_sft/         # 软件工程智能体轨迹的 SFT 数据处理
 ├── utils/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
+│   ├── dataloader.py    # 流式数据集的 batch 迭代
+│   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
 │   └── metrics.py       # 指标规范化、窗口聚合与 SwanLab 提交
 └── trainer/
     ├── __init__.py      # 公开导出与历史模块路径兼容
@@ -50,12 +52,22 @@ trio_cookbook/
 | [SWE 轨迹](../dataset/swe_sft/) | 将包含工具调用、工具结果和多轮决策的软件工程智能体轨迹转换为 PyTRIO SFT 数据。 |
 | [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、窗口聚合、SwanLab 提交、文本记录和 run 结束。 |
 | [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
+| [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
+| [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |
 | [GRPO 编排](./grpo_trainer.py) | 组织采样、奖励、advantage、Datum、远端更新以及同步／异步训练。 |
 | [GRPO 奖励](./grpo/rewards.py)、[优势](./grpo/advantages.py) | 适配奖励函数、聚合加权奖励，计算组内 centered advantage。 |
 | [GRPO 采样](./grpo/rollout.py)、[对齐](./grpo/datum.py)、[指标](./grpo/metrics.py) | 解析分组采样结果，完成 token shift，计算 rollout 统计和策略变化估计。 |
 | [DPO 编排](./dpo_trainer.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；损失模块实现成对目标与算法指标。 |
 | [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
 | [OPD 编排](./opd_trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
+
+```text
+dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
+```
+
+`dataset/` 负责从 mapping、JSONL 或已有 iterable 加载原始行，并转换成标准样本；batch 切分、Datum 外壳构造属于运行时
+数据管线。GRPO/OPD 的 logprob、advantage、teacher score 和 prompt mask 仍由算法
+模块决定。
 
 
 

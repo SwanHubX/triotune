@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -15,6 +14,8 @@ from tqdm import tqdm
 from ..api.cli_args import SFTConfig
 from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
 from ..dataset import SupervisedExample, prepare_sft
+from ..utils.dataloader import iter_batches
+from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
 from .sft.state import SFTState
 
@@ -83,10 +84,7 @@ class SFTTrainer:
 
         examples = [self._prepare_example(row) for row in rows]
         datums = [
-            trio.Datum(
-                model_input=trio.ModelInput.from_ints(example.model_input),
-                loss_fn_inputs={"target_tokens": example.target_tokens},
-            )
+            causal_datum(example.input_ids, example.target_tokens)
             for example in examples
         ]
         return examples, datums
@@ -101,15 +99,8 @@ class SFTTrainer:
         """Yield SFT validation batches under this trainer's evaluation limits."""
 
         config = self.args.evaluation
-        iterator = iter(dataset)
         batch_size = config.batch_size or self.args.batch_size
-        produced = 0
-        while config.max_batches is None or produced < config.max_batches:
-            rows = list(itertools.islice(iterator, batch_size))
-            if not rows:
-                break
-            produced += 1
-            yield rows
+        yield from iter_batches(dataset, batch_size, max_batches=config.max_batches)
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store and log SFT validation metrics without advancing the step."""
@@ -282,7 +273,7 @@ class SFTTrainer:
 
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
-        iterator = iter(self.train_dataset)
+        batches = iter_batches(self.train_dataset, self.args.batch_size)
         progress = tqdm(total=self.args.max_steps, desc="SFT train", unit="step")
         pending: list[asyncio.Task[dict[str, float]]] = []
         previous = None
@@ -308,7 +299,7 @@ class SFTTrainer:
                     await pending.pop(0)
                 while pending and pending[0].done():
                     pending.pop(0).result()
-                rows = list(itertools.islice(iterator, self.args.batch_size))
+                rows = next(batches, None)
                 if not rows:
                     break
                 submitted += 1

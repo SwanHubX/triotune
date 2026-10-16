@@ -10,6 +10,8 @@ from trio_cookbook.utils.checkpoint import (
     save_checkpoint,
     save_checkpoint_async,
 )
+from trio_cookbook.utils.dataloader import iter_batches
+from trio_cookbook.utils.datums import causal_datum, materialize_datum
 from trio_cookbook.utils.metrics import (
     accumulate_metrics,
     averaged_metrics,
@@ -124,6 +126,48 @@ class LoggingTests(unittest.TestCase):
                 "distill/reverse_kl": 4.0,
                 "train/grad_norm": 5.0,
             },
+        )
+
+    def test_iter_batches_is_lazy_and_limits_validation_batches(self):
+        rows = (index for index in range(5))
+        self.assertEqual(list(iter_batches(rows, 2)), [[0, 1], [2, 3], [4]])
+        self.assertEqual(
+            list(iter_batches(range(10), 3, max_batches=2)),
+            [[0, 1, 2], [3, 4, 5]],
+        )
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            list(iter_batches([], 0))
+
+    def test_generic_datum_helpers_preserve_algorithm_loss_inputs(self):
+        calls = []
+
+        def model_input(tokens):
+            calls.append(("model", list(tokens)))
+            return ("model", list(tokens))
+
+        def datum_factory(*, model_input, loss_fn_inputs):
+            calls.append(("datum", model_input, loss_fn_inputs))
+            return {"model_input": model_input, "loss_fn_inputs": loss_fn_inputs}
+
+        datum = causal_datum(
+            [10, 11, 12],
+            [-100, 12],
+            model_input_factory=model_input,
+            datum_factory=datum_factory,
+        )
+        self.assertEqual(datum["model_input"], ("model", [10, 11]))
+        self.assertEqual(datum["loss_fn_inputs"], {"target_tokens": [-100, 12]})
+        self.assertEqual(calls[0], ("model", [10, 11]))
+
+        generic = materialize_datum(
+            [1, 2],
+            {"target_tokens": [2], "advantages": [0.5]},
+            model_input_factory=model_input,
+            datum_factory=datum_factory,
+        )
+        self.assertEqual(
+            generic["loss_fn_inputs"],
+            {"target_tokens": [2], "advantages": [0.5]},
         )
 
 
