@@ -5,14 +5,22 @@ import sys
 # Public configuration and algorithm components are collected here so research
 # code can import extension points from one stable package boundary.
 from ...api.cli_args import OPDConfig
+from ..opd_trainer import OPDTrainer
 from .contracts import (
+    OPDPrompt,
     OPDResult,
     OPDRollout,
     OPDState,
+    OPDTeacherGroup,
+    OPDTeacherSpec,
     OPDTeacherTarget,
     OPDTrainingSample,
-    validate_logprobs,
-    validate_tokens,
+)
+from .contracts import (
+    validate_logprobs as _validate_logprobs,
+)
+from .contracts import (
+    validate_tokens as _validate_tokens,
 )
 from .datum import build_opd_datum
 from .execution import OPDExecutionPlan
@@ -20,8 +28,18 @@ from .loss import SampledReverseKLLoss, distillation_advantages
 from .metrics import OPDMetricReducer, OPDMetricTotals
 from .rollout import OPDRolloutPhase
 from .targets import OPDTargetBuilder
-from .teacher_phase import OPDTeacherPhase, teacher_completion_logprobs
-from ..opd_trainer import OPDTrainer
+from .teacher_phase import (
+    OPDTeacherPhase,
+)
+from .teacher_phase import (
+    teacher_completion_logprobs as _teacher_completion_logprobs,
+)
+
+# These helpers remain package attributes solely for historical
+# ``opd.distillation`` imports; focused modules are preferred by new code.
+validate_logprobs = _validate_logprobs
+validate_tokens = _validate_tokens
+teacher_completion_logprobs = _teacher_completion_logprobs
 
 # ---------------------------------------------------------------------------
 # Historical module compatibility
@@ -41,11 +59,14 @@ __all__ = [
     "OPDExecutionPlan",
     "OPDMetricReducer",
     "OPDMetricTotals",
+    "OPDPrompt",
     "OPDResult",
     "OPDRollout",
     "OPDRolloutPhase",
     "OPDState",
     "OPDTeacherPhase",
+    "OPDTeacherGroup",
+    "OPDTeacherSpec",
     "OPDTeacherTarget",
     "OPDTargetBuilder",
     "OPDTrainer",

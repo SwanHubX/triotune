@@ -9,7 +9,6 @@ from .contracts import OPDTeacherTarget, OPDTrainingSample
 from .datum import build_opd_datum
 from .loss import SampledReverseKLLoss
 
-
 # ---------------------------------------------------------------------------
 # Teacher target to remote training datum
 # ---------------------------------------------------------------------------
@@ -25,11 +24,21 @@ class OPDTargetBuilder:
 
     def build(self, target: OPDTeacherTarget) -> OPDTrainingSample:
         rollout = target.rollout
-        # Convert aligned policy scores into detached token credit before the
-        # model-facing datum is created.
+        # Restore the unnormalized group weight in both policy terms:
+        #   sum_j w_j log p_teacher_j - (sum_j w_j) log p_behavior.
+        # This is the sampled reverse-KL signal for a weighted geometric
+        # ensemble and preserves the user's intended group scale.
+        weighted_student = [
+            target.teacher_weight_sum * value
+            for value in rollout.behavior_logprobs
+        ]
+        weighted_teacher = [
+            target.teacher_weight_sum * value
+            for value in target.teacher_logprobs
+        ]
         advantages = self.loss.advantages(
-            rollout.behavior_logprobs,
-            target.teacher_logprobs,
+            weighted_student,
+            weighted_teacher,
         )
         # Datum construction owns causal shifting and prompt masking; this phase
         # only connects the algorithm signal to that representation.
@@ -48,6 +57,7 @@ class OPDTargetBuilder:
             rollout=rollout,
             teacher_logprobs=target.teacher_logprobs,
             advantages=advantages,
+            teacher_weight_sum=target.teacher_weight_sum,
         )
 
 

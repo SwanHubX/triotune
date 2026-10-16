@@ -10,8 +10,10 @@ from trio_cookbook.trainer.opd import (
     OPDExecutionPlan,
     OPDMetricReducer,
     OPDRollout,
-    OPDTeacherTarget,
     OPDTargetBuilder,
+    OPDTeacherGroup,
+    OPDTeacherSpec,
+    OPDTeacherTarget,
     SampledReverseKLLoss,
 )
 from trio_cookbook.trainer.opd.metrics import OPDMetricTotals
@@ -82,7 +84,8 @@ class OPDModuleTests(unittest.TestCase):
             plan.materialize(
                 prompts,
                 sampler=object(),
-                teacher_client=object(),
+                teacher_clients={"teacher": object()},
+                teacher_groups={"default": {"teacher": 1.0}},
                 config=config,
                 behavior_policy_version=7,
                 seed_offset=0,
@@ -118,6 +121,18 @@ class OPDModuleTests(unittest.TestCase):
         rollout = OPDRollout([1], [2], [-1.0], 0, 0, 0)
         with self.assertRaisesRegex(ValueError, "align"):
             OPDTeacherTarget(rollout, [-1.0, -2.0])
+
+    def test_teacher_specs_and_groups_validate_public_multi_teacher_input(self):
+        spec = OPDTeacherSpec(" math ", "teacher-model", " checkpoint://math ")
+        group = OPDTeacherGroup(" blend ", {"math": 2, "code": 0.5})
+
+        self.assertEqual(spec.teacher_id, "math")
+        self.assertEqual(spec.model_path, "checkpoint://math")
+        self.assertEqual(group.name, "blend")
+        self.assertEqual(dict(group.teachers), {"math": 2.0, "code": 0.5})
+        for weights in ({}, {"math": 0}, {"math": float("nan")}):
+            with self.subTest(weights=weights), self.assertRaises(ValueError):
+                OPDTeacherGroup("bad", weights)
 
 
 if __name__ == "__main__":

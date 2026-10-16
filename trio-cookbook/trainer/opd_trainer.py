@@ -1,4 +1,4 @@
-"""PyTRIO OPD: student rollouts, fixed teacher scores, remote policy updates.
+"""PyTRIO OPD: student rollouts, routed teacher scores, remote policy updates.
 
 Only sampled-token logprobs are transferred. This implements the local
 reverse-KL policy-gradient surrogate, not full-vocabulary KL distillation.
@@ -16,26 +16,34 @@ from tqdm import tqdm
 
 from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
-from ..dataset import PromptExample, prepare_prompt
+from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.updates import run_update_async
-from .opd.contracts import OPDResult, OPDState, OPDTrainingSample
+from .opd.contracts import (
+    OPDPrompt,
+    OPDResult,
+    OPDState,
+    OPDTeacherGroup,
+    OPDTeacherSpec,
+    OPDTrainingSample,
+)
 from .opd.execution import OPDExecutionPlan
 from .opd.metrics import OPDMetricTotals, remote_metrics
 
 
 class OPDTrainer:
-    """Distill a fixed teacher into a PyTRIO LoRA student using prompt-only rows.
+    """Distill one or more fixed teachers into a PyTRIO LoRA student.
 
-    ``model`` and ``teacher_model`` are PyTRIO base-model IDs. Optional
-    ``teacher_model_path`` loads a teacher LoRA checkpoint on that base model.
-    Token-to-ID vocabularies must match; prompts are rendered using the student
-    template and the exact same tokens are scored by the teacher.
+    The legacy ``teacher_model``/``teacher_model_path`` pair configures one
+    teacher. Multi-teacher runs pass ``teachers`` and optional ``teacher_groups``.
+    Each row may select a group through ``teacher_group_key``; all teachers in
+    that group score the exact student-sampled tokens. Student and teacher
+    token-to-ID vocabularies must match.
 
     eval_dataset holds replayable prompts. OPDConfig.eval_steps schedules student
-    rollouts and fixed-teacher scoring between updates. Evaluation does not
+    rollouts and routed teacher scoring between updates. Evaluation does not
     advance the optimizer step or the behavior-policy version.
 
     Async methods are the primary implementation; sync methods run them with
@@ -46,33 +54,117 @@ class OPDTrainer:
     def __init__(
         self,
         model: str,
-        teacher_model: str,
+        teacher_model: str | None = None,
         args: OPDConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
         lora_rank: int = 32,
         teacher_model_path: str | None = None,
+        teachers: Sequence[OPDTeacherSpec] | None = None,
+        teacher_groups: Sequence[OPDTeacherGroup] | None = None,
+        teacher_group_key: str = "teacher_group",
         execution_plan: OPDExecutionPlan | None = None,
     ) -> None:
         """Create clients and bind an immutable OPD algorithm execution plan."""
 
-        for name, value in (("model", model), ("teacher_model", teacher_model)):
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} must be a PyTRIO base-model ID.")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a PyTRIO base-model ID.")
         if (
             isinstance(lora_rank, bool)
             or not isinstance(lora_rank, int)
             or lora_rank < 1
         ):
             raise ValueError("lora_rank must be a positive integer.")
-        if teacher_model_path is not None and (
-            not isinstance(teacher_model_path, str) or not teacher_model_path.strip()
-        ):
-            raise ValueError("teacher_model_path must be a non-empty checkpoint URI.")
         self.model = model.strip()
-        self.teacher_model = teacher_model.strip()
-        self.teacher_model_path = teacher_model_path
+        if not isinstance(teacher_group_key, str) or not teacher_group_key.strip():
+            raise ValueError("teacher_group_key must be a non-empty string.")
+        self.teacher_group_key = teacher_group_key.strip()
+
+        # Keep the original single-teacher constructor fully compatible while
+        # making the multi-teacher form explicit and unambiguous.
+        if teachers is None:
+            if not isinstance(teacher_model, str) or not teacher_model.strip():
+                raise ValueError("teacher_model must be a PyTRIO base-model ID.")
+            teacher_specs = (
+                OPDTeacherSpec(
+                    teacher_id="default",
+                    model=teacher_model,
+                    model_path=teacher_model_path,
+                ),
+            )
+        else:
+            if teacher_model is not None or teacher_model_path is not None:
+                raise ValueError(
+                    "Pass either teacher_model/teacher_model_path or teachers, "
+                    "not both."
+                )
+            if (
+                isinstance(teachers, (str, bytes))
+                or not isinstance(teachers, Sequence)
+                or not teachers
+                or any(not isinstance(spec, OPDTeacherSpec) for spec in teachers)
+            ):
+                raise ValueError(
+                    "teachers must be a non-empty sequence of OPDTeacherSpec."
+                )
+            teacher_specs = tuple(teachers)
+        teacher_ids = [spec.teacher_id for spec in teacher_specs]
+        if len(set(teacher_ids)) != len(teacher_ids):
+            raise ValueError("Teacher IDs must be unique.")
+
+        if teacher_groups is None:
+            group_specs = (
+                OPDTeacherGroup(
+                    name="default",
+                    teachers={teacher_id: 1.0 for teacher_id in teacher_ids},
+                ),
+            )
+        else:
+            if (
+                isinstance(teacher_groups, (str, bytes))
+                or not isinstance(teacher_groups, Sequence)
+                or not teacher_groups
+                or any(
+                    not isinstance(group, OPDTeacherGroup)
+                    for group in teacher_groups
+                )
+            ):
+                raise ValueError(
+                    "teacher_groups must be a non-empty sequence of "
+                    "OPDTeacherGroup."
+                )
+            group_specs = tuple(teacher_groups)
+        group_names = [group.name for group in group_specs]
+        if len(set(group_names)) != len(group_names):
+            raise ValueError("Teacher group names must be unique.")
+        unknown_ids = {
+            teacher_id
+            for group in group_specs
+            for teacher_id in group.teachers
+            if teacher_id not in teacher_ids
+        }
+        if unknown_ids:
+            names = ", ".join(sorted(unknown_ids))
+            raise ValueError(f"Teacher groups reference unknown IDs: {names}.")
+
+        self.teacher_specs = teacher_specs
+        self.teacher_groups = {
+            group.name: dict(group.teachers) for group in group_specs
+        }
+        if "default" in self.teacher_groups:
+            self.default_teacher_group: str | None = "default"
+        elif len(group_specs) == 1:
+            self.default_teacher_group = group_specs[0].name
+        else:
+            self.default_teacher_group = None
+        # Retain the old public attributes for single-teacher integrations.
+        self.teacher_model = (
+            teacher_specs[0].model if len(teacher_specs) == 1 else None
+        )
+        self.teacher_model_path = (
+            teacher_specs[0].model_path if len(teacher_specs) == 1 else None
+        )
         self.args = args or OPDConfig()
         if execution_plan is not None and not isinstance(
             execution_plan, OPDExecutionPlan
@@ -90,15 +182,23 @@ class OPDTrainer:
         self._training_client = self._service_client.create_lora_training_client(
             base_model=self.model, rank=lora_rank, seed=self.args.seed,
         )
-        self._teacher_client = self._service_client.create_sampling_client(
-            base_model=self.teacher_model, model_path=self.teacher_model_path,
-        )
         self._tokenizer = self._training_client.get_tokenizer()
-        teacher_tokenizer = self._teacher_client.get_tokenizer()
-        if self._tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
-            raise ValueError(
-                "OPD requires identical student and teacher token-to-ID vocabularies."
+        student_vocab = self._tokenizer.get_vocab()
+        self._teacher_clients: dict[str, Any] = {}
+        for spec in self.teacher_specs:
+            client = self._service_client.create_sampling_client(
+                base_model=spec.model,
+                model_path=spec.model_path,
             )
+            if student_vocab != client.get_tokenizer().get_vocab():
+                raise ValueError(
+                    "OPD requires identical student and teacher token-to-ID "
+                    f"vocabularies; teacher {spec.teacher_id!r} is incompatible."
+                )
+            self._teacher_clients[spec.teacher_id] = client
+        # Preserve the private single-teacher handle used by older tests and
+        # extensions; new execution always consumes the ID-to-client mapping.
+        self._teacher_client = next(iter(self._teacher_clients.values()))
         self._student_sampler: Any = None
         self._busy = False
         self._requires_restart = False
@@ -110,7 +210,17 @@ class OPDTrainer:
             metadata={
                 "model": self.model,
                 "teacher_model": self.teacher_model,
-                "teacher_model_path": teacher_model_path,
+                "teacher_model_path": self.teacher_model_path,
+                "teachers": [
+                    {
+                        "teacher_id": spec.teacher_id,
+                        "model": spec.model,
+                        "model_path": spec.model_path,
+                    }
+                    for spec in self.teacher_specs
+                ],
+                "teacher_groups": self.teacher_groups,
+                "teacher_group_key": self.teacher_group_key,
                 "lora_rank": lora_rank,
                 "sampling_temperature": 1.0,
                 "sampling_top_p": 1.0,
@@ -139,13 +249,29 @@ class OPDTrainer:
     # Prompt preparation, student rollout, and teacher scoring
     # ------------------------------------------------------------------
 
-    def _prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[PromptExample]:
-        """Render prompt-only rows and reserve at least one completion token."""
+    def _prompts(self, rows: Sequence[Mapping[str, Any]]) -> list[OPDPrompt]:
+        """Render prompt rows and attach immutable teacher-group routing."""
 
         if not rows:
             raise ValueError("An OPD step requires at least one prompt.")
         prompts = []
         for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise TypeError(f"Row {index} must be a mapping.")
+            route = row.get(self.teacher_group_key, self.default_teacher_group)
+            if route is None:
+                raise ValueError(
+                    f"Row {index} must provide {self.teacher_group_key!r} because "
+                    "multiple teacher groups are configured without a default."
+                )
+            if not isinstance(route, str) or not route.strip():
+                raise ValueError(
+                    f"Row {index} {self.teacher_group_key!r} must be a non-empty "
+                    "string."
+                )
+            route = route.strip()
+            if route not in self.teacher_groups:
+                raise ValueError(f"Row {index} uses unknown teacher group {route!r}.")
             try:
                 prompt = prepare_prompt(
                     row,
@@ -161,18 +287,19 @@ class OPDTrainer:
                 # OPD historically treats every malformed prompt row as a
                 # value error; retain that trainer contract at this boundary.
                 raise ValueError(str(error)) from error
-            prompts.append(prompt)
+            prompts.append(OPDPrompt(prompt.text, prompt.tokens, route))
         return prompts
 
     async def _rollout_and_score(
-        self, prompts: list[PromptExample], sampler: Any
+        self, prompts: list[OPDPrompt], sampler: Any
     ) -> list[OPDTrainingSample]:
         """Delegate the complete algorithm transaction to the bound plan."""
 
         return await self.execution_plan.materialize(
             prompts,
             sampler=sampler,
-            teacher_client=self._teacher_client,
+            teacher_clients=self._teacher_clients,
+            teacher_groups=self.teacher_groups,
             config=self.args,
             behavior_policy_version=self.state.behavior_policy_version,
             seed_offset=self._sampling_seed_offset,

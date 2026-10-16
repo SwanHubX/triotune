@@ -1,7 +1,7 @@
 """Text-only GRPO, DPO, SFT, and OPD trainers backed by PyTRIO."""
 
-from importlib import import_module
 import sys
+from importlib import import_module
 
 from ..api.cli_args import (
     BaseTrainerConfig,
@@ -15,11 +15,11 @@ from ..dataset import (
     PreferenceExample,
     PromptExample,
     RenderedPrompt,
+    SupervisedExample,
     SWEConversation,
     SWESFTConfig,
     SWESFTDataset,
     SWESFTReport,
-    SupervisedExample,
     prepare_preference,
     prepare_prompt,
     prepare_rows,
@@ -38,9 +38,12 @@ from .grpo.contracts import (
 )
 from .grpo_trainer import GRPOTrainer
 from .opd.contracts import (
+    OPDPrompt,
     OPDResult,
     OPDRollout,
     OPDState,
+    OPDTeacherGroup,
+    OPDTeacherSpec,
     OPDTeacherTarget,
     OPDTrainingSample,
 )
@@ -148,11 +151,14 @@ __all__ = [
     "OPDExecutionPlan",
     "OPDMetricReducer",
     "OPDMetricTotals",
+    "OPDPrompt",
     "OPDResult",
     "OPDRollout",
     "OPDRolloutPhase",
     "OPDState",
     "OPDTeacherPhase",
+    "OPDTeacherGroup",
+    "OPDTeacherSpec",
     "OPDTeacherTarget",
     "OPDTargetBuilder",
     "OPDTrainer",

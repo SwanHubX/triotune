@@ -9,7 +9,6 @@ from typing import Any
 
 from .contracts import OPDTrainingSample
 
-
 # ---------------------------------------------------------------------------
 # Remote backend metric normalization
 # ---------------------------------------------------------------------------
@@ -60,6 +59,8 @@ class OPDMetricTotals:
     student_logprob_sum: float = 0.0
     teacher_logprob_sum: float = 0.0
     advantage_sum: float = 0.0
+    teacher_weight_token_sum: float = 0.0
+    weighted_reverse_kl_sum: float = 0.0
 
     def add(
         self,
@@ -83,6 +84,13 @@ class OPDMetricTotals:
         self.student_logprob_sum += sum(sample.student_sum for sample in samples)
         self.teacher_logprob_sum += sum(sample.teacher_sum for sample in samples)
         self.advantage_sum += sum(sample.advantage_sum for sample in samples)
+        self.teacher_weight_token_sum += sum(
+            sample.teacher_weight_sum * sample.tokens for sample in samples
+        )
+        self.weighted_reverse_kl_sum += sum(
+            sample.teacher_weight_sum * (sample.student_sum - sample.teacher_sum)
+            for sample in samples
+        )
 
     def distillation(self, *, prefix: str) -> dict[str, float]:
         """Return token means under the requested metric namespace."""
@@ -92,15 +100,15 @@ class OPDMetricTotals:
         # All signal metrics use completion tokens as the denominator. Prompt
         # length therefore cannot change the reported distillation scale.
         return {
-            f"{prefix}/reverse_kl_sampled": (
-                self.student_logprob_sum - self.teacher_logprob_sum
-            )
+            f"{prefix}/reverse_kl_sampled": self.weighted_reverse_kl_sum
             / self.token_count,
             f"{prefix}/student_logprob": self.student_logprob_sum
             / self.token_count,
             f"{prefix}/teacher_logprob": self.teacher_logprob_sum
             / self.token_count,
             f"{prefix}/advantage_mean": self.advantage_sum / self.token_count,
+            f"{prefix}/teacher_weight_sum": self.teacher_weight_token_sum
+            / self.token_count,
         }
 
 

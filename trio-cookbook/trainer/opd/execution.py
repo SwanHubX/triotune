@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ...api.loss_api import Objective
-from ...dataset import PromptExample
-from .contracts import OPDRollout, OPDTeacherTarget, OPDTrainingSample
+from .contracts import OPDPrompt, OPDRollout, OPDTeacherTarget, OPDTrainingSample
 from .loss import SampledReverseKLLoss
 from .metrics import OPDMetricReducer
 from .rollout import OPDRolloutPhase
 from .targets import OPDTargetBuilder
 from .teacher_phase import OPDTeacherPhase
-
 
 # ---------------------------------------------------------------------------
 # Replaceable phase protocols
@@ -29,7 +27,7 @@ class RolloutPhase(Protocol):
         self,
         *,
         sampler: Any,
-        prompt: PromptExample,
+        prompt: OPDPrompt,
         prompt_index: int,
         behavior_policy_version: int,
         config: Any,
@@ -45,7 +43,8 @@ class TeacherPhase(Protocol):
     async def score(
         self,
         *,
-        teacher_client: Any,
+        teacher_clients: Mapping[str, Any],
+        teacher_weights: Mapping[str, float],
         rollout: OPDRollout,
         model_input_factory: Any = None,
     ) -> OPDTeacherTarget: ...
@@ -68,7 +67,7 @@ class OPDExecutionPlan:
 
     The default plan is pure on-policy distillation:
 
-    ``student rollout -> fixed teacher scoring -> reverse-KL target -> IS loss``.
+    ``student rollout -> routed teacher scoring -> reverse-KL target -> IS loss``.
 
     It intentionally has no reward, critic, GAE, reference-policy, or mixed-RL
     branch.  Researchers can replace a phase or objective by constructing a new
@@ -117,10 +116,11 @@ class OPDExecutionPlan:
 
     async def materialize(
         self,
-        prompts: Sequence[PromptExample],
+        prompts: Sequence[OPDPrompt],
         *,
         sampler: Any,
-        teacher_client: Any,
+        teacher_clients: Mapping[str, Any],
+        teacher_groups: Mapping[str, Mapping[str, float]],
         config: Any,
         behavior_policy_version: int,
         seed_offset: int,
@@ -146,7 +146,7 @@ class OPDExecutionPlan:
         results: list[list[OPDTrainingSample] | None] = [None] * len(prompts)
 
         async def process_prompt(
-            prompt_index: int, prompt: PromptExample
+            prompt_index: int, prompt: OPDPrompt
         ) -> list[OPDTrainingSample]:
             async with sampling_slots:
                 rollouts = await self.rollout_phase.sample_prompt(
@@ -163,9 +163,15 @@ class OPDExecutionPlan:
             async def score(rollout: OPDRollout) -> OPDTrainingSample:
                 # Only the remote teacher call occupies a scoring slot. Target
                 # construction is local and should not reduce scoring capacity.
+                teacher_weights = teacher_groups.get(rollout.teacher_group)
+                if teacher_weights is None:
+                    raise ValueError(
+                        f"Unknown teacher group {rollout.teacher_group!r}."
+                    )
                 async with scoring_slots:
                     target = await self.teacher_phase.score(
-                        teacher_client=teacher_client,
+                        teacher_clients=teacher_clients,
+                        teacher_weights=teacher_weights,
                         rollout=rollout,
                         model_input_factory=model_input_factory,
                     )

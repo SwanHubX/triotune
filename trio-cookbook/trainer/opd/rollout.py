@@ -6,9 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...api.client_api import call_async, sdk_object
-from ...dataset import PromptExample
-from .contracts import OPDRollout
-
+from .contracts import OPDPrompt, OPDRollout
 
 # ---------------------------------------------------------------------------
 # SDK response compatibility
@@ -36,7 +34,7 @@ class OPDRolloutPhase:
         self,
         *,
         sampler: Any,
-        prompt: PromptExample,
+        prompt: OPDPrompt,
         prompt_index: int,
         behavior_policy_version: int,
         config: Any,
@@ -115,6 +113,9 @@ class OPDRolloutPhase:
                 prompt_index=prompt_index,
                 sample_index=sample_index,
                 behavior_policy_version=behavior_policy_version,
+                # Routing is framework metadata: the student rollout cannot
+                # alter which teacher group will score its sampled actions.
+                teacher_group=prompt.teacher_group,
             )
             if len(rollout.completion_tokens) > max_tokens:
                 raise ValueError(

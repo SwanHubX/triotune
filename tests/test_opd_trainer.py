@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from trio_cookbook import OPDTrainer
-from trio_cookbook.trainer import OPDConfig
+from trio_cookbook.trainer import OPDConfig, OPDTeacherGroup, OPDTeacherSpec
 from trio_cookbook.trainer.opd.datum import build_opd_datum
 from trio_cookbook.trainer.opd.loss import distillation_advantages
 from trio_cookbook.trainer.opd.teacher_phase import teacher_completion_logprobs
@@ -76,8 +76,8 @@ class _Sampler:
 
 
 class _Teacher:
-    def __init__(self, service):
-        self.service = service
+    def __init__(self, service, model="teacher"):
+        self.service, self.model = service, model
         self.requests = []
 
     def get_tokenizer(self):
@@ -98,8 +98,10 @@ class _Teacher:
                 raise RuntimeError("teacher failed")
             if self.service.bad_teacher:
                 return [None] * len(tokens)
-            # All generated tokens have teacher logprob -1; prompt scores are irrelevant.
-            return [None] + [-1.0] * (len(tokens) - 1)
+            # Prompt scores are irrelevant; each configured teacher may expose
+            # a distinct completion score for ensemble tests.
+            value = self.service.teacher_values.get(self.model, -1.0)
+            return [None] + [value] * (len(tokens) - 1)
         finally:
             self.service.scoring_active -= 1
 
@@ -152,6 +154,8 @@ class _Service:
     def __init__(self):
         self.training = _Training(self)
         self.teacher = _Teacher(self)
+        self.teachers = {"teacher": self.teacher}
+        self.teacher_values = {}
         self.student_values = [-2.0, -0.5]
         self.teacher_kwargs = None
         self.training_kwargs = None
@@ -169,7 +173,10 @@ class _Service:
 
     def create_sampling_client(self, **kwargs):
         self.teacher_kwargs = kwargs
-        return self.teacher
+        model = kwargs["base_model"]
+        if model not in self.teachers:
+            self.teachers[model] = _Teacher(self, model)
+        return self.teachers[model]
 
 
 class _Run:
@@ -367,6 +374,56 @@ class OPDTrainerTests(unittest.TestCase):
         self.service.vocab_mismatch = True
         with self.assertRaisesRegex(ValueError, "vocabularies"):
             self.trainer()
+
+    def test_multi_teacher_routing_and_weighted_geometric_ensemble(self):
+        self.service.teacher_values = {"math-teacher": -1.0, "code-teacher": -3.0}
+        trainer = OPDTrainer(
+            "student",
+            teachers=[
+                OPDTeacherSpec("math", "math-teacher", "checkpoint://math"),
+                OPDTeacherSpec("code", "code-teacher"),
+            ],
+            teacher_groups=[
+                OPDTeacherGroup("blend", {"math": 2.0, "code": 1.0}),
+                OPDTeacherGroup("code-only", {"code": 1.0}),
+            ],
+        )
+
+        result = trainer.step([{"messages": "P", "teacher_group": "blend"}])
+
+        # The normalized log score (-5/3) is the geometric ensemble used for
+        # metrics, while the loss keeps raw group scale W=3: [-5 - 3*p_t].
+        datum = self.service.training.datums[0]
+        self.assertEqual(datum.loss_fn_inputs["advantages"].data, [1.0, -3.5])
+        self.assertAlmostEqual(result.metrics["distill/reverse_kl_sampled"], 1.25)
+        self.assertAlmostEqual(result.metrics["distill/teacher_logprob"], -5 / 3)
+        self.assertEqual(result.metrics["distill/teacher_weight_sum"], 3.0)
+        expected = [[80, 65, 66]]
+        self.assertEqual(self.service.teachers["math-teacher"].requests, expected)
+        self.assertEqual(self.service.teachers["code-teacher"].requests, expected)
+
+        trainer.step([{"messages": "P", "teacher_group": "code-only"}])
+        self.assertEqual(self.service.teachers["math-teacher"].requests, expected)
+        self.assertEqual(
+            self.service.teachers["code-teacher"].requests,
+            expected + expected,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must provide"):
+            trainer.step([{"messages": "P"}])
+        with self.assertRaisesRegex(ValueError, "unknown teacher group"):
+            trainer.step([{"messages": "P", "teacher_group": "missing"}])
+
+    def test_multi_teacher_configuration_rejects_ambiguous_or_unknown_routes(self):
+        specs = [OPDTeacherSpec("math", "math-teacher")]
+        with self.assertRaisesRegex(ValueError, "not both"):
+            OPDTrainer("student", "teacher", teachers=specs)
+        with self.assertRaisesRegex(ValueError, "unknown IDs"):
+            OPDTrainer(
+                "student",
+                teachers=specs,
+                teacher_groups=[OPDTeacherGroup("bad", {"missing": 1.0})],
+            )
 
     def test_train_refreshes_sampler_and_saves_final_partial_batch(self):
         trainer = self.trainer(batch_size=2, seed=10)

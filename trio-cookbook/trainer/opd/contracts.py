@@ -8,11 +8,10 @@ replace one phase in an experiment without changing ``OPDTrainer``.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Primitive validation shared by phase contracts
@@ -67,6 +66,73 @@ def validate_logprobs(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class OPDTeacherSpec:
+    """One fixed teacher model and its optional LoRA checkpoint."""
+
+    teacher_id: str
+    model: str
+    model_path: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("teacher_id", "model"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string.")
+            object.__setattr__(self, name, value.strip())
+        if self.model_path is not None:
+            if not isinstance(self.model_path, str) or not self.model_path.strip():
+                raise ValueError("model_path must be a non-empty checkpoint URI.")
+            object.__setattr__(self, "model_path", self.model_path.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class OPDTeacherGroup:
+    """A named route containing positive, unnormalized teacher weights."""
+
+    name: str
+    teachers: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Teacher group name must be a non-empty string.")
+        if not isinstance(self.teachers, Mapping) or not self.teachers:
+            raise ValueError("Teacher group must contain at least one teacher.")
+        weights: dict[str, float] = {}
+        for teacher_id, weight in self.teachers.items():
+            if not isinstance(teacher_id, str) or not teacher_id.strip():
+                raise ValueError("Teacher IDs must be non-empty strings.")
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, Real)
+                or not math.isfinite(float(weight))
+                or weight <= 0
+            ):
+                raise ValueError("Teacher weights must be finite and positive.")
+            weights[teacher_id.strip()] = float(weight)
+        object.__setattr__(self, "name", self.name.strip())
+        # Keep a defensive copy; OPDTrainer copies it again when binding the
+        # execution topology, so later caller mutations cannot affect a run.
+        object.__setattr__(self, "teachers", weights)
+
+
+@dataclass(slots=True)
+class OPDPrompt:
+    """A rendered prompt plus framework-owned teacher-group routing metadata."""
+
+    text: str
+    tokens: list[int]
+    teacher_group: str = "default"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("Prompt text must be a string.")
+        self.tokens = validate_tokens(self.tokens, source="Prompt")
+        if not isinstance(self.teacher_group, str) or not self.teacher_group.strip():
+            raise ValueError("teacher_group must be a non-empty string.")
+        self.teacher_group = self.teacher_group.strip()
+
+
 @dataclass(slots=True)
 class OPDRollout:
     """One student completion sampled by a named behavior-policy version."""
@@ -77,6 +143,7 @@ class OPDRollout:
     prompt_index: int
     sample_index: int
     behavior_policy_version: int
+    teacher_group: str = "default"
 
     def __post_init__(self) -> None:
         # Copy caller-owned sequences at the phase boundary. Downstream phases
@@ -96,14 +163,23 @@ class OPDRollout:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer.")
+        if not isinstance(self.teacher_group, str) or not self.teacher_group.strip():
+            raise ValueError("teacher_group must be a non-empty string.")
+        self.teacher_group = self.teacher_group.strip()
 
 
 @dataclass(slots=True)
 class OPDTeacherTarget:
-    """Teacher token scores aligned to one existing student rollout."""
+    """Normalized ensemble scores aligned to one existing student rollout.
+
+    ``teacher_logprobs`` is the weighted mean logprob used for interpretable
+    metrics. ``teacher_weight_sum`` retains the original group scale used by
+    the reverse-KL target builder.
+    """
 
     rollout: OPDRollout
     teacher_logprobs: list[float]
+    teacher_weight_sum: float = 1.0
 
     def __post_init__(self) -> None:
         # Teacher scores refer to the exact actions sampled by the student, so
@@ -113,16 +189,25 @@ class OPDTeacherTarget:
         )
         if len(self.teacher_logprobs) != len(self.rollout.completion_tokens):
             raise ValueError("Teacher logprobs must align with completion tokens.")
+        if (
+            isinstance(self.teacher_weight_sum, bool)
+            or not isinstance(self.teacher_weight_sum, Real)
+            or not math.isfinite(float(self.teacher_weight_sum))
+            or self.teacher_weight_sum <= 0
+        ):
+            raise ValueError("teacher_weight_sum must be finite and positive.")
+        self.teacher_weight_sum = float(self.teacher_weight_sum)
 
 
 @dataclass(slots=True)
 class OPDTrainingSample:
-    """Materialized PyTRIO datum plus statistics retained outside the SDK."""
+    """Materialized datum plus normalized ensemble statistics and weight scale."""
 
     datum: Any
     rollout: OPDRollout
     teacher_logprobs: list[float]
     advantages: list[float]
+    teacher_weight_sum: float = 1.0
 
     def __post_init__(self) -> None:
         # Keep algorithm statistics beside the materialized datum. PyTRIO owns
@@ -136,6 +221,14 @@ class OPDTrainingSample:
             raise ValueError("OPD target fields must align with completion tokens.")
         if any(not math.isfinite(value) for value in self.advantages):
             raise ValueError("Distillation advantages must be finite.")
+        if (
+            isinstance(self.teacher_weight_sum, bool)
+            or not isinstance(self.teacher_weight_sum, Real)
+            or not math.isfinite(float(self.teacher_weight_sum))
+            or self.teacher_weight_sum <= 0
+        ):
+            raise ValueError("teacher_weight_sum must be finite and positive.")
+        self.teacher_weight_sum = float(self.teacher_weight_sum)
 
     @property
     def tokens(self) -> int:
@@ -181,9 +274,12 @@ class OPDResult:
 
 
 __all__ = [
+    "OPDPrompt",
     "OPDResult",
     "OPDRollout",
     "OPDState",
+    "OPDTeacherGroup",
+    "OPDTeacherSpec",
     "OPDTeacherTarget",
     "OPDTrainingSample",
     "validate_logprobs",
