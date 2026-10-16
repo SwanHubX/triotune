@@ -17,6 +17,7 @@ trio_cookbook/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
 │   ├── dataloader.py    # 流式数据集的 batch 迭代
 │   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
+│   ├── scoring.py       # 固定 completion 的 logprob 评分与对齐
 │   └── metrics.py       # 指标规范化、窗口聚合与 SwanLab 提交
 └── trainer/
     ├── __init__.py      # 公开导出与历史模块路径兼容
@@ -54,6 +55,7 @@ trio_cookbook/
 | [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
 | [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
 | [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |
+| [评分公共实现](../utils/scoring.py) | 通过 sampling client 为固定 completion 计算 token logprob，并统一校验完整序列与 completion 的位置对齐；DPO、OPD 和 PPO 可复用。 |
 | [GRPO 编排](./grpo_trainer.py) | 组织采样、奖励、advantage、Datum、远端更新以及同步／异步训练。 |
 | [GRPO 奖励](./grpo/rewards.py)、[优势](./grpo/advantages.py) | 适配奖励函数、聚合加权奖励，计算组内 centered advantage。 |
 | [GRPO 采样](./grpo/rollout.py)、[对齐](./grpo/datum.py)、[指标](./grpo/metrics.py) | 解析分组采样结果，完成 token shift，计算 rollout 统计和策略变化估计。 |

@@ -9,6 +9,7 @@ from numbers import Integral, Real
 from typing import Any
 
 from ...api.loss_api import PolicyLossInput
+from ...utils.scoring import completion_logprobs
 
 
 @dataclass(slots=True)
@@ -40,9 +41,12 @@ def teacher_completion_logprobs(
     values: Sequence[float | None], prompt_length: int, completion_length: int,
 ) -> list[float]:
     """PyTRIO scores token i at position i, including a possible initial None."""
-    if len(values) != prompt_length + completion_length:
-        raise ValueError("Teacher logprobs must align with the full prompt plus completion.")
-    return validate_logprobs(values[prompt_length:], source="Teacher completion")
+    return completion_logprobs(
+        values,
+        prompt_length=prompt_length,
+        completion_length=completion_length,
+        source="Teacher",
+    )
 
 
 def distillation_advantages(

@@ -22,12 +22,12 @@ from ..dataset import PromptExample, prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.scoring import score_completion_async
 from ..utils.updates import run_update_async
 from .opd.distillation import (
     _ScoredCompletion,
     build_opd_datum,
     distillation_advantages,
-    teacher_completion_logprobs,
     validate_logprobs,
     validate_tokens,
 )
@@ -194,12 +194,15 @@ class OPDTrainer:
         """Score one sampled completion and build its fixed-advantage Datum."""
 
         async with scoring_slots:
-            values = await call_async(
+            # OPD keeps teacher scores token-wise because each sampled student
+            # token receives its own reverse-KL distillation advantage.
+            teacher = await score_completion_async(
                 self._teacher_client,
-                "compute_logprobs",
-                trio.ModelInput.from_ints(prompt.tokens + tokens),
+                prompt.tokens,
+                tokens,
+                model_input_factory=trio.ModelInput.from_ints,
+                source="Teacher",
             )
-        teacher = teacher_completion_logprobs(values, len(prompt.tokens), len(tokens))
         advantages = distillation_advantages(
             student, teacher, coef=self.args.kl_coef, discount=self.args.discount_factor,
         )
