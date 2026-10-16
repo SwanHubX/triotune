@@ -7,7 +7,6 @@ reverse-KL policy-gradient surrogate, not full-vocabulary KL distillation.
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -17,21 +16,14 @@ from tqdm import tqdm
 
 from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
-from ..api.loss_api import BuiltinPyTrioObjective, LossSpec
 from ..dataset import PromptExample, prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
-from ..utils.scoring import score_completion_async
 from ..utils.updates import run_update_async
-from .opd.distillation import (
-    _ScoredCompletion,
-    build_opd_datum,
-    distillation_advantages,
-    validate_logprobs,
-    validate_tokens,
-)
-from .opd.state import OPDResult, OPDState
+from .opd.contracts import OPDResult, OPDState, OPDTrainingSample
+from .opd.execution import OPDExecutionPlan
+from .opd.metrics import OPDMetricTotals, remote_metrics
 
 
 class OPDTrainer:
@@ -61,8 +53,9 @@ class OPDTrainer:
         *,
         lora_rank: int = 32,
         teacher_model_path: str | None = None,
+        execution_plan: OPDExecutionPlan | None = None,
     ) -> None:
-        """Create student/teacher clients and verify token-ID compatibility."""
+        """Create clients and bind an immutable OPD algorithm execution plan."""
 
         for name, value in (("model", model), ("teacher_model", teacher_model)):
             if not isinstance(value, str) or not value.strip():
@@ -81,9 +74,14 @@ class OPDTrainer:
         self.teacher_model = teacher_model.strip()
         self.teacher_model_path = teacher_model_path
         self.args = args or OPDConfig()
-        self._objective = BuiltinPyTrioObjective(
-            LossSpec("importance_sampling")
+        if execution_plan is not None and not isinstance(
+            execution_plan, OPDExecutionPlan
+        ):
+            raise TypeError("execution_plan must be an OPDExecutionPlan.")
+        self.execution_plan = execution_plan or OPDExecutionPlan.from_config(
+            self.args
         )
+        self._objective = self.execution_plan.objective
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.state = OPDState()
@@ -166,132 +164,21 @@ class OPDTrainer:
             prompts.append(prompt)
         return prompts
 
-    def _sampling_params(self, prompt: PromptExample, index: int) -> Any:
-        """Build unbiased student sampling parameters within the token budget."""
-
-        max_tokens = self.args.max_completion_length
-        if self.args.max_length is not None:
-            max_tokens = min(max_tokens, self.args.max_length - len(prompt.tokens))
-        seed = self.args.seed
-        if seed is not None:
-            seed += self._sampling_seed_offset + index
-        return trio.SamplingParams(
-            max_tokens=max_tokens,
-            temperature=1.0,
-            top_p=1.0,
-            top_k=-1,
-            seed=seed,
-            stop=self.args.stop,
-        )
-
-    async def _score_completion(
-        self,
-        prompt: PromptExample,
-        tokens: list[int],
-        student: list[float],
-        scoring_slots: asyncio.Semaphore,
-    ) -> _ScoredCompletion:
-        """Score one sampled completion and build its fixed-advantage Datum."""
-
-        async with scoring_slots:
-            # OPD keeps teacher scores token-wise because each sampled student
-            # token receives its own reverse-KL distillation advantage.
-            teacher = await score_completion_async(
-                self._teacher_client,
-                prompt.tokens,
-                tokens,
-                model_input_factory=trio.ModelInput.from_ints,
-                source="Teacher",
-            )
-        advantages = distillation_advantages(
-            student, teacher, coef=self.args.kl_coef, discount=self.args.discount_factor,
-        )
-        return _ScoredCompletion(
-            build_opd_datum(prompt.tokens, tokens, student, advantages),
-            len(tokens),
-            sum(student),
-            sum(teacher),
-            sum(advantages),
-        )
-
-    async def _sample_and_score(
-        self,
-        prompt: PromptExample,
-        index: int,
-        sampler: Any,
-        sampling_slots: asyncio.Semaphore,
-        scoring_slots: asyncio.Semaphore,
-    ) -> list[_ScoredCompletion]:
-        """Sample every completion for one prompt, then score them as a unit."""
-
-        params = self._sampling_params(prompt, index)
-        async with sampling_slots:
-            response = await call_async(
-                sampler,
-                "sample",
-                prompt=trio.ModelInput.from_ints(prompt.tokens),
-                num_samples=self.args.num_generations,
-                sampling_params=params,
-            )
-        sequences = response.sequences
-        if len(sequences) != self.args.num_generations:
-            raise ValueError(
-                "Student sampler returned an unexpected number of completions."
-            )
-        # Validate the entire response before any of its teacher requests.
-        samples = []
-        for sequence in sequences:
-            tokens = validate_tokens(sequence.tokens, source="Student completion")
-            if len(tokens) > params.max_tokens:
-                raise ValueError("Student completion exceeds the requested token budget.")
-            if sequence.logprobs is None:
-                raise ValueError("Student sampling must return completion logprobs.")
-            student = validate_logprobs(sequence.logprobs, source="Student completion")
-            if len(student) != len(tokens):
-                raise ValueError("Student completion tokens and logprobs must align.")
-            samples.append((tokens, student))
-        # Teacher scoring starts as soon as THIS prompt is ready. TaskGroup
-        # cancels and drains sibling requests on error or caller cancellation.
-        async with asyncio.TaskGroup() as group:
-            tasks = [
-                group.create_task(
-                    self._score_completion(prompt, tokens, student, scoring_slots)
-                )
-                for tokens, student in samples
-            ]
-        return [task.result() for task in tasks]
-
     async def _rollout_and_score(
         self, prompts: list[PromptExample], sampler: Any
-    ) -> list[_ScoredCompletion]:
-        """Bound prompt rollout and teacher scoring across the complete batch."""
+    ) -> list[OPDTrainingSample]:
+        """Delegate the complete algorithm transaction to the bound plan."""
 
-        sampling_slots = asyncio.Semaphore(self.args.max_concurrent_sampling)
-        scoring_slots = asyncio.Semaphore(self.args.max_concurrent_scoring)
-        pending = iter(enumerate(prompts))
-        results: list[list[_ScoredCompletion] | None] = [None] * len(prompts)
-
-        async def worker() -> None:
-            """Consume prompt indices from a lock-free local iterator."""
-
-            # next() contains no await, so cooperative tasks cannot race here.
-            for index, prompt in pending:
-                results[index] = await self._sample_and_score(
-                    prompt, index, sampler, sampling_slots, scoring_slots,
-                )
-
-        # Bound local tasks and the number of rollouts waiting for the teacher,
-        # even when batch_size is much larger than either concurrency limit.
-        workers = min(
-            len(prompts),
-            self.args.max_concurrent_sampling + self.args.max_concurrent_scoring,
+        return await self.execution_plan.materialize(
+            prompts,
+            sampler=sampler,
+            teacher_client=self._teacher_client,
+            config=self.args,
+            behavior_policy_version=self.state.behavior_policy_version,
+            seed_offset=self._sampling_seed_offset,
+            sampling_params_factory=trio.SamplingParams,
+            model_input_factory=trio.ModelInput.from_ints,
         )
-        async with asyncio.TaskGroup() as group:
-            for _ in range(workers):
-                group.create_task(worker())
-        if any(result is None for result in results):
-            raise RuntimeError("OPD pipeline did not finish every prompt.")
-        return [sample for result in results if result is not None for sample in result]
 
     # ------------------------------------------------------------------
     # Backend metrics, checkpointing, and reporting
@@ -301,27 +188,7 @@ class OPDTrainer:
     def _remote_metrics(*responses: Any) -> dict[str, float]:
         """Normalize finite backend loss and gradient metrics."""
 
-        metrics = {}
-        for response in responses:
-            raw = getattr(response, "metrics", None)
-            if not isinstance(raw, Mapping):
-                continue
-            for key, value in raw.items():
-                if (
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and math.isfinite(value)
-                ):
-                    metrics[str(key)] = float(value)
-        for key in ("loss_mean", "loss", "loss:mean", "scalar/loss_mean"):
-            if key in metrics:
-                metrics["train/loss"] = metrics[key]
-                break
-        for key in ("grad_norm", "gradient_norm"):
-            if key in metrics:
-                metrics["optim/grad_norm"] = metrics[key]
-                break
-        return metrics
+        return remote_metrics(*responses)
 
     async def _save_state_async(self) -> str:
         """Save student weights and optimizer state at the current step."""
@@ -381,32 +248,18 @@ class OPDTrainer:
         self._student_sampler = None
         self._requires_restart = False
         input_tokens = sum(datum.model_input.length for datum in datums)
-        completion_tokens = sum(sample.tokens for sample in scored)
         metrics = self._remote_metrics(update.forward, update.optimizer)
+        metrics.update(
+            self.execution_plan.metrics.training(
+                scored,
+                prompt_count=len(prompts),
+                behavior_policy_version=version,
+            )
+        )
         metrics.update(
             {
                 "optim/lr": self.args.learning_rate,
-                "data/prompts": float(len(prompts)),
-                "data/completions": float(len(datums)),
                 "data/input_tokens": float(input_tokens),
-                "data/completion_tokens": float(completion_tokens),
-                "distill/reverse_kl_sampled": sum(
-                    sample.student_sum - sample.teacher_sum for sample in scored
-                )
-                / completion_tokens,
-                "distill/advantage_mean": sum(
-                    sample.advantage_sum for sample in scored
-                )
-                / completion_tokens,
-                "distill/student_logprob": sum(
-                    sample.student_sum for sample in scored
-                )
-                / completion_tokens,
-                "distill/teacher_logprob": sum(
-                    sample.teacher_sum for sample in scored
-                )
-                / completion_tokens,
-                "policy/behavior_version": float(version),
                 "time/prepare": prepared - started,
                 "time/snapshot": snapshotted - prepared,
                 "time/rollout_teacher": referenced - snapshotted,
@@ -469,32 +322,14 @@ class OPDTrainer:
         sampler = await call_async(
             self._training_client, "save_weights_and_get_sampling_client"
         )
-        prompt_count = 0
-        completion_count = 0
-        token_count = 0
-        student_sum = 0.0
-        teacher_sum = 0.0
-        advantage_sum = 0.0
+        totals = OPDMetricTotals()
         for rows in self._evaluation_batches(dataset):
             prompts = await asyncio.to_thread(self._prompts, rows)
             scored = await self._rollout_and_score(prompts, sampler)
-            prompt_count += len(prompts)
-            completion_count += len(scored)
-            token_count += sum(sample.tokens for sample in scored)
-            student_sum += sum(sample.student_sum for sample in scored)
-            teacher_sum += sum(sample.teacher_sum for sample in scored)
-            advantage_sum += sum(sample.advantage_sum for sample in scored)
-        if prompt_count == 0 or token_count == 0:
+            totals.add(scored, prompt_count=len(prompts))
+        if totals.prompt_count == 0 or totals.token_count == 0:
             raise ValueError("eval_dataset must contain trainable OPD prompts.")
-        metrics = {
-            "eval/reverse_kl_sampled": (student_sum - teacher_sum) / token_count,
-            "eval/student_logprob": student_sum / token_count,
-            "eval/teacher_logprob": teacher_sum / token_count,
-            "eval/advantage_mean": advantage_sum / token_count,
-            "eval/prompts": float(prompt_count),
-            "eval/completions": float(completion_count),
-            "eval/tokens": float(token_count),
-        }
+        metrics = self.execution_plan.metrics.evaluation_totals(totals)
         return self._publish_evaluation(metrics)
 
     async def evaluate_async(

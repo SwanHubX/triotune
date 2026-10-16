@@ -19,7 +19,7 @@ class TrainerLayoutTests(unittest.TestCase):
             "sft_config": "trio_cookbook.api.cli_args",
             "opd_trainer": "trio_cookbook.trainer.opd_trainer",
             "opd_config": "trio_cookbook.api.cli_args",
-            "opd_distillation": "trio_cookbook.trainer.opd.distillation",
+            "opd_distillation": "trio_cookbook.trainer.opd",
             "advantages": "trio_cookbook.trainer.grpo.advantages",
             "datum": "trio_cookbook.trainer.grpo.datum",
             "rewards": "trio_cookbook.trainer.grpo.rewards",
@@ -84,7 +84,7 @@ class TrainerLayoutTests(unittest.TestCase):
             "grpo.types": "grpo.contracts",
             "dpo.types": "dpo.state",
             "sft.types": "sft.state",
-            "opd.types": "opd.state",
+            "opd.types": "opd.contracts",
         }
         for old, new in aliases.items():
             with self.subTest(module=old):

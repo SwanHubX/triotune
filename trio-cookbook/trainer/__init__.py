@@ -37,7 +37,20 @@ from .grpo.contracts import (
     TrainerState,
 )
 from .grpo_trainer import GRPOTrainer
-from .opd.state import OPDResult, OPDState
+from .opd.contracts import (
+    OPDResult,
+    OPDRollout,
+    OPDState,
+    OPDTeacherTarget,
+    OPDTrainingSample,
+)
+from .opd.datum import build_opd_datum
+from .opd.execution import OPDExecutionPlan
+from .opd.loss import SampledReverseKLLoss, distillation_advantages
+from .opd.metrics import OPDMetricReducer, OPDMetricTotals
+from .opd.rollout import OPDRolloutPhase
+from .opd.targets import OPDTargetBuilder
+from .opd.teacher_phase import OPDTeacherPhase
 from .opd_trainer import OPDTrainer
 from .sft.state import SFTState
 from .sft_trainer import SFTTrainer
@@ -49,7 +62,7 @@ _LEGACY_MODULES = {
     "dpo_trainer": "dpo_trainer",
     "sft_trainer": "sft_trainer",
     "opd_trainer": "opd_trainer",
-    "opd_distillation": "opd.distillation",
+    "opd_distillation": "opd",
     "advantages": "grpo.advantages",
     "datum": "grpo.datum",
     "rewards": "grpo.rewards",
@@ -111,7 +124,7 @@ _RENAMED_MODULES = {
     "grpo.types": "grpo.contracts",
     "dpo.types": "dpo.state",
     "sft.types": "sft.state",
-    "opd.types": "opd.state",
+    "opd.types": "opd.contracts",
 }
 for _old_name, _new_name in _RENAMED_MODULES.items():
     sys.modules[f"{__name__}.{_old_name}"] = import_module(
@@ -132,9 +145,18 @@ __all__ = [
     "GRPOTrainer",
     "IGNORE_INDEX",
     "OPDConfig",
+    "OPDExecutionPlan",
+    "OPDMetricReducer",
+    "OPDMetricTotals",
     "OPDResult",
+    "OPDRollout",
+    "OPDRolloutPhase",
     "OPDState",
+    "OPDTeacherPhase",
+    "OPDTeacherTarget",
+    "OPDTargetBuilder",
     "OPDTrainer",
+    "OPDTrainingSample",
     "PreferenceExample",
     "PromptExample",
     "RenderedPrompt",
@@ -148,6 +170,9 @@ __all__ = [
     "SWESFTReport",
     "SupervisedExample",
     "TrainerState",
+    "SampledReverseKLLoss",
+    "build_opd_datum",
+    "distillation_advantages",
     "prepare_preference",
     "prepare_prompt",
     "prepare_rows",

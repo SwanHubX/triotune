@@ -9,11 +9,9 @@ from unittest.mock import patch
 
 from trio_cookbook import OPDTrainer
 from trio_cookbook.trainer import OPDConfig
-from trio_cookbook.trainer.opd.distillation import (
-    build_opd_datum,
-    distillation_advantages,
-    teacher_completion_logprobs,
-)
+from trio_cookbook.trainer.opd.datum import build_opd_datum
+from trio_cookbook.trainer.opd.loss import distillation_advantages
+from trio_cookbook.trainer.opd.teacher_phase import teacher_completion_logprobs
 
 
 class _Tokenizer:

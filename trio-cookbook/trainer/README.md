@@ -38,8 +38,14 @@ trio_cookbook/
     ├── sft/
     │   └── state.py
     └── opd/
-        ├── state.py
-        └── distillation.py
+        ├── contracts.py      # 阶段数据契约、trainer 状态与 step 结果
+        ├── execution.py      # 不可变执行计划与并发事务
+        ├── rollout.py        # 学生 on-policy 采样
+        ├── teacher_phase.py  # 固定 teacher 对已有 token 评分
+        ├── loss.py           # sampled reverse-KL 信号与远端 surrogate
+        ├── datum.py          # next-token 对齐与 prompt mask
+        ├── targets.py        # teacher score 到训练 target 的转换
+        └── metrics.py        # OPD 指标归约
 ```
 
 | 模块 | 职责 |
@@ -61,7 +67,10 @@ trio_cookbook/
 | [GRPO 采样](./grpo/rollout.py)、[对齐](./grpo/datum.py)、[指标](./grpo/metrics.py) | 解析分组采样结果，完成 token shift，计算 rollout 统计和策略变化估计。 |
 | [DPO 编排](./dpo_trainer.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；损失模块实现成对目标与算法指标。 |
 | [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
-| [OPD 编排](./opd_trainer.py)、[蒸馏](./opd/distillation.py) | 组织学生生成和教师评分；蒸馏模块负责评分校验、token advantage 和 Datum 对齐。 |
+| [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target、loss 与 metric 阶段。 |
+| [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；固定 teacher 只给同一 token 序列评分。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
+| [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO `importance_sampling` 所需的 next-token 对齐字段。 |
+| [OPD contracts](./opd/contracts.py)、[metrics](./opd/metrics.py) | 隔离 SDK response、校验阶段间数据，并以 completion token 为分母归约蒸馏指标；验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
 
 ```text
 dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
@@ -208,6 +217,47 @@ trainer = GRPOTrainer(
 )
 state = trainer.train()
 ```
+
+默认 OPD 执行链是：
+
+```text
+student rollout
+  → fixed-teacher token scoring
+  → sampled reverse-KL token advantage
+  → prompt-masked PyTRIO policy Datum
+  → importance_sampling forward/backward
+  → optimizer step
+```
+
+
+```python
+from dataclasses import replace
+
+from trio_cookbook.trainer import OPDConfig, OPDTrainer
+from trio_cookbook.trainer.opd import OPDExecutionPlan, OPDTeacherPhase
+
+
+class ExperimentalTeacherPhase(OPDTeacherPhase):
+    async def score(self, **kwargs):
+        target = await super().score(**kwargs)
+        # 在这里实现实验性的 teacher target 处理；返回 OPDTeacherTarget。
+        return target
+
+
+config = OPDConfig(batch_size=4, max_steps=100)
+plan = replace(
+    OPDExecutionPlan.from_config(config),
+    teacher_phase=ExperimentalTeacherPhase(),
+)
+trainer = OPDTrainer(
+    model="student-base-model-id",
+    teacher_model="teacher-base-model-id",
+    args=config,
+    execution_plan=plan,
+    train_dataset=prompt_rows,
+)
+```
+
 
 ## DPO 训练
 
