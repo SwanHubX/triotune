@@ -4,9 +4,9 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from trio_cookbook.dataset import PromptExample
-from trio_cookbook.trainer import OPDConfig
-from trio_cookbook.trainer.opd import (
+from triotune.dataset import PromptExample
+from triotune.trainer import OPDConfig
+from triotune.trainer.opd import (
     OPDExecutionPlan,
     OPDMetricReducer,
     OPDRollout,
@@ -16,7 +16,7 @@ from trio_cookbook.trainer.opd import (
     OPDTeacherTarget,
     SampledReverseKLLoss,
 )
-from trio_cookbook.trainer.opd.metrics import OPDMetricTotals
+from triotune.trainer.opd.metrics import OPDMetricTotals
 
 
 class _RolloutPhase:

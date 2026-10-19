@@ -2,7 +2,7 @@
 
 import asyncio
 
-from trio_cookbook.recipes.sft_huanhuan_trio import DEFAULT_CONFIG, load_config, main
+from triotune.recipes.sft_huanhuan_trio import DEFAULT_CONFIG, load_config, main
 
 
 if __name__ == "__main__":

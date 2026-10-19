@@ -68,7 +68,7 @@ the repository environment:
 
 ```bash
 uv sync
-uv run python -c "import trio_cookbook; print(trio_cookbook.__name__)"
+uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
 Install the optional PyTorch dependency when using DPO:
@@ -80,7 +80,7 @@ uv sync --extra dpo
 The published package can also be installed directly:
 
 ```bash
-pip install triotune==0.1.1
+pip install triotune==0.1.2
 ```
 
 For a source checkout with pip:
@@ -90,8 +90,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The distribution name is `triotune`; the Python import name remains
-`trio_cookbook`.
+The distribution name and Python import name are both `triotune`.
 
 ## 🚀 Quick start
 
@@ -158,7 +157,7 @@ The public imports are grouped by algorithm:
 ```python
 import asyncio
 
-from trio_cookbook.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import PPOConfig, PPOTrainer
 
 rows = [
     {
@@ -193,4 +192,4 @@ claim to provide a Web UI, Megatron integration, multimodal training, or a
 universal plugin/registry system. If you need a custom model module, first
 adapt it to the public PyTRIO client contract and use the existing recipe or
 trainer interfaces; first-class custom-module registration is planned work,
-not a supported promise of version 0.1.1.
+not a supported promise of version 0.1.2.

@@ -22,8 +22,8 @@ from typing import Any
 from datasets import Dataset, load_dataset
 import pytrio as trio
 
-from trio_cookbook.trainer.opd import OPDConfig, OPDTrainer
-from trio_cookbook.utils.config import load_yaml_config
+from triotune.trainer.opd import OPDConfig, OPDTrainer
+from triotune.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]

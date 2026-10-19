@@ -65,7 +65,7 @@ for _old_name, _new_name in _LEGACY_MODULES.items():
     globals()[_old_name] = _module
 del _old_name, _new_name, _module
 
-# Config contracts now live beside trainer in ``trio_cookbook.api``. Preserve
+# Config contracts now live beside trainer in ``triotune.api``. Preserve
 # both the historical flat config modules and algorithm-local config paths.
 _config_module = import_module("..api.cli_args", __name__)
 for _algorithm in ("dpo", "sft", "opd"):

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 from pytrio.types.forward.tensor_data import TensorData
-from trio_cookbook.trainer.ppo import (
+from triotune.trainer.ppo import (
     NormConfig,
     PPOActor,
     PPOConfig,
@@ -22,10 +22,10 @@ from trio_cookbook.trainer.ppo import (
     prepare_advantages,
     value_loss,
 )
-from trio_cookbook.trainer.ppo.actor import minibatches
-from trio_cookbook.trainer.ppo.datum import batch_datums, build_datum
-from trio_cookbook.trainer.ppo.loss import make_loss_fn
-from trio_cookbook.trainer.ppo.normalization import normalize
+from triotune.trainer.ppo.actor import minibatches
+from triotune.trainer.ppo.datum import batch_datums, build_datum
+from triotune.trainer.ppo.loss import make_loss_fn
+from triotune.trainer.ppo.normalization import normalize
 
 
 def trajectory(reward=1.0, group="g", n=2, **kwargs):

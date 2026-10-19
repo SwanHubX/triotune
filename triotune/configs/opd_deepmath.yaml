@@ -1,5 +1,5 @@
 # recipes/train_opd.py 读取本文件。
-# opd 与 swanlab 合并为 trio_cookbook.trainer.opd.OPDConfig。
+# opd 与 swanlab 合并为 triotune.trainer.opd.OPDConfig。
 # 数据下载、prompt 构造和循环批次由 recipe 管理，训练使用 train_async()。
 
 model:

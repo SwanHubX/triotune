@@ -1,10 +1,11 @@
 """Regression checks for the repository source-directory layout."""
 
+import importlib.util
 from pathlib import Path
 import tomllib
 import unittest
 
-import trio_cookbook
+import triotune
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -18,18 +19,23 @@ class SourceLayoutTests(unittest.TestCase):
 
     def test_public_import_resolves_from_triotune_directory(self) -> None:
         self.assertEqual(
-            Path(trio_cookbook.__file__).resolve(),
+            Path(triotune.__file__).resolve(),
             SOURCE_ROOT / "__init__.py",
         )
 
-    def test_setuptools_maps_public_packages_to_triotune(self) -> None:
+    def test_setuptools_declares_triotune_packages_directly(self) -> None:
         config = tomllib.loads(
             (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        package_dir = config["tool"]["setuptools"]["package-dir"]
+        setuptools = config["tool"]["setuptools"]
+        packages = setuptools["packages"]
 
-        self.assertEqual(package_dir["trio_cookbook"], "triotune")
-        self.assertEqual(package_dir["trio_cookbook.trainer"], "triotune/trainer")
+        self.assertIn("triotune", packages)
+        self.assertIn("triotune.trainer", packages)
+        self.assertNotIn("package-dir", setuptools)
+
+    def test_legacy_import_name_is_not_available(self) -> None:
+        self.assertIsNone(importlib.util.find_spec("trio_cookbook"))
 
     def test_runtime_files_do_not_reference_legacy_source_path(self) -> None:
         paths = [

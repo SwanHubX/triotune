@@ -51,7 +51,7 @@ class _RunProcess:
         code = (
             "import sys\nfrom contextlib import redirect_stdout\n"
             "with redirect_stdout(sys.stderr):\n"
-            "    from trio_cookbook.utils.reporting import _worker\n"
+            "    from triotune.utils.reporting import _worker\n"
             "    _worker(sys.__stdin__, sys.__stdout__)\n"
         )
         self.process = subprocess.Popen(

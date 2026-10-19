@@ -63,7 +63,7 @@ SwanLab 指标记录。
 
 ```bash
 uv sync
-uv run python -c "import trio_cookbook; print(trio_cookbook.__name__)"
+uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
 使用 DPO 时安装可选的 PyTorch 依赖：
@@ -75,7 +75,7 @@ uv sync --extra dpo
 也可以直接安装已发布的包：
 
 ```bash
-pip install triotune==0.1.1
+pip install triotune==0.1.2
 ```
 
 从源码目录使用 pip 安装：
@@ -85,7 +85,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-发行包名称是 `triotune`，Python 导入名称仍是 `trio_cookbook`。
+发行包名称和 Python 导入名称均为 `triotune`。
 
 ## 🚀 快速开始
 
@@ -152,7 +152,7 @@ PyTRIO 当前支持以下模型：
 ```python
 import asyncio
 
-from trio_cookbook.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import PPOConfig, PPOTrainer
 
 rows = [
     {
@@ -185,4 +185,4 @@ triotune/
 Triotune 当前聚焦于纯文本、基于 PyTRIO 的实验。项目不宣称提供 Web UI、
 Megatron 集成、多模态训练，也不提供通用的插件/注册表系统。如果需要使用
 自定义模型模块，请先让它适配 PyTRIO 的公共客户端契约，再使用现有 recipe
-或 trainer 接口；“任意自定义模块注册”是后续工作，不是 0.1.1 已支持的能力。
+或 trainer 接口；“任意自定义模块注册”是后续工作，不是 0.1.2 已支持的能力。

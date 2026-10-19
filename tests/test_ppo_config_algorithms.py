@@ -6,8 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from trio_cookbook.api import NormConfig, PPOConfig
-from trio_cookbook.utils.config import load_yaml_config
+from triotune.api import NormConfig, PPOConfig
+from triotune.utils.config import load_yaml_config
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]

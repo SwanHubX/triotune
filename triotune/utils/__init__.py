@@ -21,7 +21,7 @@ from .reporting import isolated_metrics
 from .scoring import completion_logprobs, score_completion, score_completion_async
 from .updates import UpdateResult, run_update, run_update_async
 
-# ``trio_cookbook.utils.client`` was public before client contracts moved into
+# ``triotune.utils.client`` was public before client contracts moved into
 # ``api``. Keep that import path without duplicating its implementation here.
 sys.modules[f"{__name__}.client"] = client
 

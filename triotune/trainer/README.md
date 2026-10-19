@@ -8,7 +8,7 @@ PPO、GRPO、RLOO、Dr.GRPO、LitePPO、GSPO、SAPO、CISPO 和 DAPO。
 
 
 ```text
-trio_cookbook/
+triotune/
 ├── api/
 │   ├── cli_args.py      # 公共配置与算法参数契约
 │   └── client_api.py    # Training/Sampling client 调用契约
@@ -132,7 +132,7 @@ sft_token_rows = [
 ## Dataset 向 Trainer 传输的标准格式
 
 ```python
-from trio_cookbook.dataset import prepare_rows
+from triotune.dataset import prepare_rows
 
 # PPO-family / OPD
 prompt_examples = prepare_rows(prompt_rows, tokenizer, format="prompt")
@@ -167,8 +167,8 @@ preference_examples = prepare_rows(
 ## 检查数据集配置
 
 ```python
-from trio_cookbook.trainer import SFTTrainer
-from trio_cookbook.dataset import SWESFTConfig, prepare_swe_sft_dataset
+from triotune.trainer import SFTTrainer
+from triotune.dataset import SWESFTConfig, prepare_swe_sft_dataset
 
 dataset = prepare_swe_sft_dataset(
     "swe-trajectories.jsonl",
@@ -187,7 +187,7 @@ trainer = SFTTrainer(
 ```python
 import asyncio
 
-from trio_cookbook.trainer import SFTConfig, SFTTrainer
+from triotune.trainer import SFTConfig, SFTTrainer
 
 trainer = SFTTrainer(
     model="Qwen/Qwen3.5-4B",
@@ -206,7 +206,7 @@ state = asyncio.run(trainer.train())
 ```python
 import asyncio
 
-from trio_cookbook.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import PPOConfig, PPOTrainer
 
 trainer = PPOTrainer(
     model="Qwen/Qwen3.5-4B",
@@ -224,7 +224,7 @@ uv sync --extra dpo
 ```
 
 ```python
-from trio_cookbook.trainer import DPOConfig, DPOTrainer
+from triotune.trainer import DPOConfig, DPOTrainer
 
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
@@ -237,7 +237,7 @@ state = trainer.train()
 ## OPD 训练
 
 ```python
-from trio_cookbook.trainer import OPDConfig, OPDTrainer
+from triotune.trainer import OPDConfig, OPDTrainer
 
 trainer = OPDTrainer(
     model="student-base-model-id",
@@ -265,8 +265,8 @@ student rollout
 数据行只携带组名，不接触模型 client 或算法字段：
 
 ```python
-from trio_cookbook.trainer import OPDConfig, OPDTrainer
-from trio_cookbook.trainer.opd import OPDTeacherGroup, OPDTeacherSpec
+from triotune.trainer import OPDConfig, OPDTrainer
+from triotune.trainer.opd import OPDTeacherGroup, OPDTeacherSpec
 
 teachers = [
     OPDTeacherSpec("math", "org/math-teacher", "checkpoint://math-lora"),
@@ -303,7 +303,7 @@ score-function 系数；设为 `None` 可恢复原来的 unbounded
 ```python
 from dataclasses import replace
 
-from trio_cookbook.trainer.opd import OPDExecutionPlan, OPDTeacherPhase
+from triotune.trainer.opd import OPDExecutionPlan, OPDTeacherPhase
 
 
 class ExperimentalTeacherPhase(OPDTeacherPhase):

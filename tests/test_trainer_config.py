@@ -6,9 +6,9 @@ import tomllib
 import unittest
 from dataclasses import asdict
 
-from trio_cookbook.api import NormConfig as APINormConfig
-from trio_cookbook.api import PPOConfig as APIPPOConfig
-from trio_cookbook.trainer import (
+from triotune.api import NormConfig as APINormConfig
+from triotune.api import PPOConfig as APIPPOConfig
+from triotune.trainer import (
     BaseTrainerConfig,
     DPOConfig,
     OPDConfig,
@@ -57,14 +57,14 @@ class TrainerConfigTests(unittest.TestCase):
                     config_class(tags=[""])
 
     def test_ppo_config_is_defined_by_the_public_api_contract(self) -> None:
-        from trio_cookbook.trainer.ppo import NormConfig, PPOConfig
+        from triotune.trainer.ppo import NormConfig, PPOConfig
 
         self.assertIs(PPOConfig, APIPPOConfig)
         self.assertIs(NormConfig, APINormConfig)
         self.assertIsInstance(PPOConfig(), BaseTrainerConfig)
         self.assertIs(
-            __import__("trio_cookbook.trainer.ppo.config", fromlist=["PPOConfig"]),
-            __import__("trio_cookbook.api.cli_args", fromlist=["PPOConfig"]),
+            __import__("triotune.trainer.ppo.config", fromlist=["PPOConfig"]),
+            __import__("triotune.api.cli_args", fromlist=["PPOConfig"]),
         )
         self.assertFalse(PPOConfig.for_algorithm("grpo").use_critic)
         self.assertTrue(PPOConfig.for_algorithm("ppo").use_critic)
