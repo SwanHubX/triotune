@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-from triotune.recipes import sft_huanhuan, sft_huanhuan_trio
 from triotune.trainer import SFTConfig, SFTTrainer
 
 
@@ -470,114 +468,5 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         trainer.train_dataset = [{"text": "ab"}]
         self.assertEqual((await trainer.train()).checkpoint_path, "checkpoint://sft-step-00000001")
         self.assertEqual(self.client.saved, ["sft-step-00000001"])
-
-
-class SFTRecipeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_direct_recipe_awaits_sdk_futures(self) -> None:
-        class SDKTokenizer(_Tokenizer):
-            def apply_chat_template(self, *args: object, **kwargs: object) -> object:
-                output = super().apply_chat_template(*args, **kwargs)
-                return {"input_ids": output} if isinstance(output, list) else output
-
-        release, submitted = asyncio.Event(), asyncio.Event()
-
-        class PendingFuture(_Future):
-            async def _resolve(self) -> object:
-                await release.wait()
-                return self.value
-
-        class QueuedClient(_Client):
-            async def forward_backward_async(self, datums: list[object], **kwargs: object) -> object:
-                result = self.forward_backward(datums, **kwargs)
-                return PendingFuture(result) if self.events.count("forward") == 1 else _Future(result)
-
-            async def optim_step_async(self, params: object) -> object:
-                result = self.optim_step(params)
-                if self.optim_calls == 3:
-                    submitted.set()
-                return _Future(result)
-
-        client = QueuedClient()
-        client.get_tokenizer = lambda: SDKTokenizer()
-        run = _Run()
-        with (
-            patch("pathlib.Path.read_text", return_value=json.dumps([
-                {"instruction": "Q", "input": "", "output": "A"},
-            ] * 3)),
-            patch.object(sft_huanhuan.trio, "ServiceClient") as service,
-            patch.object(sft_huanhuan.swanlab, "init", return_value=run),
-            patch("sys.argv", ["sft_huanhuan.py", "--steps", "3", "--batch-size", "1", "--save-every", "2", "--swanlab"]),
-            patch("builtins.print"),
-        ):
-            service.return_value.create_lora_training_client_async = AsyncMock(return_value=client)
-            task = asyncio.create_task(sft_huanhuan.main())
-            try:
-                await asyncio.wait_for(submitted.wait(), 1)
-                self.assertEqual(run.logs, [])
-                self.assertEqual(client.events, [
-                    "forward", "optim", "forward", "optim", "sft-step-00000002", "forward", "optim",
-                ])
-                release.set()
-                await asyncio.wait_for(task, 1)
-            finally:
-                release.set()
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(client.optim_calls, 3)
-        self.assertEqual(client.saved, ["sft-step-00000002", "sft-step-00000003"])
-        self.assertEqual([step for _, step in run.logs], [1, 2, 3])
-        self.assertTrue(run.finished)
-
-    async def test_config_defaults_and_cli_overrides(self) -> None:
-        sample = '[{"instruction":"Q","input":"","output":"A"}]'
-        with (
-            patch("pathlib.Path.read_text", return_value=sample),
-            patch.object(sft_huanhuan_trio, "SFTTrainer") as trainer_class,
-            patch("builtins.print"),
-        ):
-            trainer_class.return_value.train = AsyncMock(return_value=SimpleNamespace(
-                global_step=0, checkpoint_path=None, metrics={}
-            ))
-            with patch("sys.argv", ["sft_huanhuan_trio.py"]):
-                await sft_huanhuan_trio.main()
-            defaults = trainer_class.call_args.kwargs
-            self.assertEqual(defaults["model"], "Qwen/Qwen3.5-4B")
-            self.assertEqual(defaults["lora_rank"], 8)
-            self.assertEqual(defaults["args"].max_steps, 100)
-            self.assertEqual(defaults["args"].max_in_flight, 32)
-            self.assertEqual(defaults["args"].report_to, "swanlab")
-            self.assertEqual(list(defaults["train_dataset"])[0]["completion"][0]["content"], "A")
-
-            with patch("sys.argv", [
-                "sft_huanhuan_trio.py", "--steps", "2", "--batch-size", "2", "--max-in-flight", "2", "--no-swanlab"
-            ]):
-                await sft_huanhuan_trio.main()
-            overridden = trainer_class.call_args.kwargs["args"]
-            self.assertEqual((overridden.max_steps, overridden.batch_size), (2, 2))
-            self.assertEqual(overridden.max_in_flight, 2)
-            self.assertIsNone(overridden.report_to)
-
-            settings = {
-                "model": {"name": "test-model", "lora_rank": 8},
-                "data": {"file": "data/huanhuan.json", "epochs": 1},
-                "sft": {"batch_size": 1, "max_steps": 1},
-                "swanlab": {
-                    "report_to": "swanlab", "workspace": "team", "tags": ["sft"],
-                    "run_name": "toml-run", "log_dir": "/tmp/sft-logs",
-                },
-            }
-            with (
-                patch.object(sft_huanhuan_trio.tomllib, "load", return_value=settings),
-                patch("sys.argv", ["sft_huanhuan_trio.py"]),
-            ):
-                await sft_huanhuan_trio.main()
-            configured = trainer_class.call_args.kwargs["args"]
-            self.assertEqual(configured.workspace, "team")
-            self.assertEqual(configured.tags, ["sft"])
-            self.assertEqual(configured.run_name, "toml-run")
-            self.assertEqual(configured.log_dir, "/tmp/sft-logs")
-
-
 if __name__ == "__main__":
     unittest.main()

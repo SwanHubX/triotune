@@ -1,13 +1,13 @@
 # PyTRIO remote training and sampling SDK.
 pytrio>=0.2.9
 
-# Dataset loading used by triotune/recipes/grpo_gsm8k.py.
+# Dataset loading used by training data preparation.
 datasets>=2.14.0
 
 # GRPO Datum tensors and local metric calculations.
 numpy>=1.24.0
 
-# Experiment tracking used by the GSM8K recipe.
+# Experiment tracking used by trainers.
 swanlab>=0.10.1
 
 # Rollout progress display.

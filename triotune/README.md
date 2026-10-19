@@ -1,17 +1,12 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 DPO、SFT、OPD 和 PPO-family 训练器及运行示例；GRPO 由 PPO-family 预设提供。
-
 
 ## 目录结构
 
 ```text
 triotune/
 ├── api/              # 配置参数与 PyTRIO client 公共契约
-├── configs/          # PPO-family、DPO、SFT、OPD 的 YAML 训练参数
 ├── dataset/          # 算法共享的数据校验、分词、mask 与 SWE 轨迹处理
-├── recipes/          # 框架版和独立版训练入口
-├── scripts/          # 启动脚本及使用说明
 ├── trainer/          # 按算法组织的训练实现和稳定导入入口
 │   ├── ppo/          # PPO/GRPO 等共享的采样、优势、损失与更新组件
 │   ├── dpo/          # 偏好数据、成对损失与训练编排
@@ -20,5 +15,4 @@ triotune/
 └── utils/            # batch、Datum、指标与 checkpoint 跨模块实现
 ```
 
-训练器模块的详细职责见 [trainer/README.md](trainer/README.md)；脚本参数及独立版示例见
-[scripts/README.md](scripts/README.md)。
+训练器模块的详细职责见 [trainer/README.md](trainer/README.md)。

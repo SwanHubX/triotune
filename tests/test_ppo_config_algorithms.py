@@ -10,9 +10,6 @@ from triotune.api import NormConfig, PPOConfig
 from triotune.utils.config import load_yaml_config
 
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
-
-
 class PPOConfigFileTests(unittest.TestCase):
     """Exercise algorithm selection without creating remote PyTRIO clients."""
 
@@ -79,18 +76,6 @@ rollout:
                     self.assertEqual(config.max_tokens, 128)
                     for field, value in expected.items():
                         self.assertEqual(getattr(config, field), value, field)
-
-    def test_repository_ppo_yaml_uses_the_same_module_adapter(self) -> None:
-        path = REPOSITORY_ROOT / "triotune" / "configs" / "ppo_gsm8k.yaml"
-        settings = load_yaml_config(path)
-        config = PPOConfig.from_modules(settings)
-
-        self.assertEqual(settings["algorithm"], "ppo")
-        self.assertTrue(config.use_critic)
-        self.assertEqual(config.num_generations, 4)
-        self.assertEqual(config.max_tokens, 1024)
-        self.assertEqual(config.critic_update_epochs, 1)
-        self.assertEqual(config.critic_n_minibatches, 1)
 
     def test_unknown_algorithm_is_rejected_from_a_config_file(self) -> None:
         with TemporaryDirectory() as directory:
