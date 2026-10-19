@@ -36,10 +36,10 @@ packages = [
 ]
 
 [tool.setuptools.package-dir]
-trio_cookbook = "trio-cookbook"
-"trio_cookbook.trainer" = "trio-cookbook/trainer"
+trio_cookbook = "triotune"
+"trio_cookbook.trainer" = "triotune/trainer"
 
 [tool.uv]
-# Keep the historical on-disk directory name while installing it under the
-# valid Python import name ``trio_cookbook`` via the setuptools mapping above.
+# Install the ``triotune`` source directory under the stable public import
+# name ``trio_cookbook`` via the setuptools mapping above.
 package = true

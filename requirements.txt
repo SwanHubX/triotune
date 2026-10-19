@@ -1,7 +1,7 @@
 # PyTRIO remote training and sampling SDK.
 pytrio>=0.2.9
 
-# Dataset loading used by trio-cookbook/recipes/grpo_gsm8k.py.
+# Dataset loading used by triotune/recipes/grpo_gsm8k.py.
 datasets>=2.14.0
 
 # GRPO Datum tensors and local metric calculations.

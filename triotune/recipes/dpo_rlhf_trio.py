@@ -21,7 +21,7 @@ from trio_cookbook.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "dpo_rlhf.yaml"
+DEFAULT_CONFIG = ROOT / "triotune" / "configs" / "dpo_rlhf.yaml"
 SUBSETS = {"helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base"}
 TURN = re.compile(r"\n\n(Human|Assistant):")
 

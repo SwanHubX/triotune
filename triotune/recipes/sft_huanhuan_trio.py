@@ -16,7 +16,7 @@ from trio_cookbook.trainer.sft import SFTConfig, SFTTrainer
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "sft_huanhuan.yaml"
+DEFAULT_CONFIG = ROOT / "triotune" / "configs" / "sft_huanhuan.yaml"
 SYSTEM_PROMPT = "现在你要扮演皇帝身边的女人--甄嬛"
 
 

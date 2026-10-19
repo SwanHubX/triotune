@@ -85,13 +85,13 @@ OPD 另有 `[teacher]` 配置教师模型，
 预处理数据：
 
 ```bash
-bash trio-cookbook/scripts/train_dpo_rlhf.sh --prepare-only
+bash triotune/scripts/train_dpo_rlhf.sh --prepare-only
 ```
 
 启动训练：
 
 ```bash
-bash trio-cookbook/scripts/train_dpo_rlhf.sh
+bash triotune/scripts/train_dpo_rlhf.sh
 ```
 
 ## GSM8K GRPO 案例
@@ -101,19 +101,19 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh
 预处理数据：
 
 ```bash
-bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
+bash triotune/scripts/train_grpo_gms8k.sh --prepare-only
 ```
 
 训练启动：
 
 ```bash
-bash trio-cookbook/scripts/train_grpo_gms8k.sh
+bash triotune/scripts/train_grpo_gms8k.sh
 ```
 
 查看脚本支持的覆盖参数：
 
 ```bash
-bash trio-cookbook/scripts/train_grpo_gms8k.sh --help
+bash triotune/scripts/train_grpo_gms8k.sh --help
 ```
 
 ## 嬛嬛 SFT 案例
@@ -128,7 +128,7 @@ curl --fail --location https://raw.githubusercontent.com/KMnO4-zx/huanhuan-chat/
 训练启动：
 
 ```bash
-bash trio-cookbook/scripts/train_sft_huanhuan.sh
+bash triotune/scripts/train_sft_huanhuan.sh
 ```
 
 ## DeepMath OPD 异步案例
@@ -136,22 +136,22 @@ bash trio-cookbook/scripts/train_sft_huanhuan.sh
 准备和检查数据，不创建 PyTRIO 客户端：
 
 ```bash
-bash trio-cookbook/scripts/train_opd_deepmath.sh --prepare-only
+bash triotune/scripts/train_opd_deepmath.sh --prepare-only
 ```
 
 启动默认训练，或按独立案例的命令覆盖参数：
 
 ```bash
-bash trio-cookbook/scripts/train_opd_deepmath.sh
+bash triotune/scripts/train_opd_deepmath.sh
 
-bash trio-cookbook/scripts/train_opd_deepmath.sh \
+bash triotune/scripts/train_opd_deepmath.sh \
   --steps 100 --batch-size 4 --group-size 4 --max-tokens 512 \
   --sample-size 5000 --base-model Qwen/Qwen3.5-4B \
   --teacher-base-model Qwen/Qwen3.8-27B
 
 # 完整数据、关闭 SwanLab；已有分片会直接复用
-bash trio-cookbook/scripts/train_opd_deepmath.sh \
+bash triotune/scripts/train_opd_deepmath.sh \
   --num-shards 10 --sample-size 0 --no-swanlab
 
-bash trio-cookbook/scripts/train_opd_deepmath.sh --help
+bash triotune/scripts/train_opd_deepmath.sh --help
 ```

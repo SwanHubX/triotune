@@ -81,7 +81,7 @@ rollout:
                         self.assertEqual(getattr(config, field), value, field)
 
     def test_repository_ppo_yaml_uses_the_same_module_adapter(self) -> None:
-        path = REPOSITORY_ROOT / "trio-cookbook" / "configs" / "ppo_gsm8k.yaml"
+        path = REPOSITORY_ROOT / "triotune" / "configs" / "ppo_gsm8k.yaml"
         settings = load_yaml_config(path)
         config = PPOConfig.from_modules(settings)
 

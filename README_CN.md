@@ -94,16 +94,16 @@ PyTRIO 客户端，适合作为本地环境的第一步检查：
 
 ```bash
 # 在仓库根目录执行
-bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
+bash triotune/scripts/train_grpo_gms8k.sh --prepare-only
 
 # 使用默认 YAML 配置启动训练
-bash trio-cookbook/scripts/train_grpo_gms8k.sh
+bash triotune/scripts/train_grpo_gms8k.sh
 ```
 
 常用覆盖参数包括 `--steps`、`--batch-size`、`--group-size`、
 `--max-examples` 和 `--help`。默认配置使用 Qwen 模型、LoRA、SwanLab 记录，
 以及 GSM8K 的 boxed-answer reward。请根据实际环境修改
-`trio-cookbook/configs/grpo_gms8k.yaml` 中的模型和训练配置。
+`triotune/configs/grpo_gms8k.yaml` 中的模型和训练配置。
 
 ## 🔧 支持矩阵
 
@@ -111,11 +111,11 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 
 | 算法 | 文档 | 论文 | 配置 |
 | --- | --- | --- | --- |
-| **GRPO** | - | [📄 论文](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K 示例](trio-cookbook/configs/grpo_gms8k.yaml) |
-| **PPO** | - | [📄 论文](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K 示例](trio-cookbook/configs/ppo_gsm8k.yaml) |
-| **DPO** | - | [📄 论文](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF 示例](trio-cookbook/configs/dpo_rlhf.yaml) |
-| **OPD** | - |  | [🔗 DeepMath-103K 示例](trio-cookbook/configs/opd_deepmath.yaml) |
-| **SFT** | - |  | [🔗 嬛嬛对话示例](trio-cookbook/configs/sft_huanhuan.yaml) |
+| **GRPO** | - | [📄 论文](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K 示例](triotune/configs/grpo_gms8k.yaml) |
+| **PPO** | - | [📄 论文](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K 示例](triotune/configs/ppo_gsm8k.yaml) |
+| **DPO** | - | [📄 论文](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF 示例](triotune/configs/dpo_rlhf.yaml) |
+| **OPD** | - |  | [🔗 DeepMath-103K 示例](triotune/configs/opd_deepmath.yaml) |
+| **SFT** | - |  | [🔗 嬛嬛对话示例](triotune/configs/sft_huanhuan.yaml) |
 
 ### 📖 模型
 
@@ -142,8 +142,8 @@ PyTRIO 当前支持以下模型：
 - **OPD：** prompt 行，教师会对学生采样的 completion 打分。
 
 字段校验规则和完整 JSONL 示例见
-[trainer 说明](trio-cookbook/trainer/README.md) 与
-[脚本说明](trio-cookbook/scripts/README.md)。
+[trainer 说明](triotune/trainer/README.md) 与
+[脚本说明](triotune/scripts/README.md)。
 
 ## 🐍 Python API
 
@@ -173,7 +173,7 @@ asyncio.run(trainer.train())
 ## 🗃️ 仓库结构
 
 ```text
-trio-cookbook/
+triotune/
 ├── configs/       # 内置流程的 YAML 配置
 ├── recipes/       # trainer 版本和独立 PyTRIO 案例
 ├── scripts/       # 启动脚本和数据准备说明

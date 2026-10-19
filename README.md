@@ -101,16 +101,16 @@ safe first check for the local environment:
 
 ```bash
 # From the repository root
-bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
+bash triotune/scripts/train_grpo_gms8k.sh --prepare-only
 
 # Start training with the default YAML configuration
-bash trio-cookbook/scripts/train_grpo_gms8k.sh
+bash triotune/scripts/train_grpo_gms8k.sh
 ```
 
 Useful overrides include `--steps`, `--batch-size`, `--group-size`,
 `--max-examples`, and `--help`. The default configuration uses a Qwen model,
 LoRA, SwanLab logging, and the GSM8K boxed-answer reward. Change the model and
-training settings in `trio-cookbook/configs/grpo_gms8k.yaml` for your setup.
+training settings in `triotune/configs/grpo_gms8k.yaml` for your setup.
 
 ## 🔧 Support Matrix
 
@@ -118,11 +118,11 @@ training settings in `trio-cookbook/configs/grpo_gms8k.yaml` for your setup.
 
 | Algorithm | Documentation | Paper | Configuration |
 | --- | --- | --- | --- |
-| **GRPO** | - | [📄 Paper](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K Example](trio-cookbook/configs/grpo_gms8k.yaml) |
-| **PPO** | - | [📄 Paper](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K Example](trio-cookbook/configs/ppo_gsm8k.yaml) |
-| **DPO** | - | [📄 Paper](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF Example](trio-cookbook/configs/dpo_rlhf.yaml) |
-| **OPD** | - |  | [🔗 DeepMath-103K Example](trio-cookbook/configs/opd_deepmath.yaml) |
-| **SFT** | - |  | [🔗 Huanhuan Chat Example](trio-cookbook/configs/sft_huanhuan.yaml) |
+| **GRPO** | - | [📄 Paper](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K Example](triotune/configs/grpo_gms8k.yaml) |
+| **PPO** | - | [📄 Paper](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K Example](triotune/configs/ppo_gsm8k.yaml) |
+| **DPO** | - | [📄 Paper](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF Example](triotune/configs/dpo_rlhf.yaml) |
+| **OPD** | - |  | [🔗 DeepMath-103K Example](triotune/configs/opd_deepmath.yaml) |
+| **SFT** | - |  | [🔗 Huanhuan Chat Example](triotune/configs/sft_huanhuan.yaml) |
 
 ### 📖 Models
 
@@ -148,7 +148,7 @@ Algorithm-specific fields are:
   `input_ids` (optionally with `labels`);
 - **OPD:** prompt rows; the teacher scores the student's sampled completion.
 
-See the [trainer guide](trio-cookbook/trainer/README.md) and [script guide](trio-cookbook/scripts/README.md)
+See the [trainer guide](triotune/trainer/README.md) and [script guide](triotune/scripts/README.md)
 for validation rules and complete JSONL examples.
 
 ## 🐍 Python API
@@ -179,7 +179,7 @@ asyncio.run(trainer.train())
 ## 🗃️ Repository layout
 
 ```text
-trio-cookbook/
+triotune/
 ├── configs/       # YAML configurations for the built-in workflows
 ├── recipes/       # Trainer-based and standalone PyTRIO examples
 ├── scripts/       # Shell launchers and dataset preparation guides

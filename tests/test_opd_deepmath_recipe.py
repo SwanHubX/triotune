@@ -15,7 +15,7 @@ import urllib.parse
 from datasets import Dataset
 
 
-RECIPE = Path(__file__).parents[1] / "trio-cookbook/recipes/opd_deepmath_trio.py"
+RECIPE = Path(__file__).parents[1] / "triotune/recipes/opd_deepmath_trio.py"
 spec = importlib.util.spec_from_file_location("opd_deepmath_recipe_test", RECIPE)
 assert spec is not None and spec.loader is not None
 script = importlib.util.module_from_spec(spec)

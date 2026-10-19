@@ -1,7 +1,7 @@
 """使用 PyTRIO 在 4x4 数独任务上进行同步 GRPO 训练。
 
 本脚本改写自 ``sudoku_trl_grpo/train_grpo.py``，训练循环沿用
-``trio-cookbook/recipes/grpo_gsm8k.py`` 的 PyTRIO 写法：
+``triotune/recipes/grpo_gsm8k.py`` 的 PyTRIO 写法：
 
 1. 读取并渲染 4x4 数独题目；
 2. 用当前 LoRA 权重为每道题采样一组回答；
@@ -11,7 +11,7 @@
 
 最小试跑（使用仓库 ``tests/sudoku_4x4_qa.jsonl`` 数据）：
 
-    uv run python trio-cookbook/recipes/grpo_sudoku.py \
+    uv run python triotune/recipes/grpo_sudoku.py \
         --steps 1 \
         --batch-size 1 \
         --group-size 4 \
@@ -19,7 +19,7 @@
 
 正式训练：
 
-    uv run python trio-cookbook/recipes/grpo_sudoku.py \
+    uv run python triotune/recipes/grpo_sudoku.py \
         --steps 100 \
         --batch-size 2 \
         --group-size 6 \

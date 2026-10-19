@@ -5,7 +5,7 @@ student 先采样，teacher 对 student 采样轨迹算 logprob，
 reverse_kl = student_logprob - teacher_logprob，再用 -reverse_kl 做 advantage。
 
 训练命令（在仓库根目录执行）：
-uv run python trio-cookbook/recipes/opd_async.py \
+uv run python triotune/recipes/opd_async.py \
     --steps 50 \
     --batch-size 4 \
     --group-size 4 \
