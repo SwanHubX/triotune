@@ -80,7 +80,7 @@ uv sync --extra dpo
 The published package can also be installed directly:
 
 ```bash
-pip install pytrio-cookbook==0.1.0
+pip install triotune==0.1.1
 ```
 
 For a source checkout with pip:
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The distribution name is `pytrio-cookbook`; the Python import name is
+The distribution name is `triotune`; the Python import name remains
 `trio_cookbook`.
 
 ## 🚀 Quick start
@@ -193,4 +193,4 @@ claim to provide a Web UI, Megatron integration, multimodal training, or a
 universal plugin/registry system. If you need a custom model module, first
 adapt it to the public PyTRIO client contract and use the existing recipe or
 trainer interfaces; first-class custom-module registration is planned work,
-not a supported promise of version 0.1.0.
+not a supported promise of version 0.1.1.
