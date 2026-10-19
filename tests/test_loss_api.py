@@ -6,7 +6,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from trio_cookbook.api.loss_api import (
+from triotune.api.loss_api import (
     BuiltinPyTrioObjective,
     LossSpec,
     PolicyLossInput,

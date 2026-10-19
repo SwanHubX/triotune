@@ -5,15 +5,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from trio_cookbook.trainer import PPOConfig
-from trio_cookbook.utils.checkpoint import (
+from triotune.trainer import PPOConfig
+from triotune.utils.checkpoint import (
     checkpoint_path,
     save_checkpoint,
     save_checkpoint_async,
 )
-from trio_cookbook.utils.dataloader import iter_batches
-from trio_cookbook.utils.datums import causal_datum, materialize_datum
-from trio_cookbook.utils.metrics import (
+from triotune.utils.dataloader import iter_batches
+from triotune.utils.datums import causal_datum, materialize_datum
+from triotune.utils.metrics import (
     MetricsAPI,
     accumulate_metrics,
     averaged_metrics,
@@ -21,7 +21,7 @@ from trio_cookbook.utils.metrics import (
     normalize_metrics,
     start_run,
 )
-from trio_cookbook.utils.scoring import (
+from triotune.utils.scoring import (
     completion_logprobs,
     score_completion,
     score_completion_async,
@@ -48,7 +48,7 @@ class LoggingTests(unittest.TestCase):
             tags=["grpo"],
             workspace="team",
         )
-        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+        with patch("triotune.utils.metrics.swanlab.init") as init:
             self.assertIs(start_run(args, default_name="fallback", metadata={"model": "test"}), init.return_value)
         self.assertEqual(init.call_args.kwargs["name"], "custom")
         self.assertEqual(init.call_args.kwargs["workspace"], "team")

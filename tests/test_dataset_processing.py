@@ -6,7 +6,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from trio_cookbook.dataset import (
+from triotune.dataset import (
     PreferenceExample,
     PromptExample,
     SupervisedExample,

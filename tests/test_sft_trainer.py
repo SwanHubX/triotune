@@ -6,8 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from trio_cookbook.recipes import sft_huanhuan, sft_huanhuan_trio
-from trio_cookbook.trainer import SFTConfig, SFTTrainer
+from triotune.recipes import sft_huanhuan, sft_huanhuan_trio
+from triotune.trainer import SFTConfig, SFTTrainer
 
 
 class _Tokenizer:
@@ -138,9 +138,9 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.client = _Client()
         self.run = _Run()
-        service = patch("trio_cookbook.trainer.sft_trainer.trio.ServiceClient")
+        service = patch("triotune.trainer.sft_trainer.trio.ServiceClient")
         swanlab = patch(
-            "trio_cookbook.utils.metrics.swanlab.init",
+            "triotune.utils.metrics.swanlab.init",
             return_value=self.run,
         )
         self.service = service.start()
@@ -370,7 +370,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(self.client, "forward_backward_async", return_value=FailedFuture(None)),
-            patch("trio_cookbook.trainer.sft_trainer.asyncio.create_task", side_effect=tracked_task),
+            patch("triotune.trainer.sft_trainer.asyncio.create_task", side_effect=tracked_task),
         ):
             with self.assertRaisesRegex(RuntimeError, "remote forward failed"):
                 await trainer.train()
@@ -381,7 +381,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.run.finished)
 
     async def test_swanlab_options_and_disabled_reporting(self) -> None:
-        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+        with patch("triotune.utils.metrics.swanlab.init") as init:
             self.trainer()
             init.assert_not_called()
             self.trainer(report_to="swanlab")

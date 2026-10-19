@@ -7,11 +7,11 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from trio_cookbook import OPDTrainer
-from trio_cookbook.trainer import OPDConfig, OPDTeacherGroup, OPDTeacherSpec
-from trio_cookbook.trainer.opd.datum import build_opd_datum
-from trio_cookbook.trainer.opd.loss import distillation_advantages
-from trio_cookbook.trainer.opd.teacher_phase import teacher_completion_logprobs
+from triotune import OPDTrainer
+from triotune.trainer import OPDConfig, OPDTeacherGroup, OPDTeacherSpec
+from triotune.trainer.opd.datum import build_opd_datum
+from triotune.trainer.opd.loss import distillation_advantages
+from triotune.trainer.opd.teacher_phase import teacher_completion_logprobs
 
 
 class _Tokenizer:
@@ -277,7 +277,7 @@ class OPDConfigTests(unittest.TestCase):
 class OPDTrainerTests(unittest.TestCase):
     def setUp(self):
         self.service, self.run = _Service(), _Run()
-        self.patch = patch("trio_cookbook.trainer.opd_trainer.trio.ServiceClient", return_value=self.service)
+        self.patch = patch("triotune.trainer.opd_trainer.trio.ServiceClient", return_value=self.service)
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
@@ -479,7 +479,7 @@ class OPDTrainerTests(unittest.TestCase):
         for failure in ("fail_forward", "fail_optim"):
             with self.subTest(failure=failure):
                 self.service = _Service()
-                with patch("trio_cookbook.trainer.opd_trainer.trio.ServiceClient", return_value=self.service):
+                with patch("triotune.trainer.opd_trainer.trio.ServiceClient", return_value=self.service):
                     trainer = self.trainer()
                 setattr(self.service.training, failure, True)
                 with self.assertRaises(RuntimeError):
@@ -493,7 +493,7 @@ class OPDTrainerTests(unittest.TestCase):
 
     def test_swanlab_flush_and_failure_finish(self):
         with patch(
-            "trio_cookbook.utils.metrics.swanlab.init",
+            "triotune.utils.metrics.swanlab.init",
             return_value=self.run,
         ):
             trainer = self.trainer(report_to="swanlab", logging_step=10, batch_size=1)
@@ -505,7 +505,7 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(self.run.texts[0]["data"], trainer.state.checkpoint_path)
         self.run = _Run()
         with patch(
-            "trio_cookbook.utils.metrics.swanlab.init",
+            "triotune.utils.metrics.swanlab.init",
             return_value=self.run,
         ):
             trainer = self.trainer(report_to="swanlab")

@@ -23,7 +23,7 @@ GRPO 不再保留独立 trainer；统一通过 `PPOTrainer` 与
 新接口统一从以下包导入：
 
 ```python
-from trio_cookbook.trainer.ppo import (
+from triotune.trainer.ppo import (
     Critic, NormConfig, PPOActor, PPOConfig, PPOState, PPOTrainer, PyTRIOCritic,
     PreparedBatch, Trajectory, compute_gae, prepare_advantages, value_loss,
 )
@@ -300,7 +300,7 @@ import asyncio
 import math
 import os
 
-from trio_cookbook.trainer.ppo import PPOConfig, PPOTrainer
+from triotune.trainer.ppo import PPOConfig, PPOTrainer
 
 
 def reward(*, row, completion, completion_ids):

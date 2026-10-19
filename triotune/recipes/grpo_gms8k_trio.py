@@ -17,8 +17,8 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from trio_cookbook.trainer import PPOConfig, PPOTrainer
-from trio_cookbook.utils.config import load_yaml_config
+from triotune.trainer import PPOConfig, PPOTrainer
+from triotune.utils.config import load_yaml_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

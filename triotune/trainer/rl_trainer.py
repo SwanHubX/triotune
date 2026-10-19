@@ -414,7 +414,7 @@ class PPOTrainer:
         return self.state
 
 
-# Keep ``trio_cookbook.trainer.ppo.trainer`` as an identity-preserving alias
+# Keep ``triotune.trainer.ppo.trainer`` as an identity-preserving alias
 # for integrations that patch or pickle the historical module path.
 _ppo_module = __import__(f"{__package__}.ppo", fromlist=["*"])
 _ppo_module.PPOTrainer = PPOTrainer

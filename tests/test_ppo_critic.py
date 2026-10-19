@@ -15,14 +15,14 @@ import swanlab
 import torch
 from pytrio.types.forward.tensor_data import TensorData
 from test_ppo_family import Future, Tokenizer, TrainingClient, trajectory
-from trio_cookbook.trainer.ppo import PPOConfig, PPOTrainer, PyTRIOCritic
-from trio_cookbook.trainer.ppo.critic_loss import (
+from triotune.trainer.ppo import PPOConfig, PPOTrainer, PyTRIOCritic
+from triotune.trainer.ppo.critic_loss import (
     critic_datums,
     make_value_loss_fn,
     values_from_logprobs,
 )
-from trio_cookbook.trainer.ppo.reporting import critic_metrics
-from trio_cookbook.utils.metrics import MetricsAPI
+from triotune.trainer.ppo.reporting import critic_metrics
+from triotune.utils.metrics import MetricsAPI
 
 
 class MarkerTokenizer(Tokenizer):
@@ -343,11 +343,11 @@ class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
         service.critic.forward_backward_custom_async = failed
         with (
             patch(
-                "trio_cookbook.trainer.ppo.trainer.MetricsAPI.from_config",
+                "triotune.trainer.ppo.trainer.MetricsAPI.from_config",
                 return_value=MetricsAPI(actor_run),
             ) as actor_factory,
             patch(
-                "trio_cookbook.trainer.ppo.trainer.critic_metrics",
+                "triotune.trainer.ppo.trainer.critic_metrics",
                 return_value=MetricsAPI(critic_run),
             ) as critic_factory,
         ):

@@ -8,9 +8,9 @@
 | --- | --- | --- | --- |
 | [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [train_grpo.py](../recipes/train_grpo.py) | [grpo_gms8k.yaml](../configs/grpo_gms8k.yaml) | `PPOConfig.from_modules` (`grpo`) |
 | [train_ppo_gms8k.sh](./train_ppo_gms8k.sh) | [train_ppo.py](../recipes/train_ppo.py) | [ppo_gsm8k.yaml](../configs/ppo_gsm8k.yaml) | `PPOConfig.from_modules` (`ppo`) |
-| [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [train_dpo.py](../recipes/train_dpo.py) | [dpo_rlhf.yaml](../configs/dpo_rlhf.yaml) | `trio_cookbook.trainer.dpo` |
-| [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [train_sft.py](../recipes/train_sft.py) | [sft_huanhuan.yaml](../configs/sft_huanhuan.yaml) | `trio_cookbook.trainer.sft` |
-| [train_opd_deepmath.sh](./train_opd_deepmath.sh) | [train_opd.py](../recipes/train_opd.py) | [opd_deepmath.yaml](../configs/opd_deepmath.yaml) | `trio_cookbook.trainer.opd` |
+| [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [train_dpo.py](../recipes/train_dpo.py) | [dpo_rlhf.yaml](../configs/dpo_rlhf.yaml) | `triotune.trainer.dpo` |
+| [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [train_sft.py](../recipes/train_sft.py) | [sft_huanhuan.yaml](../configs/sft_huanhuan.yaml) | `triotune.trainer.sft` |
+| [train_opd_deepmath.sh](./train_opd_deepmath.sh) | [train_opd.py](../recipes/train_opd.py) | [opd_deepmath.yaml](../configs/opd_deepmath.yaml) | `triotune.trainer.opd` |
 
 各配置的算法段（`grpo`、`dpo`、`sft`、`opd`）与 `swanlab`
 合并为对应的 Config；`[model]` 与 `[data]` 由 recipe 读取。

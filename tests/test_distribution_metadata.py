@@ -16,7 +16,7 @@ class DistributionMetadataTests(unittest.TestCase):
         project = config["project"]
 
         self.assertEqual(project["name"], "triotune")
-        self.assertEqual(project["version"], "0.1.1")
+        self.assertEqual(project["version"], "0.1.2")
         self.assertEqual(project["readme"], "README.md")
 
     def test_source_distribution_excludes_repository_only_content(self) -> None:

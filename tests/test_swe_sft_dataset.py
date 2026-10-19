@@ -7,8 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from trio_cookbook.dataset import prepare_sft
-from trio_cookbook.dataset.swe_sft import (
+from triotune.dataset import prepare_sft
+from triotune.dataset.swe_sft import (
     SWESFTConfig,
     prepare_swe_sft_dataset,
 )

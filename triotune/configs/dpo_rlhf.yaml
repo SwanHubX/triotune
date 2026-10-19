@@ -1,5 +1,5 @@
 # recipes/train_dpo.py 读取本文件。
-# dpo 与 swanlab 合并为 trio_cookbook.trainer.dpo.DPOConfig。
+# dpo 与 swanlab 合并为 triotune.trainer.dpo.DPOConfig。
 # model 和 data 是 recipe 的模型初始化与数据准备参数。
 
 model:

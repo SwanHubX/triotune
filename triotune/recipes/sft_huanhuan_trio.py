@@ -10,9 +10,9 @@ import tomllib  # retain legacy TOML loading for explicitly supplied files
 from pathlib import Path
 from typing import Any
 
-from trio_cookbook.utils.config import load_yaml_config
+from triotune.utils.config import load_yaml_config
 
-from trio_cookbook.trainer.sft import SFTConfig, SFTTrainer
+from triotune.trainer.sft import SFTConfig, SFTTrainer
 
 
 ROOT = Path(__file__).resolve().parents[2]

@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from trio_cookbook.trainer import DPOConfig, DPOTrainer
-from trio_cookbook.trainer.dpo.loss import make_loss_fn as _loss_fn
-from trio_cookbook.trainer.dpo_trainer import _datum, _reference_logprob
+from triotune.trainer import DPOConfig, DPOTrainer
+from triotune.trainer.dpo.loss import make_loss_fn as _loss_fn
+from triotune.trainer.dpo_trainer import _datum, _reference_logprob
 
 
 class _Tokenizer:
@@ -178,9 +178,9 @@ class DPOTrainerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = _ServiceClient()
         self.run = _SwanLabRun()
-        service_patch = patch("trio_cookbook.trainer.dpo_trainer.trio.ServiceClient", return_value=self.service)
+        service_patch = patch("triotune.trainer.dpo_trainer.trio.ServiceClient", return_value=self.service)
         swanlab_patch = patch(
-            "trio_cookbook.utils.metrics.swanlab.init",
+            "triotune.utils.metrics.swanlab.init",
             return_value=self.run,
         )
         service_patch.start()
@@ -195,8 +195,8 @@ class DPOTrainerTests(unittest.TestCase):
     def test_none_report_to_uses_terminal_progress_without_swanlab(self) -> None:
         self.assertIsNone(DPOConfig().report_to)
         with (
-            patch("trio_cookbook.utils.metrics.swanlab.init") as init,
-            patch("trio_cookbook.trainer.dpo_trainer.tqdm") as progress,
+            patch("triotune.utils.metrics.swanlab.init") as init,
+            patch("triotune.trainer.dpo_trainer.tqdm") as progress,
         ):
             trainer = self.trainer(report_to=None, max_steps=1)
             trainer.train_dataset = [{"messages": "P", "chosen": "A", "rejected": "B"}]
@@ -329,7 +329,7 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/train_runtime", summary)
 
     def test_swanlab_mode_initializes_run_without_sdk_mode_override(self) -> None:
-        with patch("trio_cookbook.utils.metrics.swanlab.init") as init:
+        with patch("triotune.utils.metrics.swanlab.init") as init:
             self.trainer()
         self.assertNotIn("mode", init.call_args.kwargs)
 
