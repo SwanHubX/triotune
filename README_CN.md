@@ -22,6 +22,7 @@ cookbook。名称中的 **Trio** 来自 PyTRIO，**tune** 参考了 Torchtune。
 - [快速开始](#快速开始)
 - [算法](#算法)
 - [数据契约](#数据契约)
+- [Token 用量指标](#token-用量指标)
 - [Python API](#python-api)
 - [文档](#文档)
 - [仓库结构](#仓库结构)
@@ -144,6 +145,23 @@ PyTRIO 当前支持以下模型：
 字段校验规则和完整 JSONL 示例见
 [trainer 说明](triotune/trainer/README.md) 与
 [脚本说明](triotune/scripts/README.md)。
+
+## Token 用量指标
+
+使用 trainer 的 SwanLab run 会通过 `usage/train_tokens` 记录本步提交给训练计算的
+token 数，并通过 `usage/train_tokens_total` 记录累计值。包含采样的流程还会记录
+`usage/sample_input_tokens`、`usage/sample_output_tokens` 及各自的 `_total`
+累计值。训练用量按实际发生的远端计算逐次累加，因此 PPO 重复执行的 epoch、
+minibatch 也会分别计入。采样用量优先采用 PyTRIO 响应中的计数；对于兼容的测试
+客户端或旧响应格式，才根据已经 tokenized 的 prompt 和返回序列计算。
+
+`usage/sample_input_tokens` 不会标成 prefill 或 cache token。前缀缓存是否命中是在
+服务端完成请求路由后决定的，取决于请求被分配到哪个副本、该副本当时驻留的缓存
+前缀、是否只命中部分前缀，以及缓存是否已被淘汰。对客户端而言，无论服务端重新
+计算还是命中缓存，发送的 prompt token 完全相同，所以仅根据 prompt 长度无法还原
+两者的实际拆分。PyTRIO 0.2.9 的采样响应只提供汇总的输入和输出 token 数，没有
+cached-input 或 uncached-prefill 计数。因此 Triotune 不猜测这两个数，也不维护按
+模型硬编码的单价表来计算费用。
 
 ## 🐍 Python API
 

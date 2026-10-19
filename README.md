@@ -24,6 +24,7 @@ advantage calculation, token alignment, and training-loop orchestration.
 - [Quick start](#quick-start)
 - [Algorithms](#algorithms)
 - [Data contracts](#data-contracts)
+- [Token usage metrics](#token-usage-metrics)
 - [Python API](#python-api)
 - [Documentation](#documentation)
 - [Repository layout](#repository-layout)
@@ -149,6 +150,27 @@ Algorithm-specific fields are:
 
 See the [trainer guide](triotune/trainer/README.md) and [script guide](triotune/scripts/README.md)
 for validation rules and complete JSONL examples.
+
+## Token usage metrics
+
+Trainer-backed SwanLab runs report the tokens submitted to training compute as
+`usage/train_tokens` and its running total as `usage/train_tokens_total`.
+Sampling workflows additionally report `usage/sample_input_tokens`,
+`usage/sample_output_tokens`, and their `_total` counterparts. Training usage
+counts every actual remote training pass, including repeated PPO epochs and
+minibatches. Sampling usage uses PyTRIO's response counters when available and
+falls back to the tokenized prompt and returned sequences for compatible test
+or older clients.
+
+`usage/sample_input_tokens` is intentionally not labeled as either prefill or
+cache usage. Prefix-cache hits are decided inside the serving system after
+request routing: they depend on the selected replica, the prefixes currently
+resident in that replica's cache, partial-prefix matching, and cache eviction.
+The client sends the same prompt tokens whether they are recomputed or served
+from cache, so prompt length alone cannot recover that split. PyTRIO 0.2.9
+returns aggregate sampling input/output tokens but no cached-input or
+uncached-prefill counters. Triotune therefore does not guess the split or
+calculate a monetary cost from a hard-coded model price table.
 
 ## 🐍 Python API
 
