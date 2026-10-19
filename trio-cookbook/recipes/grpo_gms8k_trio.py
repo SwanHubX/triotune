@@ -1,4 +1,4 @@
-"""Prepare GSM8K data and train GRPO using a TOML recipe configuration.
+"""Prepare GSM8K data and train GRPO using a YAML recipe configuration.
 
 Launch this recipe with ``bash trio-cookbook/scripts/train_grpo_gms8k.sh``.
 Use ``--prepare-only`` to inspect the JSONL data before creating PyTRIO clients.
@@ -10,7 +10,7 @@ import argparse
 import asyncio
 import json
 import re
-import tomllib
+import tomllib  # retain legacy TOML loading for explicitly supplied files
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -18,10 +18,11 @@ from typing import Any
 from datasets import Dataset, load_dataset
 
 from trio_cookbook.trainer import PPOConfig, PPOTrainer
+from trio_cookbook.utils.config import load_yaml_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = REPOSITORY_ROOT / "trio-cookbook" / "configs" / "grpo_gms8k.toml"
+DEFAULT_CONFIG = REPOSITORY_ROOT / "trio-cookbook" / "configs" / "grpo_gms8k.yaml"
 
 QUESTION_SUFFIX = "Provide a numerical answer without units, written inside \\boxed{}."
 FEWSHOT_PREFIX = [
@@ -160,12 +161,10 @@ def resolve_path(value: str | Path) -> Path:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with path.expanduser().open("rb") as source:
-        settings = tomllib.load(source)
+    settings = load_yaml_config(path)
     required = {
         "model": ("name", "lora_rank"),
         "data": ("file", "cache_dir"),
-        "grpo": ("num_generations", "max_steps"),
     }
     for section, fields in required.items():
         values = settings.get(section)
@@ -174,8 +173,45 @@ def load_config(path: Path) -> dict[str, Any]:
         for field in fields:
             if field not in values:
                 raise ValueError(f"Config {path} is missing [{section}].{field}")
+    # Legacy flat files are still accepted when explicitly supplied.  A
+    # mapping without the modular markers must provide its algorithm section.
+    if "algorithm" not in settings and "training" not in settings and "rollout" not in settings:
+        values = settings.get("grpo")
+        if not isinstance(values, dict):
+            raise ValueError(f"Config {path} must contain a [grpo] section")
+        for field in ("num_generations", "max_steps"):
+            if field not in values:
+                raise ValueError(f"Config {path} is missing [grpo].{field}")
+    algorithm = settings.get("algorithm", "grpo")
+    if isinstance(algorithm, dict):
+        algorithm = algorithm.get("name")
+    if not isinstance(algorithm, str) or not algorithm.strip():
+        raise ValueError(f"Config {path} must contain a non-empty algorithm")
+    if not isinstance(settings.get("training", {}), dict):
+        raise ValueError(f"Config {path} training must be a mapping")
+    if not isinstance(settings.get("rollout", {}), dict):
+        raise ValueError(f"Config {path} rollout must be a mapping")
+    if not isinstance(settings.get("reference", {}), dict):
+        raise ValueError(f"Config {path} reference must be a mapping")
     if not isinstance(settings.get("swanlab", {}), dict):
         raise ValueError(f"Config {path} must contain a [swanlab] table when provided")
+    # Expose the previous flat section to integrations that inspect settings
+    # directly, while constructing the trainer from independent modules below.
+    if "grpo" not in settings:
+        legacy = {
+            **settings.get("training", {}),
+            **settings.get("rollout", {}),
+            **settings.get("optimizer", {}),
+            **settings.get("actor", {}),
+        }
+        for source, target in {
+            "group_size": "num_generations",
+            "max_new_tokens": "max_tokens",
+            "lr": "learning_rate",
+        }.items():
+            if source in legacy:
+                legacy[target] = legacy[source]
+        settings["grpo"] = legacy
     return settings
 
 
@@ -219,28 +255,43 @@ def main() -> None:
     if args.prepare_only:
         return
 
-    grpo = dict(settings["grpo"])
-    for flag, field in (
-        ("steps", "max_steps"),
-        ("batch_size", "batch_size"),
-        ("group_size", "num_generations"),
+    algorithm = settings.get("algorithm", "grpo")
+    if isinstance(algorithm, dict):
+        algorithm = algorithm.get("name")
+    modules = dict(settings)
+    for flag, section, field in (
+        ("steps", "training", "max_steps"),
+        ("batch_size", "training", "batch_size"),
+        ("group_size", "rollout", "num_generations"),
     ):
         if (value := getattr(args, flag)) is not None:
-            grpo[field] = value
-    grpo.setdefault("save_every", grpo.get("max_steps") or 0)
+            modules.setdefault(section, {})[field] = value
+    modules.setdefault("training", {}).setdefault(
+        "save_every", modules["training"].get("max_steps") or 0
+    )
 
     swanlab_options = dict(settings.get("swanlab", {}))
     for field in ("report_to", "project", "workspace", "run_name", "tags"):
         if (value := getattr(args, field)) is not None:
             swanlab_options[field] = value
 
-    config = PPOConfig.for_algorithm("grpo", **grpo, **swanlab_options)
+    config = PPOConfig.from_modules(modules, **swanlab_options)
+    reference = settings.get("reference", {})
+    if not isinstance(reference, dict):
+        raise ValueError(f"Config {args.config} reference must be a mapping")
+    reference_model = reference.get("path") or reference.get("model")
+    if reference_model is not None and (
+        not isinstance(reference_model, str) or not reference_model.strip()
+    ):
+        raise ValueError("reference.path must be a non-empty model ID when provided")
+
     trainer = PPOTrainer(
         model=settings["model"]["name"],
         reward_fn=boxed_answer_reward,
         args=config,
         train_dataset=rows,
         lora_rank=settings["model"]["lora_rank"],
+        reference_model=reference_model,
     )
     asyncio.run(trainer.train())
 

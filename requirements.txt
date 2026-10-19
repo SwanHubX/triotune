@@ -12,3 +12,6 @@ swanlab>=0.10.1
 
 # Rollout progress display.
 tqdm>=4.60.0
+
+# YAML configuration files used by recipes.
+PyYAML>=6.0.2

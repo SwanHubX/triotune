@@ -12,7 +12,7 @@ import asyncio
 import itertools
 import math
 import shutil
-import tomllib
+import tomllib  # retain legacy TOML loading for explicitly supplied files
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -23,10 +23,11 @@ from datasets import Dataset, load_dataset
 import pytrio as trio
 
 from trio_cookbook.trainer.opd import OPDConfig, OPDTrainer
+from trio_cookbook.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "opd_deepmath.toml"
+DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "opd_deepmath.yaml"
 DEEPMATH_SHARDS = 10
 
 
@@ -84,8 +85,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with path.open("rb") as source:
-        settings = tomllib.load(source)
+    settings = load_yaml_config(path)
     required = {
         "model": ("name", "lora_rank"),
         "teacher": ("name",),

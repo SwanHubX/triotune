@@ -1411,6 +1411,7 @@ dependencies = [
     { name = "datasets" },
     { name = "numpy" },
     { name = "pytrio" },
+    { name = "pyyaml" },
     { name = "swanlab" },
     { name = "tqdm" },
 ]
@@ -1428,6 +1429,7 @@ requires-dist = [
     { name = "datasets", specifier = "==5.0.1" },
     { name = "numpy", specifier = "==2.5.3" },
     { name = "pytrio", specifier = "==0.2.9" },
+    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "swanlab", specifier = "==0.10.1" },
     { name = "torch", marker = "extra == 'dpo'", specifier = ">=2.3" },
     { name = "torch", marker = "extra == 'ppo'", specifier = ">=2.3" },

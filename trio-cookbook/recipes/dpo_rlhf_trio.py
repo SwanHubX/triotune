@@ -9,7 +9,7 @@ import json
 import random
 import re
 import shutil
-import tomllib
+import tomllib  # retain legacy TOML loading for explicitly supplied files
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from trio_cookbook.trainer.dpo import DPOConfig, DPOTrainer
+from trio_cookbook.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "dpo_rlhf.toml"
+DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "dpo_rlhf.yaml"
 SUBSETS = {"helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base"}
 TURN = re.compile(r"\n\n(Human|Assistant):")
 
@@ -53,8 +54,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with path.open("rb") as source:
-        settings = tomllib.load(source)
+    settings = load_yaml_config(path)
     for section, fields in {
         "model": ("name", "lora_rank"),
         "data": ("file", "cache_dir", "subsets", "sample_size"),

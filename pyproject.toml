@@ -8,6 +8,7 @@ dependencies = [
     "datasets==5.0.1",
     "numpy==2.5.3",
     "pytrio==0.2.9",
+    "pyyaml==6.0.3",
     "swanlab==0.10.1",
     "tqdm==4.70.1",
 ]

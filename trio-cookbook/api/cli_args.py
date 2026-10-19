@@ -2,7 +2,7 @@
 
 This module is the trainer's contract layer: common run controls live on
 ``BaseTrainerConfig`` while algorithm subclasses add only their own behavior.
-Configuration fields can be supplied directly from recipe/TOML mappings.
+Configuration fields can be supplied directly from recipe/YAML mappings.
 Evaluation uses flat eval_* fields instead of the former nested evaluation
 object: every_steps becomes eval_steps, before_train/after_train become
 eval_before_train/eval_after_train, and batch_size/max_batches become
@@ -12,7 +12,8 @@ eval_batch_size/eval_max_batches. Trainers receive eval_dataset separately.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from typing import Any, Literal
 
 @dataclass(slots=True)
@@ -107,7 +108,7 @@ class BaseTrainerConfig:
         """Validate shared invariants before an algorithm validates its fields.
 
         These checks are kept at the contract boundary because values commonly
-        originate in TOML or CLI input, where Python type annotations are not
+        originate in YAML or CLI input, where Python type annotations are not
         enforced. They prevent invalid optimizer calls, empty logging targets,
         and training loops that cannot make progress.
         """
@@ -337,7 +338,7 @@ class NormConfig:
 class PPOConfig(BaseTrainerConfig):
     """Configure PPO and its shared GRPO-family policy loop.
 
-    The class is defined beside the other public API contracts so TOML, CLI,
+    The class is defined beside the other public API contracts so YAML, CLI,
     and Python callers receive one validation path.  Presets only select
     algorithm settings; ``PPOTrainer`` remains the single PyTRIO orchestrator.
     Defaults describe PPO with independent actor and critic clients, while
@@ -691,6 +692,114 @@ class PPOConfig(BaseTrainerConfig):
         else:
             raise ValueError(f"Unknown PPO preset: {name!r}.")
         return cls(**{**options, **overrides})
+
+    @classmethod
+    def from_modules(
+        cls,
+        settings: Mapping[str, Any],
+        **overrides: Any,
+    ) -> "PPOConfig":
+        """Build a PPO-family config from independent YAML module sections.
+
+        Recipe YAML keeps lifecycle, optimizer, rollout, actor, critic,
+        reference-model, and reporting controls in separate mappings. The
+        trainer still receives one validated ``PPOConfig``; this adapter is the
+        boundary that merges
+        those module contracts and applies the selected algorithm preset.
+
+        ``grpo``/``ppo`` style flat mappings remain accepted as a migration
+        path for older recipe files.  Modern files select the preset with the
+        top-level ``algorithm`` key and use sections such as ``rollout`` and
+        ``optimizer``.
+        """
+
+        if not isinstance(settings, Mapping):
+            raise TypeError("PPO settings must be a mapping.")
+        algorithm = settings.get("algorithm", "grpo")
+        if isinstance(algorithm, Mapping):
+            algorithm = algorithm.get("name")
+        if not isinstance(algorithm, str) or not algorithm.strip():
+            raise ValueError("algorithm must be a non-empty string.")
+        algorithm = algorithm.strip().lower()
+
+        values: dict[str, Any] = {}
+        legacy = settings.get(algorithm)
+        if isinstance(legacy, Mapping):
+            values.update(legacy)
+            for source, target in {
+                "group_size": "num_generations",
+                "max_new_tokens": "max_tokens",
+                "lr": "learning_rate",
+            }.items():
+                if source in values:
+                    values[target] = values.pop(source)
+
+        aliases = {
+            "training": {"steps": "max_steps", "total_train_steps": "max_steps"},
+            "optimizer": {"lr": "learning_rate"},
+            "rollout": {
+                "group_size": "num_generations",
+                "n_samples": "num_generations",
+                "max_new_tokens": "max_tokens",
+            },
+            "gconfig": {"n_samples": "num_generations", "max_new_tokens": "max_tokens"},
+            "critic": {
+                "enabled": "use_critic",
+                "lora_rank": "critic_lora_rank",
+                "learning_rate": "critic_learning_rate",
+                "lr": "critic_learning_rate",
+                "eps_clip": "critic_eps_clip",
+                "n_minibatches": "critic_n_minibatches",
+                "update_epochs": "critic_update_epochs",
+                "value_scale": "critic_value_scale",
+                "value_bias": "critic_value_bias",
+                "token_ids": "critic_token_ids",
+            },
+            "logging": {"name": "run_name"},
+            "swanlab": {"name": "run_name"},
+        }
+        sections = (
+            "training",
+            "optimizer",
+            "rollout",
+            "gconfig",
+            "actor",
+            "critic",
+            "logging",
+            "swanlab",
+        )
+        field_names = {item.name for item in fields(cls)}
+        for section in sections:
+            module = settings.get(section)
+            if not isinstance(module, Mapping):
+                continue
+            for key, value in module.items():
+                if section == "actor" and key == "optimizer" and isinstance(value, Mapping):
+                    for optimizer_key, optimizer_value in value.items():
+                        target = {"lr": "learning_rate"}.get(optimizer_key, optimizer_key)
+                        if target in field_names:
+                            values[target] = optimizer_value
+                    continue
+                if section == "critic" and key == "optimizer" and isinstance(value, Mapping):
+                    for optimizer_key, optimizer_value in value.items():
+                        target = {
+                            "lr": "critic_learning_rate",
+                            "learning_rate": "critic_learning_rate",
+                        }.get(optimizer_key, f"critic_{optimizer_key}")
+                        if target in field_names:
+                            values[target] = optimizer_value
+                    continue
+                target = aliases.get(section, {}).get(key, key)
+                if target in field_names:
+                    values[target] = value
+
+        for key in ("reward_norm", "adv_norm"):
+            value = values.get(key)
+            if isinstance(value, Mapping):
+                values[key] = NormConfig(**dict(value))
+
+        values.update(overrides)
+        return cls.for_algorithm(algorithm, **values)
 
 
 @dataclass(slots=True)

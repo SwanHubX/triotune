@@ -8,7 +8,7 @@
 ```text
 trio-cookbook/
 ├── api/              # 配置参数与 PyTRIO client 公共契约
-├── configs/          # PPO-family、DPO、SFT、OPD 训练参数
+├── configs/          # PPO-family、DPO、SFT、OPD 的 YAML 训练参数
 ├── dataset/          # 算法共享的数据校验、分词、mask 与 SWE 轨迹处理
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
