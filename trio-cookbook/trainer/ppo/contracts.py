@@ -24,6 +24,7 @@ class Trajectory:
     reference_logprobs: list[float] | None = None
     values: list[float] | None = None
     token_rewards: list[float] | None = None
+    turn_ids: list[int] | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt_tokens or not self.completion_tokens:
@@ -66,6 +67,29 @@ class Trajectory:
                     f"{name} must be finite and aligned with completion tokens"
                     + (" plus one bootstrap value." if name == "values" else ".")
                 )
+        if self.turn_ids is not None:
+            if len(self.turn_ids) != n or any(
+                isinstance(turn_id, bool) or not isinstance(turn_id, int)
+                for turn_id in self.turn_ids
+            ):
+                raise ValueError(
+                    "turn_ids must contain one integer per completion token."
+                )
+            previous = -1
+            for turn_id, active in zip(self.turn_ids, self.loss_mask, strict=True):
+                if not active:
+                    if turn_id != -1:
+                        raise ValueError(
+                            "Inactive completion tokens must use turn_id -1."
+                        )
+                    continue
+                if not 0 <= turn_id < n:
+                    raise ValueError("Active turn_ids must be in [0, T).")
+                if turn_id < previous:
+                    raise ValueError(
+                        "Active turn_ids must be temporally nondecreasing."
+                    )
+                previous = turn_id
 
 
 @dataclass(slots=True)

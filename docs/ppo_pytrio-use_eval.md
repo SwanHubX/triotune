@@ -37,7 +37,7 @@ flowchart TD
     C --> D[可选：过滤无 reward 差异的组并补采]
     D --> E[固定 reference 评分、独立 critic logprob 读出 value]
     E --> F[可选：重算 proximal logprob]
-    F --> G[奖励处理、归一化、token GAE、advantage 归一化]
+    F --> G[奖励处理、归一化、token/turn GAE、advantage 归一化]
     G --> H[固定目标，按完整 prompt group 切 minibatch]
     H --> I[actor：策略损失、backward、Adam]
     H --> J[critic：clipped value regression、backward、独立 Adam]
@@ -50,7 +50,8 @@ flowchart TD
 | [cli_args.py](../trio-cookbook/api/cli_args.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
 | [contracts.py](../trio-cookbook/trainer/ppo/contracts.py) | `Trajectory`、`PreparedBatch`、`PPOState` |
 | [rollout.py](../trio-cookbook/trainer/ppo/rollout.py) | 文本采样、reward 调用、动态补采、固定 reference 评分 |
-| [actor.py](../trio-cookbook/trainer/ppo/actor.py) | 奖励整形、batch/group 归一化、KL reward、token 级 GAE、优势归一化和 actor 更新 |
+| [advantages.py](../trio-cookbook/trainer/ppo/advantages.py) | 奖励整形、batch/group 归一化、KL reward 组合和优势归一化 |
+| [gae.py](../trio-cookbook/trainer/ppo/gae.py) | 独立的 token/turn 级 GAE 递推、mask/bootstrap 与 turn metadata 校验 |
 | [datum.py](../trio-cookbook/trainer/ppo/datum.py) | 因果 token 对齐、prompt/tool label mask、PyTRIO Datum 构建 |
 | [loss.py](../trio-cookbook/trainer/ppo/loss.py) | PPO、SAPO、CISPO、GSPO 比率、双重裁剪、reduction、行为过滤 |
 | [actor.py](../trio-cookbook/trainer/ppo/actor.py) | proximal 重算、目标冻结、minibatch 和重复更新 |
@@ -90,7 +91,7 @@ flowchart TD
 | 类别 | 配置 |
 | --- | --- |
 | 数据与采样 | `batch_size`、`num_generations`、`max_tokens`、`prompt_key`、`chat_template_kwargs`、`seed` |
-| reward/GAE | `use_critic`、`reward_norm`、`adv_norm`、`reward_bias/scaling/clip`、`discount`、`gae_lambda` |
+| reward/GAE | `use_critic`、`reward_norm`、`adv_norm`、`reward_bias/scaling/clip`、`discount`、`gae_lambda`、`gae_timestep_unit` |
 | critic 优化 | `critic_learning_rate`、`critic_lora_rank`、`critic_n_minibatches`、`critic_update_epochs` |
 | critic 读出/损失 | `critic_token_ids`、`critic_value_scale`、`critic_value_bias`、`critic_eps_clip` |
 | KL 和截断 | `kl_ctl`、`kl_estimator`、`mask_no_eos_with_zero`、`overlong_tokens`、`overlong_penalty_factor` |
@@ -114,17 +115,19 @@ flowchart TD
 | `completion_tokens`、`logprobs` | completion token 和其行为策略 logprob，长度均为 T；不是整段 prompt+completion 的 logprob |
 | `reward`、`group_id` | 任务得分和 prompt 分组标识；同一 group 必须有完全相同的 prompt token |
 | `loss_mask` | T 个布尔值，默认全为 True；工具返回可设为 False，仍保留上下文 token |
+| `turn_ids` | 可选的 T 个整数；turn GAE 时必填。有效 action token 使用时间单调不减的 turn ID，mask 位置使用 `-1` |
 | `truncated` | 是否因长度等原因截断；决定 GAE 是否使用 bootstrap |
 | `reference_logprobs` | 可选的 T 个固定参考策略 logprob；`kl_ctl > 0` 且缺失时由 trainer 补算 |
 | `values` | critic 路径需要 T+1 个 value；前 T 个对应 action 前的状态，最后一个是截断 bootstrap |
-| `token_rewards` | 可选的 T 个奖励增量，直接进入 token GAE；不是 AReaL 的全部 PRM/turn reward 语义 |
+| `token_rewards` | 可选的 T 个任务/过程奖励增量；token 模式逐 token 进入 GAE，turn 模式按 turn 求和后进入 GAE |
 | `Critic.compute_values(trajectories)` | 异步返回每条轨迹的 T+1 个真实 value |
 | `Critic.update(trajectories, returns, masks)` | 异步拟合冻结 return，返回指标字典；critic 自己管理模型、optimizer 和 checkpoint |
 | `value_loss(values, old_values, returns, mask, clip=0.2)` | 本地 torch clipped value regression；四个 tensor 形状相同，仅含 T 个 action 位置，不含 bootstrap |
 
 `PreparedBatch` 保存轨迹、advantage、return、mask 和 frozen proximal logprob。
 `PPOState` 保存 rollout step、两种 optimizer step、最新指标及 actor/critic checkpoint 路径。
-`compute_gae()` 与 `prepare_advantages()` 可独立调用，不依赖远端模型。
+`compute_gae()`、`compute_token_level_gae()`、`compute_turn_level_gae()` 与
+`prepare_advantages()` 可独立调用，不依赖远端模型。
 
 内置 `PyTRIOCritic` 的读出与训练如下：
 
@@ -134,6 +137,30 @@ delta_t = reward_t + discount * V(s_next) - V(s_t)
 advantage_t = delta_t + discount * gae_lambda * advantage_next
 return_t = advantage_t + old_value_t  # 使用归一化之前的 GAE advantage
 ```
+
+`gae_timestep_unit="token"` 保持原有行为：每个有效 completion token 都推进一次
+`discount` 和 `gae_lambda`。`"turn"` 则参考 AReaL，把每个非空 assistant turn
+作为宏时间步：对 turn 内 task/process reward 求和，读取该 turn 第一个有效 action
+位置的 value，执行一次 GAE，再把 advantage/return 广播回 turn 内全部有效 token。
+prompt、tool 和其他 mask 位置不会消耗时间步，turn ID 允许跳号。
+
+Turn 模式将 reference KL 保持为 token-local actor penalty，不把它纳入 turn recurrence
+或 critic return。否则先对一个 turn 的 KL 求和、再把总和广播给 turn 内每个 token，
+会重复放大 KL。正常 EOS 终止仍使用零 bootstrap；截断轨迹仍使用第 T+1 个 value。
+内置 PyTRIO sampler 的一次 completion 自动标记为 turn 0；自定义多轮 rollout 通过
+`PPOTrainer.step()` 提交 `Trajectory.turn_ids`。
+
+这里需要区分三个互相独立的粒度轴：
+
+| 粒度轴 | 配置 | 含义 | 典型用途 |
+| --- | --- | --- | --- |
+| 信用分配时间步 | `gae_timestep_unit=token/turn` | `gamma/lambda` 按 token 或 assistant turn 推进 | token PPO；多轮 agent PPO |
+| 重要性采样比率 | `importance_sampling_level=token/sequence` | 每 token ratio 或整条 response 的几何平均 ratio | PPO/GRPO；GSPO |
+| loss 归约 | `loss_aggregation=token_mean/seq_mean/prompt_mean/constant` | 决定不同长度 response 和 prompt group 的权重 | 长度公平、prompt 公平或固定 divisor |
+
+因此 turn 级 GAE 本身不是另一种 PPO-family 算法，也不等同于 GSPO 的 sequence
+ratio。它是可与 PPO、GRPO、RLOO、GSPO 等预设正交组合的信用分配策略；所谓“句子级”
+在当前实现中应明确为整条 response 的 `sequence` ratio/reduction，而不是按自然语言句号切分。
 
 两个 logprob 的 log-softmax 归一化项抵消，等价于两个词表 logit 的差，可以表示正负无界 value。
 默认 marker 为 tokenizer 编码的 `"1"`、`"0"`；必须各是一个不同的既有 token，
@@ -206,7 +233,7 @@ critic 按轨迹切 minibatch，数量不得超过有效轨迹数；每个 epoch
 | --- | --- |
 | 可变 group 大小 | 用显式 `group_id` 分组，不依赖固定 reshape；内置采样仍要求每个请求返回配置数量的回答 |
 | reward/advantage normalization | mean/std 可分别选 batch、group 或关闭；支持 unbiased std、leave-one-out、singleton fallback |
-| token GAE | 支持 discount、固定 lambda、正常终止的零 bootstrap、截断的真实 value bootstrap；跳过 masked 工具位置 |
+| token/turn GAE | token 模式逐有效 token 递推；turn 模式聚合 task reward、广播 turn target，并保持 KL 为 token-local；两者均支持 mask 与终止/截断 bootstrap |
 | KL reward | 支持 k1/k2/k3，估计量限幅到 [-10, 10] 后乘 `kl_ctl` 加入 token reward |
 | 截断 reward 处理 | `mask_no_eos_with_zero=True` 清零截断样本的 outcome/token reward，保留 KL 和 critic bootstrap |
 | 策略裁剪 | 普通和非对称 PPO clip、dual clip；GSPO、SAPO、CISPO 的相应目标 |
@@ -234,14 +261,14 @@ uv sync --extra ppo
 uv run --extra ppo python -m unittest discover -s tests -p 'test_ppo*.py' -v
 ```
 
-测试文件为 [test_ppo_family.py](../tests/test_ppo_family.py)（24 项）和
-[test_ppo_critic.py](../tests/test_ppo_critic.py)（15 项），共 39 项。
+测试文件为 [test_ppo_family.py](../tests/test_ppo_family.py)（28 项）和
+[test_ppo_critic.py](../tests/test_ppo_critic.py)（15 项），共 43 项。
 这些测试不需要 PyTRIO 服务凭据，不创建真实远端模型，也不向 SwanLab 上传训练轨迹。
 已有 CPU PyTorch 环境可直接使用 `.venv/bin/python` 执行测试，无需重复安装 GPU 版 PyTorch。
 
 | 测试部分 | 检查内容 |
 | --- | --- |
-| `AdvantageTests` | 可变组和 singleton、RLOO baseline、reward/advantage 归一化、GAE、工具 mask、KL、超长/截断处理、无效配置 |
+| `AdvantageTests` | 可变组和 singleton、RLOO baseline、reward/advantage 归一化、token/turn GAE、turn metadata、工具 mask、KL、超长/截断处理、无效配置 |
 | `PolicyLossTests` | PPO clip 和 dual clip 梯度、GSPO 几何比率、SAPO/CISPO、不同长度的 reduction、过滤分母、因果对齐、value loss、有限差分梯度和溢出失败 |
 | `CriticLossTests`、`TwoRunPPOTests`、`ReporterProcessTests` | marker 因果对齐、无界读出、梯度有限差分、mask/bootstrap、独立优化器与 checkpoint、GAE 目标冻结、实际回归学习、并发更新、双 reporter 和异常清理、真实 SDK 的正负 CE 权重 |
 | `AsyncTrainerTests` | 两阶段 future 顺序、策略刷新和 seed、各预设共用 actor、native 参数、固定 reference、外部 critic 调用、动态补采、失败状态和 SDK 梯度转换 |
@@ -399,8 +426,8 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 | --- | --- | --- |
 | 异步 rollout 队列、staleness 控制、`_update_weights_and_publish_version()` | 只在一轮中并发采样，更新后刷新 sampling client；无持续生产消费、显式版本发布 | 目前选择逐轮策略一致性；需额外的队列、背压、版本记录、失败处理和过期策略。部分权重分发细节还依赖服务端 |
 | 完整 workflow/agent/proxy 运行时，`_init_rollout()`、`_ensure_proxy_started()` | 只有文本单次采样；`step()` 可接收外部工作流已完成的轨迹 | 多轮工具执行、环境交互和会话状态管理尚未实现；接受工具 mask 不等于内置 agent 引擎 |
-| `_compute_turn_level_gae()`、自定义 `gae_lambda` 函数 | 只有 token GAE、标量 lambda | 缺少 `turn_ids`、turn 聚合和 lambda 回调契约；可以在客户端继续扩展，并非 SDK 的硬限制 |
-| PRM、`token_rewards_as_adv`、GVPO/process-weighted shaping | 只支持直接进入 GAE 的逐 token 奖励增量 | 没有移植 AReaL 的 turn reward 折叠、PRM advantage shaping 和对应数据语义 |
+| 自定义 `gae_lambda` 函数 | 已支持 token/turn GAE，但 lambda 仍是全局标量 | 没有移植 AReaL 的逐轨迹动态 lambda 回调、长度上下文及配置加载；可以在客户端继续扩展，并非 SDK 的硬限制 |
+| PRM、`token_rewards_as_adv`、GVPO/process-weighted shaping | `token_rewards` 已按所选 token/turn 时间步进入 GAE | 没有移植 AReaL 的 GAE 后直接 advantage shaping、GVPO/process-weighted 组合和对应 scorer 数据语义 |
 | 完整 `RejectionSamplingConfig` | 仅 token ratio 上下界 mask；无 sequence/其他 metric、clamp 等模式 | 当前只实现已验证的一个子集；许多其他模式也可用现有 logprob 计算 |
 | rollout export、logical group、分段轨迹/高级 reward normalization | 一条 `Trajectory` 对应一条 completion，显式 group ID；无完整 exporter metadata | 数据契约有意简化，缺少跨片段关系与逻辑成员计数；部分超长惩罚归一化不保证与这些路径相同 |
 | 跨 group 切分、packing、分布式 microbatch reduction | 完整 prompt group 不拆开；没有客户端 packing 和 engine microbatch weight 协议 | 简化为请求级更新；服务端可能自行 packing，但这不是对 AReaL reduction 调度的复刻 |

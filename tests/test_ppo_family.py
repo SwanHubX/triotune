@@ -17,6 +17,8 @@ from trio_cookbook.trainer.ppo import (
     PreparedBatch,
     Trajectory,
     compute_gae,
+    compute_token_level_gae,
+    compute_turn_level_gae,
     prepare_advantages,
     value_loss,
 )
@@ -98,6 +100,60 @@ class AdvantageTests(unittest.TestCase):
         np.testing.assert_allclose(adv, [1.1104, 0, 1.32])
         np.testing.assert_allclose(ret, [1.3104, 0, 1.72])
 
+    def test_token_and_turn_gae_advance_at_different_timestep_units(self):
+        rewards = [0, 1, 0, 2]
+        values = [0] * 5
+        mask = [True] * 4
+
+        token_adv, token_returns = compute_token_level_gae(
+            rewards, values, mask, gae_lambda=0.5
+        )
+        turn_adv, turn_returns = compute_turn_level_gae(
+            rewards, values, mask, [0, 0, 1, 1], gae_lambda=0.5
+        )
+
+        self.assertEqual(token_adv, [0.75, 1.5, 1.0, 2.0])
+        self.assertEqual(token_returns, token_adv)
+        self.assertEqual(turn_adv, [2.0, 2.0, 2.0, 2.0])
+        self.assertEqual(turn_returns, turn_adv)
+
+    def test_turn_gae_skips_masked_gaps_and_uses_first_turn_value(self):
+        advantages, returns = compute_turn_level_gae(
+            [0, 3, 0, 0, 4],
+            [1, 5, 9, 2, 8, 8],
+            [True, True, False, True, True],
+            [0, 0, -1, 2, 2],
+            discount=0.5,
+            gae_lambda=0.25,
+            truncated=True,
+        )
+
+        self.assertEqual(advantages, [3.75, 3.75, 0.0, 6.0, 6.0])
+        self.assertEqual(returns, [4.75, 4.75, 0.0, 8.0, 8.0])
+
+    def test_turn_advantages_keep_kl_token_local_and_returns_task_only(self):
+        t = replace(
+            trajectory(2, n=4, turn_ids=[0, 0, 1, 1]),
+            logprobs=[-1.0, -0.8, -0.6, -1.0],
+            reference_logprobs=[-1.0] * 4,
+        )
+        batch = prepare_advantages(
+            [t], raw_config(gae_timestep_unit="turn", kl_ctl=1.0)
+        )
+
+        np.testing.assert_allclose(batch.advantages, [[2.0, 1.8, 1.6, 2.0]])
+        self.assertEqual(batch.returns, [[2.0, 2.0, 2.0, 2.0]])
+
+    def test_turn_gae_rejects_missing_or_malformed_turn_metadata(self):
+        with self.assertRaisesRegex(ValueError, "requires.*turn_ids"):
+            compute_gae(
+                [1], [0, 0], [True], timestep_unit="turn"
+            )
+        with self.assertRaisesRegex(ValueError, "nondecreasing"):
+            trajectory(n=3, turn_ids=[0, 1, 0])
+        with self.assertRaisesRegex(ValueError, "turn_id -1"):
+            trajectory(n=3, loss_mask=[True, False, True], turn_ids=[0, 0, 1])
+
     def test_reference_kl_estimators_and_clamp(self):
         t = trajectory(0, reference_logprobs=[-2, -2])
         for estimator, expected in [("k1", 1), ("k2", 0.5), ("k3", math.exp(-1))]:
@@ -141,6 +197,7 @@ class AdvantageTests(unittest.TestCase):
             {"reward_norm": {}},
             {"rejection_upper": 2},
             {"c_clip": 1},
+            {"gae_timestep_unit": "episode"},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 raw_config(**kwargs)
@@ -288,11 +345,16 @@ class PolicyLossTests(unittest.TestCase):
         self.assertAlmostEqual(sum(losses) / 2, -3, places=6)
 
     def test_shift_and_native_inputs_preserve_tool_context(self):
-        t = trajectory(n=3, loss_mask=[True, False, True])
+        t = trajectory(
+            n=3,
+            loss_mask=[True, False, True],
+            turn_ids=[0, -1, 1],
+        )
         d = build_datum(t, advantages=[1, 0, 2], old_logprobs=t.logprobs)
         self.assertEqual(d.model_input.to_ints(), [10, 11, 20, 21])
         self.assertEqual(d.loss_fn_inputs["target_tokens"].data, [-100, 20, -100, 22])
         self.assertEqual(d.loss_fn_inputs["advantages"].data, [0, 1, 0, 2])
+        self.assertNotIn("turn_ids", d.loss_fn_inputs)
 
 
 class Future:

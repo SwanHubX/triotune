@@ -394,6 +394,10 @@ class PPOConfig(BaseTrainerConfig):
             shaped outcome rewards.
         discount (``float``, default ``1.0``): GAE reward discount factor.
         gae_lambda (``float``, default ``1.0``): GAE trace-decay factor.
+        gae_timestep_unit (``"token"`` or ``"turn"``, default ``"token"``):
+            Unit over which discount and lambda advance. Turn mode aggregates
+            task rewards per generated turn and broadcasts its target back to
+            the turn's active completion tokens.
         kl_ctl (``float``, default ``0.0``): Coefficient for the KL penalty
             between policy and fixed-reference completion logprobs. Zero
             disables reference scoring.
@@ -480,6 +484,7 @@ class PPOConfig(BaseTrainerConfig):
     reward_clip: float = 20.0
     discount: float = 1.0
     gae_lambda: float = 1.0
+    gae_timestep_unit: str = "token"
     kl_ctl: float = 0.0
     kl_estimator: str = "k1"
     mask_no_eos_with_zero: bool = False
@@ -586,6 +591,7 @@ class PPOConfig(BaseTrainerConfig):
         choices = {
             "kl_estimator": ("k1", "k2", "k3"),
             "loss_type": ("ppo", "sapo", "cispo"),
+            "gae_timestep_unit": ("token", "turn"),
             "importance_sampling_level": ("token", "sequence"),
             "loss_aggregation": ("token_mean", "seq_mean", "prompt_mean", "constant"),
             "loss_backend": ("custom", "native"),
@@ -686,7 +692,7 @@ class PPOConfig(BaseTrainerConfig):
                 overlong_tokens=128,
             )
         else:
-            raise ValueError(f"Unknown PPO-family preset: {name!r}.")
+            raise ValueError(f"Unknown PPO preset: {name!r}.")
         return cls(**{**options, **overrides})
 
 

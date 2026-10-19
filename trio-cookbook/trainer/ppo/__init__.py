@@ -9,22 +9,21 @@ compatibility alias.
 import importlib
 import sys
 
-from .actor import PPOActor, compute_gae, normalize, prepare_advantages
+from .actor import PPOActor
+from .advantages import normalize, prepare_advantages
 from ...api.cli_args import NormConfig, PPOConfig
 from .contracts import PPOState, PreparedBatch, Trajectory
 from .critic import Critic, PyTRIOCritic, value_loss
+from .gae import compute_gae, compute_token_level_gae, compute_turn_level_gae
 
-# The actor and critic now own their complete algorithm-side pipelines. Keep
-# historical submodule imports working as identity aliases during migration.
-_actor_module = importlib.import_module(".actor", __name__)
+# Keep historical submodule imports working as identity aliases during migration.
+_advantages_module = importlib.import_module(".advantages", __name__)
 _critic_module = importlib.import_module(".critic", __name__)
 _config_module = importlib.import_module("...api.cli_args", __name__)
 _reporting_module = importlib.import_module("...utils.reporting", __name__)
 for _legacy_name, _canonical_module in (
     ("config", _config_module),
-    ("advantages", _actor_module),
-    ("gae", _actor_module),
-    ("normalization", _actor_module),
+    ("normalization", _advantages_module),
     ("critic_loss", _critic_module),
     ("reporting", _reporting_module),
 ):
@@ -32,7 +31,7 @@ for _legacy_name, _canonical_module in (
 del (
     _legacy_name,
     _canonical_module,
-    _actor_module,
+    _advantages_module,
     _critic_module,
     _config_module,
     _reporting_module,
@@ -70,6 +69,8 @@ __all__ = [
     "PreparedBatch",
     "Trajectory",
     "compute_gae",
+    "compute_token_level_gae",
+    "compute_turn_level_gae",
     "normalize",
     "prepare_advantages",
     "value_loss",

@@ -97,6 +97,11 @@ async def generate_rollouts(
                     reward=float(reward),
                     group_id=f"prompt-{index}",
                     truncated=truncated,
+                    # PyTRIO's sampler returns one assistant completion per
+                    # request, so every generated token belongs to turn zero.
+                    # Custom multi-turn rollouts can provide richer IDs when
+                    # calling PPOTrainer.step() with Trajectory objects.
+                    turn_ids=[0] * len(sequence.tokens),
                 )
             )
         return trajectories
