@@ -408,6 +408,8 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([datum.loss_fn_inputs["target_tokens"].data for datum in self.client.datums],
                          [[98, 255], [65, 255]])
         self.assertEqual(metrics["train/tokens"], 4)
+        self.assertEqual(metrics["usage/train_tokens"], 4)
+        self.assertEqual(metrics["usage/train_tokens_total"], 4)
         self.assertEqual(metrics["train/loss"], 0.5)
         self.assertEqual(self.client.optim_calls, 1)
 

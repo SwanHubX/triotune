@@ -10,6 +10,7 @@ import numpy as np
 
 from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
+from ...utils.token_usage import compute_train_tokens
 from .advantages import prepare_advantages
 from .contracts import PreparedBatch, Trajectory
 from .datum import batch_datums, build_datum, completion_logprobs
@@ -59,6 +60,7 @@ class PPOActor:
 
         self.client, self.config = client, config
         self.optimizer_steps = 0
+        self.train_tokens = 0
 
     async def prepare(self, trajectories: list[Trajectory]) -> PreparedBatch:
         """Recompute optional proximal scores and freeze one actor update batch."""
@@ -78,13 +80,15 @@ class PPOActor:
                 )
         proximal = None
         if config.recompute_logprob or config.use_decoupled_loss:
+            datums = [build_datum(t) for t in trajectories]
             result = await call_async(
                 self.client,
                 "forward",
-                [build_datum(t) for t in trajectories],
+                datums,
                 loss_fn="cross_entropy",
                 auto_shift=False,
             )
+            self.train_tokens += compute_train_tokens(datums)
             proximal = completion_logprobs(result, trajectories)
         if proximal is not None and not config.use_decoupled_loss:
             # Match AReaL: ordinary recomputation replaces old logprobs for
@@ -106,11 +110,12 @@ class PPOActor:
         metrics = []
         for _ in range(config.update_epochs):
             for chunk in chunks:
+                data = batch_datums(chunk, native=config.loss_backend == "native")
                 if config.loss_backend == "native":
                     result = await call_async(
                         self.client,
                         "forward_backward",
-                        batch_datums(chunk, native=True),
+                        data,
                         loss_fn="ppo",
                         loss_fn_config={
                             "clip_low_threshold": 1 - config.eps_clip,
@@ -127,9 +132,10 @@ class PPOActor:
                     result = await call_async(
                         self.client,
                         "forward_backward_custom",
-                        batch_datums(chunk),
+                        data,
                         loss_fn=make_loss_fn(chunk, config),
                     )
+                self.train_tokens += compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
                 await call_async(self.client, "optim_step", optimizer_params(config))

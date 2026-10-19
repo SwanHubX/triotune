@@ -20,6 +20,7 @@ from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.token_usage import compute_train_tokens
 from ..utils.updates import run_update_async
 from .opd.contracts import (
     OPDPrompt,
@@ -204,6 +205,8 @@ class OPDTrainer:
         self._requires_restart = False
         self._sampling_seed_offset = 0
         self._total_tokens = 0
+        self._sample_input_tokens = 0
+        self._sample_output_tokens = 0
         self._metrics_api = MetricsAPI.from_config(
             self.args,
             default_name=f"{self.model.rsplit('/', 1)[-1]}-opd",
@@ -374,7 +377,9 @@ class OPDTrainer:
         self._sampling_seed_offset += len(prompts)
         self._student_sampler = None
         self._requires_restart = False
-        input_tokens = sum(datum.model_input.length for datum in datums)
+        input_tokens = compute_train_tokens(datums)
+        sample_input_tokens = sum(len(prompt.tokens) for prompt in prompts)
+        sample_output_tokens = sum(sample.tokens for sample in scored)
         metrics = self._remote_metrics(update.forward, update.optimizer)
         metrics.update(
             self.execution_plan.metrics.training(
@@ -406,6 +411,22 @@ class OPDTrainer:
         metrics["time/step"] = time.perf_counter() - started
         metrics["time/tokens_per_second"] = input_tokens / metrics["time/step"]
         self._total_tokens += input_tokens
+        self._sample_input_tokens += sample_input_tokens
+        self._sample_output_tokens += sample_output_tokens
+        metrics.update(
+            {
+                "usage/train_tokens": float(input_tokens),
+                "usage/train_tokens_total": float(self._total_tokens),
+                "usage/sample_input_tokens": float(sample_input_tokens),
+                "usage/sample_output_tokens": float(sample_output_tokens),
+                "usage/sample_input_tokens_total": float(
+                    self._sample_input_tokens
+                ),
+                "usage/sample_output_tokens_total": float(
+                    self._sample_output_tokens
+                ),
+            }
+        )
         self.state.metrics = metrics
         self._log(metrics)
         return OPDResult(self.state.global_step, metrics, len(datums), version, checkpoint_path)
@@ -545,6 +566,13 @@ class OPDTrainer:
                                 self._total_tokens - initial_tokens
                             )
                             / elapsed,
+                            "usage/train_tokens_total": float(self._total_tokens),
+                            "usage/sample_input_tokens_total": float(
+                                self._sample_input_tokens
+                            ),
+                            "usage/sample_output_tokens_total": float(
+                                self._sample_output_tokens
+                            ),
                         },
                         step=self.state.global_step,
                     )

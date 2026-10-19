@@ -284,7 +284,10 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertNotIn("loss_mean", metrics)
         self.assertNotIn("scalar/loss_mean", metrics)
         payload = self.run.logs[0][0]
-        self.assertEqual({name.split("/", 1)[0] for name in payload}, {"train", "reward", "time"})
+        self.assertEqual(
+            {name.split("/", 1)[0] for name in payload},
+            {"train", "reward", "time", "usage"},
+        )
         self.assertEqual(payload["train/loss"], 0.5)
         self.assertEqual(payload["reward/accuracy"], 1.0)
         self.assertEqual(payload["reward/margin"], 0.3)
@@ -295,6 +298,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(payload["train/backend_token_count"], 4)
         self.assertEqual(payload["train/step"], 1)
         self.assertEqual(payload["train/pairs"], 1)
+        self.assertEqual(payload["usage/train_tokens"], 4)
+        self.assertEqual(payload["usage/train_tokens_total"], 4)
         self.assertNotIn("loss_sum", payload)
         for key in ("time/prepare", "time/reference", "time/forward_backward", "time/optim", "time/save"):
             self.assertGreaterEqual(metrics[key], 0)
@@ -369,10 +374,14 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual((sample.caption, sample.content), ("P", "generated answer"))
         self.assertEqual(self.service.training.sampler.requests[0][0], [80])
         self.assertEqual(
-            {name.split("/", 1)[0] for name in self.run.logs[-1][0]}, {"train", "time"}
+            {name.split("/", 1)[0] for name in self.run.logs[-1][0]},
+            {"train", "time", "usage"},
         )
         self.assertEqual(state.metrics["data/total_tokens"], 4)
         self.assertEqual(state.metrics["data/total_pairs"], 1)
+        self.assertEqual(state.metrics["usage/train_tokens_total"], 4)
+        self.assertEqual(state.metrics["usage/sample_input_tokens_total"], 1)
+        self.assertEqual(state.metrics["usage/sample_output_tokens_total"], 2)
         self.assertGreater(state.metrics["time/train_runtime"], 0)
         self.assertGreater(state.metrics["time/train_steps_per_second"], 0)
         self.assertGreater(state.metrics["time/train_pairs_per_second"], 0)
@@ -386,7 +395,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/save", result.metrics)
         self.assertNotIn("loss_mean", result.metrics)
         self.assertEqual(
-            {name.split("/", 1)[0] for name in self.run.logs[0][0]}, {"train", "reward", "time"}
+            {name.split("/", 1)[0] for name in self.run.logs[0][0]},
+            {"train", "reward", "time", "usage"},
         )
 
     def test_async_train_saves_final_checkpoint(self) -> None:

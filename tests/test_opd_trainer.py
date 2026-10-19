@@ -332,6 +332,12 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(result.metrics["train/loss"], 0.3)
         self.assertEqual(result.metrics["train/loss"], result.metrics["loss_mean"])
         self.assertEqual(result.metrics["policy/importance_ratio_cap"], 5.0)
+        self.assertEqual(result.metrics["usage/train_tokens"], 3)
+        self.assertEqual(result.metrics["usage/train_tokens_total"], 3)
+        self.assertEqual(result.metrics["usage/sample_input_tokens"], 2)
+        self.assertEqual(result.metrics["usage/sample_output_tokens"], 2)
+        self.assertEqual(result.metrics["usage/sample_input_tokens_total"], 2)
+        self.assertEqual(result.metrics["usage/sample_output_tokens_total"], 2)
         self.assertEqual(
             self.service.training.forward_kwargs,
             {

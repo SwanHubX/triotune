@@ -19,6 +19,7 @@ from .datums import causal_datum, materialize_datum, materialize_model_input
 from .metrics import MetricsAPI, metric_name, normalize_metrics
 from .reporting import isolated_metrics
 from .scoring import completion_logprobs, score_completion, score_completion_async
+from .token_usage import SampleTokens, compute_sample_tokens, compute_train_tokens
 from .updates import UpdateResult, run_update, run_update_async
 
 # ``triotune.utils.client`` was public before client contracts moved into
@@ -27,6 +28,7 @@ sys.modules[f"{__name__}.client"] = client
 
 __all__ = [
     "MetricsAPI",
+    "SampleTokens",
     "UpdateResult",
     "call",
     "call_async",
@@ -34,6 +36,8 @@ __all__ = [
     "checkpoint_path",
     "client",
     "completion_logprobs",
+    "compute_sample_tokens",
+    "compute_train_tokens",
     "iter_batches",
     "isolated_metrics",
     "materialize_datum",
