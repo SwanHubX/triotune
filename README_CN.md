@@ -14,20 +14,20 @@ cookbook。名称中的 **Trio** 来自 PyTRIO，**tune** 参考了 Torchtune。
 > **项目状态：** Triotune 仍处于早期阶段。目前提供的是内置的文本训练流程
 > 和案例；任意自定义模型模块的通用注册接口尚未纳入项目。
 
-## 目录
+## 🗂️ 目录
 
 - [项目简介](#项目简介)
 - [近期动态](#近期动态)
 - [安装](#安装)
 - [快速开始](#快速开始)
-- [算法与案例](#算法与案例)
+- [算法](#算法)
 - [数据契约](#数据契约)
 - [Python API](#python-api)
 - [文档](#文档)
 - [仓库结构](#仓库结构)
 - [当前范围](#当前范围)
 
-## 项目简介
+## 👋 项目简介
 
 Triotune 为若干基于 PyTRIO 的训练算法提供类似 Trainer 的使用方式。它只
 负责客户端侧逻辑；模型权重、LoRA 训练客户端、tokenizer、采样、前向/反向、
@@ -47,14 +47,14 @@ Triotune 为若干基于 PyTRIO 的训练算法提供类似 Trainer 的使用方
 公共工具统一处理文本、token ID 和聊天消息输入，以及 checkpoint 命名和
 SwanLab 指标记录。
 
-## 近期动态
+## 📰 近期动态
 
 - **2026-10-12：** Triotune 0.1.0（`pytrio-cookbook`）首次发布到
   [PyPI](https://pypi.org/project/pytrio-cookbook/)。
 
-## 安装
+## 📦 安装
 
-### 环境要求
+### ✅ 环境要求
 
 - Python 3.12（当前包声明 `>=3.12,<3.13`）
 - 可用的 PyTRIO 训练服务，以及该案例所使用模型的访问权限
@@ -87,7 +87,7 @@ pip install -e .
 
 发行包名称是 `pytrio-cookbook`，Python 导入名称是 `trio_cookbook`。
 
-## 快速开始
+## 🚀 快速开始
 
 GSM8K 案例会准备 JSONL 数据集，然后使用 PPO trainer 的 GRPO 预设。准备阶段不会创建
 PyTRIO 客户端，适合作为本地环境的第一步检查：
@@ -105,20 +105,27 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 以及 GSM8K 的 boxed-answer reward。请根据实际环境修改
 `trio-cookbook/configs/grpo_gms8k.yaml` 中的模型和训练配置。
 
-## 算法与案例
+## 🔧 支持矩阵
 
-| 算法 | 内置案例 | 数据 | 启动入口 |
+### 🧠 算法
+
+| 算法 | 文档 | 论文 | 配置 |
 | --- | --- | --- | --- |
-| PPO / GRPO | [GSM8K](trio-cookbook/recipes/train_grpo.py) / [PPO](trio-cookbook/recipes/train_ppo.py) | prompt + 参考答案 | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) / [`train_ppo_gms8k.sh`](trio-cookbook/scripts/train_ppo_gms8k.sh) |
-| DPO | [HH-RLHF](trio-cookbook/recipes/train_dpo.py) | `messages`、`chosen`、`rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
-| SFT | [嬛嬛对话](trio-cookbook/recipes/train_sft.py) | 文本、messages 或 prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
-| OPD | [DeepMath-103K](trio-cookbook/recipes/train_opd.py) | 仅 prompt | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
+| **GRPO** | - | [📄 论文](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K 示例](trio-cookbook/configs/grpo_gms8k.yaml) |
+| **PPO** | - | [📄 论文](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K 示例](trio-cookbook/configs/ppo_gsm8k.yaml) |
+| **DPO** | - | [📄 论文](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF 示例](trio-cookbook/configs/dpo_rlhf.yaml) |
+| **OPD** | - |  | [🔗 DeepMath-103K 示例](trio-cookbook/configs/opd_deepmath.yaml) |
+| **SFT** | - |  | [🔗 嬛嬛对话示例](trio-cookbook/configs/sft_huanhuan.yaml) |
 
-每个案例都有对应的 YAML 配置，位于
-[`trio-cookbook/configs/`](trio-cookbook/configs/)。`recipes/` 中还保留了直接
-调用 PyTRIO 的独立脚本，可作为易读的算法基线，与 trainer 版本进行对照。
+### 📖 模型
 
-## 数据契约
+PyTRIO 当前支持以下模型：
+
+- `Qwen/Qwen3.5-4B`
+- `Qwen/Qwen3.5-9B`
+- `Qwen/Qwen3.8-27B`
+
+## 🧩 数据契约
 
 训练器有意只接受以下几种基础输入：
 
@@ -138,7 +145,7 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 [trainer 说明](trio-cookbook/trainer/README.md) 与
 [脚本说明](trio-cookbook/scripts/README.md)。
 
-## Python API
+## 🐍 Python API
 
 公开入口按算法组织：
 
@@ -163,17 +170,7 @@ trainer = PPOTrainer(
 asyncio.run(trainer.train())
 ```
 
-`DPOTrainer`、`SFTTrainer` 和 `OPDTrainer` 使用相同的配置与数据集导向风格。
-请将示例中的模型 ID 和 reward 函数替换为 PyTRIO 服务实际支持的内容。
-
-## 文档
-
-- [训练器内部实现与 Python 示例](trio-cookbook/trainer/README.md)
-- [案例、配置与脚本命令](trio-cookbook/scripts/README.md)
-- [包目录说明](trio-cookbook/README.md)
-- [框架评测记录](docs/README.md)
-
-## 仓库结构
+## 🗃️ 仓库结构
 
 ```text
 trio-cookbook/
@@ -183,7 +180,7 @@ trio-cookbook/
 └── trainer/       # trainer 及公共配置、数据和 client 契约
 ```
 
-## 当前范围
+## 🎯 当前范围
 
 Triotune 当前聚焦于纯文本、基于 PyTRIO 的实验。项目不宣称提供 Web UI、
 Megatron 集成、多模态训练，也不提供通用的插件/注册表系统。如果需要使用

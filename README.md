@@ -16,20 +16,20 @@ advantage calculation, token alignment, and training-loop orchestration.
 > built-in text-training workflows and examples; a general API for registering
 > arbitrary custom model modules is not yet part of the project.
 
-## Contents
+## 🗂️ Contents
 
 - [Introduction](#introduction)
 - [News](#news)
 - [Installation](#installation)
 - [Quick start](#quick-start)
-- [Algorithms and examples](#algorithms-and-examples)
+- [Algorithms](#algorithms)
 - [Data contracts](#data-contracts)
 - [Python API](#python-api)
 - [Documentation](#documentation)
 - [Repository layout](#repository-layout)
 - [Current scope](#current-scope)
 
-## Introduction
+## 👋 Introduction
 
 Triotune provides a trainer-shaped interface for a few PyTRIO-backed training
 algorithms. The package is intentionally client-side: PyTRIO remains
@@ -51,13 +51,13 @@ PPO, DPO, and OPD include asynchronous training paths where
 the underlying PyTRIO client supports them. Shared utilities handle text,
 token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
-## News
+## 📰 News
 
 - **2026-10-12:** Triotune 0.1.0 (`pytrio-cookbook`) was published to [PyPI](https://pypi.org/project/pytrio-cookbook/).
 
-## Installation
+## 📦 Installation
 
-### Requirements
+### ✅ Requirements
 
 - Python 3.12 (the package currently declares `>=3.12,<3.13`)
 - Access to a PyTRIO-compatible training service and the models used by your
@@ -93,7 +93,7 @@ pip install -e .
 The distribution name is `pytrio-cookbook`; the Python import name is
 `trio_cookbook`.
 
-## Quick start
+## 🚀 Quick start
 
 The GSM8K recipe prepares a JSONL dataset and then runs the PPO trainer with
 its GRPO preset. The preparation command does not create a PyTRIO client, so it is a
@@ -112,21 +112,27 @@ Useful overrides include `--steps`, `--batch-size`, `--group-size`,
 LoRA, SwanLab logging, and the GSM8K boxed-answer reward. Change the model and
 training settings in `trio-cookbook/configs/grpo_gms8k.yaml` for your setup.
 
-## Algorithms and examples
+## 🔧 Support Matrix
 
-| Algorithm | Built-in example | Data | Entry point |
+### 🧠 Algorithms
+
+| Algorithm | Documentation | Paper | Configuration |
 | --- | --- | --- | --- |
-| PPO / GRPO | [GSM8K](trio-cookbook/recipes/train_grpo.py) / [PPO](trio-cookbook/recipes/train_ppo.py) | Prompt + reference answer | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) / [`train_ppo_gms8k.sh`](trio-cookbook/scripts/train_ppo_gms8k.sh) |
-| DPO | [HH-RLHF](trio-cookbook/recipes/train_dpo.py) | `messages`, `chosen`, `rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
-| SFT | [Huanhuan chat](trio-cookbook/recipes/train_sft.py) | Text, messages, or prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
-| OPD | [DeepMath-103K](trio-cookbook/recipes/train_opd.py) | Prompt-only rows | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
+| **GRPO** | - | [📄 Paper](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K Example](trio-cookbook/configs/grpo_gms8k.yaml) |
+| **PPO** | - | [📄 Paper](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K Example](trio-cookbook/configs/ppo_gsm8k.yaml) |
+| **DPO** | - | [📄 Paper](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF Example](trio-cookbook/configs/dpo_rlhf.yaml) |
+| **OPD** | - |  | [🔗 DeepMath-103K Example](trio-cookbook/configs/opd_deepmath.yaml) |
+| **SFT** | - |  | [🔗 Huanhuan Chat Example](trio-cookbook/configs/sft_huanhuan.yaml) |
 
-Every example has a YAML configuration under
-[`trio-cookbook/configs/`](trio-cookbook/configs/). The `recipes/` directory
-also contains standalone PyTRIO scripts that are useful as readable algorithm
-baselines alongside the trainer-based versions.
+### 📖 Models
 
-## Data contracts
+PyTRIO currently supports the following models:
+
+- `Qwen/Qwen3.5-4B`
+- `Qwen/Qwen3.5-9B`
+- `Qwen/Qwen3.8-27B`
+
+## 🧩 Data contracts
 
 The trainers accept a deliberately small set of input representations:
 
@@ -145,7 +151,7 @@ Algorithm-specific fields are:
 See the [trainer guide](trio-cookbook/trainer/README.md) and [script guide](trio-cookbook/scripts/README.md)
 for validation rules and complete JSONL examples.
 
-## Python API
+## 🐍 Python API
 
 The public imports are grouped by algorithm:
 
@@ -170,18 +176,7 @@ trainer = PPOTrainer(
 asyncio.run(trainer.train())
 ```
 
-`DPOTrainer`, `SFTTrainer`, and `OPDTrainer` follow the same configuration-
-and-dataset-oriented style. Replace the example model ID and reward function
-with values supported by your PyTRIO service.
-
-## Documentation
-
-- [Trainer internals and Python examples](trio-cookbook/trainer/README.md)
-- [Recipes, configurations, and script commands](trio-cookbook/scripts/README.md)
-- [Package-level README](trio-cookbook/README.md)
-- [Framework evaluation notes](docs/README.md)
-
-## Repository layout
+## 🗃️ Repository layout
 
 ```text
 trio-cookbook/
@@ -191,7 +186,7 @@ trio-cookbook/
 └── trainer/       # Trainers plus shared config, dataset, and client contracts
 ```
 
-## Current scope
+## 🎯 Current scope
 
 Triotune currently targets text-only, PyTRIO-backed experiments. It does not
 claim to provide a Web UI, Megatron integration, multimodal training, or a
