@@ -103,25 +103,25 @@ safe first check for the local environment:
 # From the repository root
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
 
-# Start training with the default TOML configuration
+# Start training with the default YAML configuration
 bash trio-cookbook/scripts/train_grpo_gms8k.sh
 ```
 
 Useful overrides include `--steps`, `--batch-size`, `--group-size`,
 `--max-examples`, and `--help`. The default configuration uses a Qwen model,
 LoRA, SwanLab logging, and the GSM8K boxed-answer reward. Change the model and
-training settings in `trio-cookbook/configs/grpo_gms8k.toml` for your setup.
+training settings in `trio-cookbook/configs/grpo_gms8k.yaml` for your setup.
 
 ## Algorithms and examples
 
 | Algorithm | Built-in example | Data | Entry point |
 | --- | --- | --- | --- |
-| PPO / GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py) | Prompt + reference answer | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
-| DPO | [HH-RLHF](trio-cookbook/recipes/dpo_rlhf_trio.py) | `messages`, `chosen`, `rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
-| SFT | [Huanhuan chat](trio-cookbook/recipes/sft_huanhuan_trio.py) | Text, messages, or prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
-| OPD | [DeepMath-103K](trio-cookbook/recipes/opd_deepmath_trio.py) | Prompt-only rows | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
+| PPO / GRPO | [GSM8K](trio-cookbook/recipes/train_grpo.py) / [PPO](trio-cookbook/recipes/train_ppo.py) | Prompt + reference answer | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) / [`train_ppo_gms8k.sh`](trio-cookbook/scripts/train_ppo_gms8k.sh) |
+| DPO | [HH-RLHF](trio-cookbook/recipes/train_dpo.py) | `messages`, `chosen`, `rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
+| SFT | [Huanhuan chat](trio-cookbook/recipes/train_sft.py) | Text, messages, or prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
+| OPD | [DeepMath-103K](trio-cookbook/recipes/train_opd.py) | Prompt-only rows | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
 
-Every example has a TOML configuration under
+Every example has a YAML configuration under
 [`trio-cookbook/configs/`](trio-cookbook/configs/). The `recipes/` directory
 also contains standalone PyTRIO scripts that are useful as readable algorithm
 baselines alongside the trainer-based versions.
@@ -185,7 +185,7 @@ with values supported by your PyTRIO service.
 
 ```text
 trio-cookbook/
-├── configs/       # TOML configurations for the built-in workflows
+├── configs/       # YAML configurations for the built-in workflows
 ├── recipes/       # Trainer-based and standalone PyTRIO examples
 ├── scripts/       # Shell launchers and dataset preparation guides
 └── trainer/       # Trainers plus shared config, dataset, and client contracts

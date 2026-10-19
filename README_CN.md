@@ -96,25 +96,25 @@ PyTRIO 客户端，适合作为本地环境的第一步检查：
 # 在仓库根目录执行
 bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only
 
-# 使用默认 TOML 配置启动训练
+# 使用默认 YAML 配置启动训练
 bash trio-cookbook/scripts/train_grpo_gms8k.sh
 ```
 
 常用覆盖参数包括 `--steps`、`--batch-size`、`--group-size`、
 `--max-examples` 和 `--help`。默认配置使用 Qwen 模型、LoRA、SwanLab 记录，
 以及 GSM8K 的 boxed-answer reward。请根据实际环境修改
-`trio-cookbook/configs/grpo_gms8k.toml` 中的模型和训练配置。
+`trio-cookbook/configs/grpo_gms8k.yaml` 中的模型和训练配置。
 
 ## 算法与案例
 
 | 算法 | 内置案例 | 数据 | 启动入口 |
 | --- | --- | --- | --- |
-| PPO / GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py) | prompt + 参考答案 | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
-| DPO | [HH-RLHF](trio-cookbook/recipes/dpo_rlhf_trio.py) | `messages`、`chosen`、`rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
-| SFT | [嬛嬛对话](trio-cookbook/recipes/sft_huanhuan_trio.py) | 文本、messages 或 prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
-| OPD | [DeepMath-103K](trio-cookbook/recipes/opd_deepmath_trio.py) | 仅 prompt | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
+| PPO / GRPO | [GSM8K](trio-cookbook/recipes/train_grpo.py) / [PPO](trio-cookbook/recipes/train_ppo.py) | prompt + 参考答案 | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) / [`train_ppo_gms8k.sh`](trio-cookbook/scripts/train_ppo_gms8k.sh) |
+| DPO | [HH-RLHF](trio-cookbook/recipes/train_dpo.py) | `messages`、`chosen`、`rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
+| SFT | [嬛嬛对话](trio-cookbook/recipes/train_sft.py) | 文本、messages 或 prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
+| OPD | [DeepMath-103K](trio-cookbook/recipes/train_opd.py) | 仅 prompt | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
 
-每个案例都有对应的 TOML 配置，位于
+每个案例都有对应的 YAML 配置，位于
 [`trio-cookbook/configs/`](trio-cookbook/configs/)。`recipes/` 中还保留了直接
 调用 PyTRIO 的独立脚本，可作为易读的算法基线，与 trainer 版本进行对照。
 
@@ -177,7 +177,7 @@ asyncio.run(trainer.train())
 
 ```text
 trio-cookbook/
-├── configs/       # 内置流程的 TOML 配置
+├── configs/       # 内置流程的 YAML 配置
 ├── recipes/       # trainer 版本和独立 PyTRIO 案例
 ├── scripts/       # 启动脚本和数据准备说明
 └── trainer/       # trainer 及公共配置、数据和 client 契约

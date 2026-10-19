@@ -6,15 +6,35 @@ import argparse
 import asyncio
 import itertools
 import json
-import tomllib
+import tomllib  # retain legacy TOML loading for explicitly supplied files
 from pathlib import Path
+from typing import Any
+
+from trio_cookbook.utils.config import load_yaml_config
 
 from trio_cookbook.trainer.sft import SFTConfig, SFTTrainer
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "sft_huanhuan.toml"
+DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "sft_huanhuan.yaml"
 SYSTEM_PROMPT = "现在你要扮演皇帝身边的女人--甄嬛"
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    """Load and validate the SFT YAML configuration."""
+
+    settings = load_yaml_config(path)
+    for section, fields in {
+        "model": ("name", "lora_rank"),
+        "data": ("file", "epochs"),
+        "sft": ("batch_size", "max_steps"),
+    }.items():
+        values = settings.get(section)
+        if not isinstance(values, dict) or any(field not in values for field in fields):
+            raise ValueError(f"Config needs [{section}] with {', '.join(fields)}.")
+    if not isinstance(settings.get("swanlab", {}), dict):
+        raise ValueError("[swanlab] must be a mapping")
+    return settings
 
 
 async def main() -> None:
@@ -39,17 +59,7 @@ async def main() -> None:
     parser.set_defaults(swanlab=None)
     args = parser.parse_args()
 
-    with args.config.open("rb") as source:
-        settings = tomllib.load(source)
-    for section, fields in {
-        "model": ("name", "lora_rank"),
-        "data": ("file", "epochs"),
-        "sft": ("batch_size", "max_steps"),
-    }.items():
-        if not isinstance(settings.get(section), dict) or any(
-            field not in settings[section] for field in fields
-        ):
-            raise ValueError(f"Config needs [{section}] with {', '.join(fields)}.")
+    settings = load_config(args.config)
 
     data = settings["data"]
     epochs = args.epochs if args.epochs is not None else data["epochs"]

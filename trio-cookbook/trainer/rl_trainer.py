@@ -55,6 +55,7 @@ class PPOTrainer:
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         reward_fn: Callable | None = None,
         *,
+        reference_model: str | None = None,
         critic: Critic | None = None,
         lora_rank: int = 32,
         training_client=None,
@@ -70,13 +71,21 @@ class PPOTrainer:
         """
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
+        if reference_model is not None and (
+            not isinstance(reference_model, str) or not reference_model.strip()
+        ):
+            raise ValueError("reference_model must be a non-empty model ID when provided.")
         if (
             isinstance(lora_rank, bool)
             or not isinstance(lora_rank, int)
             or lora_rank < 1
         ):
             raise ValueError("lora_rank must be a positive integer.")
-        self.model, self.args = model.strip(), args or PPOConfig()
+        self.model, self.reference_model, self.args = (
+            model.strip(),
+            reference_model.strip() if reference_model is not None else None,
+            args or PPOConfig(),
+        )
         if (
             critic is not None or critic_training_client is not None
         ) and not self.args.use_critic:
@@ -208,7 +217,9 @@ class PPOTrainer:
             # A separate base-model client stays fixed and is never refreshed
             # with policy weights. Callers may inject a frozen reference.
             self._reference = await call_async(
-                self._service, "create_sampling_client", base_model=self.model
+                self._service,
+                "create_sampling_client",
+                base_model=self.reference_model or self.model,
             )
         await score_reference(self._reference, trajectories)
 

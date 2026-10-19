@@ -2,18 +2,31 @@
 
 ## 脚本、配置与算法入口
 
-脚本调用 recipe，recipe 读取 TOML 并使用对应算法包的公开入口：
+脚本调用 recipe，recipe 读取 YAML 并使用对应算法包的公开入口：
 
 | 启动脚本 | Recipe | 配置 | Python 入口 |
 | --- | --- | --- | --- |
-| [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) | [grpo_gms8k.toml](../configs/grpo_gms8k.toml) | `PPOConfig.for_algorithm("grpo")` |
-| [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [dpo_rlhf_trio.py](../recipes/dpo_rlhf_trio.py) | [dpo_rlhf.toml](../configs/dpo_rlhf.toml) | `trio_cookbook.trainer.dpo` |
-| [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [sft_huanhuan_trio.py](../recipes/sft_huanhuan_trio.py) | [sft_huanhuan.toml](../configs/sft_huanhuan.toml) | `trio_cookbook.trainer.sft` |
-| [train_opd_deepmath.sh](./train_opd_deepmath.sh) | [opd_deepmath_trio.py](../recipes/opd_deepmath_trio.py) | [opd_deepmath.toml](../configs/opd_deepmath.toml) | `trio_cookbook.trainer.opd` |
+| [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [train_grpo.py](../recipes/train_grpo.py) | [grpo_gms8k.yaml](../configs/grpo_gms8k.yaml) | `PPOConfig.from_modules` (`grpo`) |
+| [train_ppo_gms8k.sh](./train_ppo_gms8k.sh) | [train_ppo.py](../recipes/train_ppo.py) | [ppo_gsm8k.yaml](../configs/ppo_gsm8k.yaml) | `PPOConfig.from_modules` (`ppo`) |
+| [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [train_dpo.py](../recipes/train_dpo.py) | [dpo_rlhf.yaml](../configs/dpo_rlhf.yaml) | `trio_cookbook.trainer.dpo` |
+| [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [train_sft.py](../recipes/train_sft.py) | [sft_huanhuan.yaml](../configs/sft_huanhuan.yaml) | `trio_cookbook.trainer.sft` |
+| [train_opd_deepmath.sh](./train_opd_deepmath.sh) | [train_opd.py](../recipes/train_opd.py) | [opd_deepmath.yaml](../configs/opd_deepmath.yaml) | `trio_cookbook.trainer.opd` |
 
-各配置的算法表（`[grpo]`、`[dpo]`、`[sft]`、`[opd]`）与 `[swanlab]`
+各配置的算法段（`grpo`、`dpo`、`sft`、`opd`）与 `swanlab`
 合并为对应的 Config；`[model]` 与 `[data]` 由 recipe 读取。
+内置配置统一使用 YAML；为兼容旧实验，仍可通过 `--config` 显式传入历史 TOML 文件。
 训练器目录调整不影响脚本路径和配置字段，原有启动命令仍可使用。
+
+PPO-family 配置使用模块化结构：`algorithm` 选择固定预设，`training` 管理训练
+步数和批大小，`optimizer` 管理 Adam 参数，`rollout` 管理采样，`actor` 管理
+策略损失，`critic` 管理 PPO value client，`swanlab` 管理记录。recipe 会将这些
+模块映射到一个经过校验的 `PPOConfig`；例如将 `algorithm` 改为 `ppo` 并把
+`critic.enabled` 设为 `true` 即可使用独立 critic。
+
+如果需要 reference policy 的 KL 约束，在 `actor.kl_ctl` 设置正数，并在
+`reference.path` 指定模型（支持 `${model.name}` 这类 YAML 引用）。省略
+`reference.path` 时，训练器使用学生的初始 base model 创建冻结 sampling client；
+`actor.kl_ctl: 0` 时不会创建或请求 reference 打分。
 DPO 脚本保留 `uv run --extra dpo`，用于安装本地损失计算需要的 PyTorch。
 
 GRPO 由统一的 PPO trainer 执行；独立版 recipe 仍可直接调用 PyTRIO。
@@ -24,7 +37,7 @@ OPD 另有 `[teacher]` 配置教师模型，
 
 ### GRPO
 
-`grpo_gms8k_trio.py` 的 `--data-file` 接收 UTF-8 JSONL，每行一条记录：
+`train_grpo.py` 的 `--data-file` 接收 UTF-8 JSONL，每行一条记录：
 
 ```jsonl
 {"messages":[{"role":"user","content":"What is 6 times 7? Answer with \\boxed{}."}],"answer":"42","question":"What is 6 times 7?"}
@@ -40,7 +53,7 @@ OPD 另有 `[teacher]` 配置教师模型，
 
 ### DPO
 
-`dpo_rlhf_trio.py` 的 `[data].file`（或 `--data-file`）接收 UTF-8 JSONL，
+`train_dpo.py` 的 `[data].file`（或 `--data-file`）接收 UTF-8 JSONL，
 每行一组偏好数据：
 
 ```jsonl
@@ -67,7 +80,7 @@ OPD 另有 `[teacher]` 配置教师模型，
 ## HH-RLHF DPO 案例
 
 数据集来自 ModelScope 的 `Anthropic/hh-rlhf`，具体参数配置见
-[dpo_rlhf.toml](../configs/dpo_rlhf.toml)。
+[dpo_rlhf.yaml](../configs/dpo_rlhf.yaml)。
 
 预处理数据：
 
@@ -83,7 +96,7 @@ bash trio-cookbook/scripts/train_dpo_rlhf.sh
 
 ## GSM8K GRPO 案例
 
-数据集为 GSM8K，具体配置见 [grpo_gms8k.toml](../configs/grpo_gms8k.toml)。
+数据集为 GSM8K，具体配置见 [grpo_gms8k.yaml](../configs/grpo_gms8k.yaml)。
 
 预处理数据：
 
