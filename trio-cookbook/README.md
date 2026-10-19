@@ -1,6 +1,6 @@
 # PyTRIO 训练器
 
-本目录提供基于 PyTRIO 客户端的纯文本 GRPO、DPO、SFT、OPD 和 PPO-family 训练器及运行示例。
+本目录提供基于 PyTRIO 客户端的纯文本 DPO、SFT、OPD 和 PPO-family 训练器及运行示例；GRPO 由 PPO-family 预设提供。
 
 
 ## 目录结构
@@ -8,12 +8,12 @@
 ```text
 trio-cookbook/
 ├── api/              # 配置参数与 PyTRIO client 公共契约
-├── configs/          # GRPO、DPO、SFT、OPD 训练参数
+├── configs/          # PPO-family、DPO、SFT、OPD 训练参数
 ├── dataset/          # 算法共享的数据校验、分词、mask 与 SWE 轨迹处理
 ├── recipes/          # 框架版和独立版训练入口
 ├── scripts/          # 启动脚本及使用说明
 ├── trainer/          # 按算法组织的训练实现和稳定导入入口
-│   ├── grpo/         # 分组采样、奖励、优势、Datum 与训练编排
+│   ├── ppo/          # PPO/GRPO 等共享的采样、优势、损失与更新组件
 │   ├── dpo/          # 偏好数据、成对损失与训练编排
 │   ├── sft/          # 标签处理与异步流水线训练
 │   └── opd/          # 教师评分、蒸馏信号与训练编排

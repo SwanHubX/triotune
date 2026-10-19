@@ -38,8 +38,8 @@ forward/backward execution, optimizer steps, and checkpoint storage.
 
 The current trainers are:
 
-- **GRPO**: grouped rollouts, user-provided reward functions, centered group
-  advantages, and PyTRIO `importance_sampling` updates.
+- **PPO**: one asynchronous trainer for PPO, GRPO, RLOO, GSPO, SAPO,
+  CISPO, DAPO, and related presets.
 - **DPO**: chosen/rejected preference pairs, optional reference-policy scoring,
   and a local pairwise loss submitted through PyTRIO.
 - **SFT**: text-only supervised fine-tuning with prompt/completion masking and
@@ -47,7 +47,7 @@ The current trainers are:
 - **OPD**: on-policy distillation in which a student samples completions and a
   fixed teacher supplies token-level scores.
 
-GRPO, DPO, and OPD include synchronous and asynchronous training paths where
+PPO, DPO, and OPD include asynchronous training paths where
 the underlying PyTRIO client supports them. Shared utilities handle text,
 token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
@@ -95,8 +95,8 @@ The distribution name is `pytrio-cookbook`; the Python import name is
 
 ## Quick start
 
-The GSM8K recipe prepares a JSONL dataset and then runs the built-in GRPO
-trainer. The preparation command does not create a PyTRIO client, so it is a
+The GSM8K recipe prepares a JSONL dataset and then runs the PPO trainer with
+its GRPO preset. The preparation command does not create a PyTRIO client, so it is a
 safe first check for the local environment:
 
 ```bash
@@ -116,7 +116,7 @@ training settings in `trio-cookbook/configs/grpo_gms8k.toml` for your setup.
 
 | Algorithm | Built-in example | Data | Entry point |
 | --- | --- | --- | --- |
-| GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py), [4×4 Sudoku](trio-cookbook/recipes/grpo_sudoku_trio.py) | Prompt + reference answer | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
+| PPO / GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py) | Prompt + reference answer | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
 | DPO | [HH-RLHF](trio-cookbook/recipes/dpo_rlhf_trio.py) | `messages`, `chosen`, `rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
 | SFT | [Huanhuan chat](trio-cookbook/recipes/sft_huanhuan_trio.py) | Text, messages, or prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
 | OPD | [DeepMath-103K](trio-cookbook/recipes/opd_deepmath_trio.py) | Prompt-only rows | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
@@ -150,7 +150,9 @@ for validation rules and complete JSONL examples.
 The public imports are grouped by algorithm:
 
 ```python
-from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
+import asyncio
+
+from trio_cookbook.trainer import PPOConfig, PPOTrainer
 
 rows = [
     {
@@ -159,13 +161,13 @@ rows = [
     },
 ]
 
-trainer = GRPOTrainer(
-    model_name="your-pytrio-model-id",
-    reward_funcs=your_reward_function,
-    args=GRPOConfig(num_generations=4, max_steps=100),
+trainer = PPOTrainer(
+    model="your-pytrio-model-id",
+    reward_fn=your_reward_function,
+    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
     train_dataset=rows,
 )
-trainer.train()
+asyncio.run(trainer.train())
 ```
 
 `DPOTrainer`, `SFTTrainer`, and `OPDTrainer` follow the same configuration-

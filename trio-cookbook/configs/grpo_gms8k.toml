@@ -1,5 +1,5 @@
 # recipes/grpo_gms8k_trio.py 读取本文件。
-# [grpo] 与 [swanlab] 合并为 trio_cookbook.trainer.grpo.GRPOConfig。
+# [grpo] 与 [swanlab] 合并后传给 PPOConfig.for_algorithm("grpo")。
 # [model] 和 [data] 是 recipe 的模型初始化与数据准备参数。
 
 [model]
@@ -13,13 +13,11 @@ cache_dir = ".cache/huggingface"
 
 [grpo]
 num_generations = 8
-max_completion_length = 1024
+max_tokens = 1024
 temperature = 1.0
 top_p = 1.0
 batch_size = 4
 max_steps = 100
-stop = true
-output_dir = true
 learning_rate = 4e-5
 beta1 = 0.9
 beta2 = 0.95
@@ -31,7 +29,6 @@ enable_thinking = false
 
 [swanlab]
 report_to = "swanlab"
-logging_step = 1
 project = "cookbook-test"
 run_name = "gsm8k"
 workspace = "pytrio"

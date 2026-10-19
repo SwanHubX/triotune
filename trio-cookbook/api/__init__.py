@@ -3,7 +3,6 @@
 from .cli_args import (
     BaseTrainerConfig,
     DPOConfig,
-    GRPOConfig,
     NormConfig,
     OPDConfig,
     PPOConfig,
@@ -38,7 +37,6 @@ __all__ = [
     "BuiltinObjective",
     "BuiltinPyTrioObjective",
     "DPOConfig",
-    "GRPOConfig",
     "LossSpec",
     "NormConfig",
     "OPDConfig",

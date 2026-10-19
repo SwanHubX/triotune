@@ -11,8 +11,6 @@ import trio_cookbook.trainer as trainers
 class TrainerLayoutTests(unittest.TestCase):
     def test_legacy_imports_are_the_actual_modules(self):
         aliases = {
-            "grpo_trainer": "trio_cookbook.trainer.grpo_trainer",
-            "grpo_config": "trio_cookbook.api.cli_args",
             "dpo_trainer": "trio_cookbook.trainer.dpo_trainer",
             "dpo_config": "trio_cookbook.api.cli_args",
             "sft_trainer": "trio_cookbook.trainer.sft_trainer",
@@ -20,11 +18,6 @@ class TrainerLayoutTests(unittest.TestCase):
             "opd_trainer": "trio_cookbook.trainer.opd_trainer",
             "opd_config": "trio_cookbook.api.cli_args",
             "opd_distillation": "trio_cookbook.trainer.opd",
-            "advantages": "trio_cookbook.trainer.grpo.advantages",
-            "datum": "trio_cookbook.trainer.grpo.datum",
-            "rewards": "trio_cookbook.trainer.grpo.rewards",
-            "rollout": "trio_cookbook.trainer.grpo.rollout",
-            "types": "trio_cookbook.trainer.grpo.contracts",
             "prompts": "trio_cookbook.dataset.prompt",
         }
         for old, new in aliases.items():
@@ -35,7 +28,7 @@ class TrainerLayoutTests(unittest.TestCase):
                 self.assertIs(getattr(trainers, old), actual)
 
     def test_algorithm_packages_export_the_same_public_objects(self):
-        for algorithm in ("grpo", "dpo", "sft", "opd"):
+        for algorithm in ("dpo", "sft", "opd"):
             package = importlib.import_module(f"trio_cookbook.trainer.{algorithm}")
             for name in package.__all__:
                 with self.subTest(algorithm=algorithm, name=name):
@@ -43,7 +36,7 @@ class TrainerLayoutTests(unittest.TestCase):
 
     def test_algorithm_config_paths_share_the_api_contract_module(self):
         cli_args = importlib.import_module("trio_cookbook.api.cli_args")
-        for algorithm in ("grpo", "dpo", "sft", "opd"):
+        for algorithm in ("dpo", "sft", "opd"):
             with self.subTest(algorithm=algorithm):
                 module = importlib.import_module(
                     f"trio_cookbook.trainer.{algorithm}.config"
@@ -69,7 +62,7 @@ class TrainerLayoutTests(unittest.TestCase):
                 )
 
     def test_algorithm_trainer_paths_alias_root_modules(self):
-        for algorithm in ("grpo", "dpo", "sft", "opd"):
+        for algorithm in ("dpo", "sft", "opd"):
             with self.subTest(algorithm=algorithm):
                 root = importlib.import_module(
                     f"trio_cookbook.trainer.{algorithm}_trainer"
@@ -81,7 +74,6 @@ class TrainerLayoutTests(unittest.TestCase):
 
     def test_renamed_algorithm_modules_keep_legacy_imports(self):
         aliases = {
-            "grpo.types": "grpo.contracts",
             "dpo.types": "dpo.state",
             "sft.types": "sft.state",
             "opd.types": "opd.contracts",
@@ -98,14 +90,13 @@ class TrainerLayoutTests(unittest.TestCase):
             self.assertIs(actual.tqdm, progress)
 
     def test_state_pickle_roundtrips_and_historical_globals_resolve(self):
-        for name in ("TrainerState", "DPOState", "SFTState", "OPDState"):
+        for name in ("DPOState", "SFTState", "OPDState"):
             state = getattr(trainers, name)(global_step=3, checkpoint_path="trio://saved")
             restored = pickle.loads(pickle.dumps(state))
             self.assertEqual(restored, state)
             self.assertIs(type(restored), type(state))
         # Protocol 0 GLOBAL records use module paths embedded in older pickles.
         for module, name in (
-            ("grpo_trainer", "TrainerState"),
             ("dpo_trainer", "DPOState"),
             ("sft_trainer", "SFTState"),
             ("opd_trainer", "OPDState"),

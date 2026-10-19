@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from trio_cookbook.trainer.grpo import GRPOConfig
+from trio_cookbook.trainer import PPOConfig
 from trio_cookbook.utils.checkpoint import (
     checkpoint_path,
     save_checkpoint,
@@ -41,7 +41,8 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(averaged_metrics(window), {"loss": 10.0})
 
     def test_run_initialization_retains_config_and_metadata(self):
-        args = GRPOConfig(
+        args = PPOConfig.for_algorithm(
+            "grpo",
             report_to="swanlab",
             run_name="custom",
             tags=["grpo"],

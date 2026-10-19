@@ -15,9 +15,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .loss_api import POLICY_LOSS_FNS, LossSpec
-
-
 @dataclass(slots=True)
 class BaseTrainerConfig:
     """Common optimizer, lifecycle, and reporting options for every trainer.
@@ -697,124 +694,6 @@ class PPOConfig(BaseTrainerConfig):
 
 
 @dataclass(slots=True)
-class GRPOConfig(_StepLoggingConfig):
-    """Configure grouped rollout generation and GRPO policy updates.
-
-    Parameters:
-        learning_rate (`float`, defaults to `4e-5`):
-            GRPO actor learning rate, overriding the conservative shared default.
-        project (`str`, defaults to `"trio-cookbook-grpo"`):
-            Default SwanLab namespace for GRPO runs.
-        output_dir (`bool`, defaults to `False`):
-            Log the final checkpoint URI as an output artifact when reporting.
-        num_generations (`int`, defaults to `8`):
-            Completions sampled per prompt. At least two are required because
-            GRPO centers rewards within each prompt group.
-        max_completion_length (`int`, defaults to `512`):
-            Maximum generated tokens for each completion.
-        temperature (`float`, defaults to `1.0`):
-            Sampling temperature. It must stay positive so rollout logprobs
-            describe a valid stochastic behavior policy.
-        top_p (`float`, defaults to `1.0`):
-            Nucleus probability threshold in ``(0, 1]``.
-        top_k (`int`, defaults to `-1`):
-            Top-k cutoff; ``-1`` disables top-k filtering in PyTRIO.
-        loss_fn (`str`, defaults to `"importance_sampling"`):
-            PyTRIO policy objective: ``importance_sampling``, ``ppo``, ``cispo``
-            or ``dro``. Rollout and group-centered advantage semantics remain GRPO.
-        loss_fn_config (`dict[str, Any]`, defaults to `{}`):
-            Additional options forwarded to the remote loss implementation.
-        reward_weights (`list[float]` or `None`, defaults to `None`):
-            Per-reward-function coefficients. ``None`` assigns weight one.
-        scale_rewards (`"none"`, `"group"`, or `"batch"`, defaults to `"none"`):
-            Standard-deviation normalization applied after group centering.
-        reward_epsilon (`float`, defaults to `1e-4`):
-            Positive stabilizer added to the reward standard deviation.
-        skip_zero_advantage (`bool`, defaults to `True`):
-            Omit groups whose centered advantages are all zero.
-        prompt_key (`str`, defaults to `"messages"`):
-            Dataset column containing text, token IDs or chat messages.
-        add_generation_prompt (`bool`, defaults to `True`):
-            Ask the chat template to append the assistant-generation prefix.
-        stop (`bool`, defaults to `True`):
-            Stop at tokenizer EOS/chat-end markers. ``False`` relies only on the
-            completion token budget.
-        chat_template_kwargs (`dict[str, Any]`, defaults to `{}`):
-            Extra chat-template options. Tokenization and generation-prefix
-            control remain owned by the trainer to preserve alignment.
-
-        Shared parameters are documented by :class:`BaseTrainerConfig` and
-        ``logging_step`` by :class:`_StepLoggingConfig`.
-    """
-
-    # Algorithm-specific overrides of shared defaults.
-    learning_rate: float = 4e-5
-    project: str = "trio-cookbook-grpo"
-    output_dir: bool = False
-
-    # Rollout distribution and completion budget.
-    num_generations: int = 8
-    max_completion_length: int = 512
-    temperature: float = 1.0
-    top_p: float = 1.0
-    top_k: int = -1
-    # Remote objective and reward-to-advantage transformation.
-    loss_fn: str = "importance_sampling"
-    loss_fn_config: dict[str, Any] = field(default_factory=dict)
-    reward_weights: list[float] | None = None
-    scale_rewards: str = "none"
-    reward_epsilon: float = 1e-4
-    skip_zero_advantage: bool = True
-    # Dataset column and tokenizer rendering controls.
-    prompt_key: str = "messages"
-    add_generation_prompt: bool = True
-    stop: bool = True
-    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Validate sampling, reward scaling and remote-loss compatibility."""
-
-        _StepLoggingConfig.__post_init__(self)
-        self._integer("num_generations", minimum=2)
-        self._integer("max_completion_length", minimum=1)
-        if self.top_k != -1:
-            self._integer("top_k", minimum=1)
-        self._unit_interval("top_p", include_zero=False)
-        self._positive("temperature")
-        if self.scale_rewards not in {"none", "group", "batch"}:
-            raise ValueError("scale_rewards must be 'none', 'group', or 'batch'.")
-        self._positive("reward_epsilon")
-        self._non_empty_string("prompt_key")
-        if not isinstance(self.stop, bool):
-            raise TypeError("stop must be a boolean.")
-        if not isinstance(self.output_dir, bool):
-            raise TypeError("output_dir must be a boolean.")
-        self._chat_template_options({"tokenize", "add_generation_prompt"})
-        loss = LossSpec(self.loss_fn, self.loss_fn_config)
-        if loss.name not in POLICY_LOSS_FNS:
-            raise ValueError("GRPO requires a PyTRIO policy loss.")
-        self.loss_fn = loss.name
-        self.loss_fn_config = loss.loss_fn_config
-
-    @property
-    def sampling_params(self) -> dict[str, Any]:
-        """Translate generation fields to the PyTRIO sampling vocabulary.
-
-        Returns:
-            SDK-neutral keyword arguments. Stop sequences are model-dependent
-            and are added later by ``GRPOTrainer``.
-        """
-
-        return {
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "max_tokens": self.max_completion_length,
-            "seed": self.seed,
-        }
-
-
-@dataclass(slots=True)
 class DPOConfig(_StepLoggingConfig):
     """Configure pairwise preference optimization with a fixed reference model.
 
@@ -1066,7 +945,6 @@ class OPDConfig(_StepLoggingConfig):
 __all__ = [
     "BaseTrainerConfig",
     "DPOConfig",
-    "GRPOConfig",
     "NormConfig",
     "OPDConfig",
     "PPOConfig",

@@ -1,4 +1,4 @@
-"""Text-only GRPO, DPO, SFT, and OPD trainers backed by PyTRIO."""
+"""Text-only PPO, DPO, SFT, and OPD trainers backed by PyTRIO."""
 
 import sys
 from importlib import import_module
@@ -6,7 +6,6 @@ from importlib import import_module
 from ..api.cli_args import (
     BaseTrainerConfig,
     DPOConfig,
-    GRPOConfig,
     NormConfig,
     OPDConfig,
     PPOConfig,
@@ -31,14 +30,6 @@ from ..dataset import (
 )
 from .dpo.state import DPOResult, DPOState
 from .dpo_trainer import DPOTrainer
-from .grpo.contracts import (
-    GRPOBatch,
-    GRPODatum,
-    GRPOResult,
-    SequenceSample,
-    TrainerState,
-)
-from .grpo_trainer import GRPOTrainer
 from .opd.contracts import (
     OPDPrompt,
     OPDResult,
@@ -63,16 +54,10 @@ from .sft_trainer import SFTTrainer
 # Historical flat imports resolve to the actual modules, preserving object
 # identity, pickled types, and patches of module attributes such as tqdm.
 _LEGACY_MODULES = {
-    "grpo_trainer": "grpo_trainer",
     "dpo_trainer": "dpo_trainer",
     "sft_trainer": "sft_trainer",
     "opd_trainer": "opd_trainer",
     "opd_distillation": "opd",
-    "advantages": "grpo.advantages",
-    "datum": "grpo.datum",
-    "rewards": "grpo.rewards",
-    "rollout": "grpo.rollout",
-    "types": "grpo.contracts",
 }
 for _old_name, _new_name in _LEGACY_MODULES.items():
     _module = import_module(f".{_new_name}", __name__)
@@ -83,7 +68,7 @@ del _old_name, _new_name, _module
 # Config contracts now live beside trainer in ``trio_cookbook.api``. Preserve
 # both the historical flat config modules and algorithm-local config paths.
 _config_module = import_module("..api.cli_args", __name__)
-for _algorithm in ("grpo", "dpo", "sft", "opd"):
+for _algorithm in ("dpo", "sft", "opd"):
     sys.modules[f"{__name__}.{_algorithm}_config"] = _config_module
     globals()[f"{_algorithm}_config"] = _config_module
     sys.modules[f"{__name__}.{_algorithm}.config"] = _config_module
@@ -126,7 +111,6 @@ del _old_name, _new_name, _module, _prompt_module
 # responsibility. Keep import aliases for callers that used the old internal
 # paths, while the source tree exposes only the clearer canonical names.
 _RENAMED_MODULES = {
-    "grpo.types": "grpo.contracts",
     "dpo.types": "dpo.state",
     "sft.types": "sft.state",
     "opd.types": "opd.contracts",
@@ -153,11 +137,6 @@ __all__ = [
     "DPOResult",
     "DPOState",
     "DPOTrainer",
-    "GRPOBatch",
-    "GRPOConfig",
-    "GRPODatum",
-    "GRPOResult",
-    "GRPOTrainer",
     "IGNORE_INDEX",
     "OPDConfig",
     "OPDExecutionPlan",
@@ -181,7 +160,6 @@ __all__ = [
     "PreferenceExample",
     "PromptExample",
     "RenderedPrompt",
-    "SequenceSample",
     "SFTConfig",
     "SFTState",
     "SFTTrainer",
@@ -190,7 +168,6 @@ __all__ = [
     "SWESFTDataset",
     "SWESFTReport",
     "SupervisedExample",
-    "TrainerState",
     "SampledReverseKLLoss",
     "build_opd_datum",
     "distillation_advantages",

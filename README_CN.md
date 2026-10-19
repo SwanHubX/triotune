@@ -35,15 +35,15 @@ Triotune 为若干基于 PyTRIO 的训练算法提供类似 Trainer 的使用方
 
 当前包含以下训练器：
 
-- **GRPO**：分组采样、用户提供的 reward 函数、组内中心化 advantage，以及
-  PyTRIO `importance_sampling` 更新。
+- **PPO**：一个异步 trainer 支持 PPO、GRPO、RLOO、GSPO、SAPO、
+  CISPO、DAPO 等预设。
 - **DPO**：chosen/rejected 偏好对、可选的 reference policy 打分，以及通过
   PyTRIO 提交的本地成对损失。
 - **SFT**：纯文本监督微调，支持 prompt/completion mask，并提供异步训练路径。
 - **OPD**：在线蒸馏，由学生模型采样 completion，再由固定教师模型提供 token
   级分数。
 
-在底层 PyTRIO 客户端支持的前提下，GRPO、DPO 和 OPD 提供同步与异步训练路径。
+在底层 PyTRIO 客户端支持的前提下，PPO、DPO 和 OPD 提供异步训练路径。
 公共工具统一处理文本、token ID 和聊天消息输入，以及 checkpoint 命名和
 SwanLab 指标记录。
 
@@ -89,7 +89,7 @@ pip install -e .
 
 ## 快速开始
 
-GSM8K 案例会准备 JSONL 数据集，然后启动内置 GRPO trainer。准备阶段不会创建
+GSM8K 案例会准备 JSONL 数据集，然后使用 PPO trainer 的 GRPO 预设。准备阶段不会创建
 PyTRIO 客户端，适合作为本地环境的第一步检查：
 
 ```bash
@@ -109,7 +109,7 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 
 | 算法 | 内置案例 | 数据 | 启动入口 |
 | --- | --- | --- | --- |
-| GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py)、[4×4 数独](trio-cookbook/recipes/grpo_sudoku_trio.py) | prompt + 参考答案 | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
+| PPO / GRPO | [GSM8K](trio-cookbook/recipes/grpo_gms8k_trio.py) | prompt + 参考答案 | [`train_grpo_gms8k.sh`](trio-cookbook/scripts/train_grpo_gms8k.sh) |
 | DPO | [HH-RLHF](trio-cookbook/recipes/dpo_rlhf_trio.py) | `messages`、`chosen`、`rejected` | [`train_dpo_rlhf.sh`](trio-cookbook/scripts/train_dpo_rlhf.sh) |
 | SFT | [嬛嬛对话](trio-cookbook/recipes/sft_huanhuan_trio.py) | 文本、messages 或 prompt/completion | [`train_sft_huanhuan.sh`](trio-cookbook/scripts/train_sft_huanhuan.sh) |
 | OPD | [DeepMath-103K](trio-cookbook/recipes/opd_deepmath_trio.py) | 仅 prompt | [`train_opd_deepmath.sh`](trio-cookbook/scripts/train_opd_deepmath.sh) |
@@ -143,7 +143,9 @@ bash trio-cookbook/scripts/train_grpo_gms8k.sh
 公开入口按算法组织：
 
 ```python
-from trio_cookbook.trainer import GRPOConfig, GRPOTrainer
+import asyncio
+
+from trio_cookbook.trainer import PPOConfig, PPOTrainer
 
 rows = [
     {
@@ -152,13 +154,13 @@ rows = [
     },
 ]
 
-trainer = GRPOTrainer(
-    model_name="your-pytrio-model-id",
-    reward_funcs=your_reward_function,
-    args=GRPOConfig(num_generations=4, max_steps=100),
+trainer = PPOTrainer(
+    model="your-pytrio-model-id",
+    reward_fn=your_reward_function,
+    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
     train_dataset=rows,
 )
-trainer.train()
+asyncio.run(trainer.train())
 ```
 
 `DPOTrainer`、`SFTTrainer` 和 `OPDTrainer` 使用相同的配置与数据集导向风格。

@@ -110,7 +110,7 @@ COMPARISON_METRIC_KEYS = (
 
 
 @dataclass(slots=True)
-class GRPOConfig:
+class Arguments:
     """命令行参数解析后的训练配置。"""
 
     base_model: str
@@ -197,7 +197,7 @@ def default_data_file() -> Path:
     return repository_root / "tests/sudoku_4x4_qa.jsonl"
 
 
-def parse_args() -> GRPOConfig:
+def parse_args() -> Arguments:
     """解析并验证训练参数。"""
 
     parser = argparse.ArgumentParser(description="PyTRIO 同步版 GRPO / 4x4 Sudoku")
@@ -269,7 +269,7 @@ def parse_args() -> GRPOConfig:
     if args.temperature < 0.0:
         parser.error("--temperature 不能小于 0")
 
-    return GRPOConfig(
+    return Arguments(
         base_model=args.base_model,
         data_file=args.data_file.expanduser().resolve(),
         difficulty=args.difficulty,
@@ -311,7 +311,7 @@ def validate_row(row: dict[str, Any], index: int) -> None:
         raise ValueError(f"Row {index}: answer 修改了 question 中的已知数字")
 
 
-def load_sudoku_train(config: GRPOConfig) -> Dataset:
+def load_sudoku_train(config: Arguments) -> Dataset:
     """加载 JSONL，按难度过滤、打乱，并复现原任务的 90% 训练切分。"""
 
     if not config.data_file.is_file():
@@ -639,7 +639,7 @@ def sample_train_kl(datums: list[trio.Datum], forward_result: Any) -> float | No
     return 0.5 * sum(differences) / len(differences) if differences else None
 
 
-def get_num_steps(dataset: Dataset, config: GRPOConfig) -> int:
+def get_num_steps(dataset: Dataset, config: Arguments) -> int:
     """计算训练步数；all-data 模式保证每条样本最多使用一次。"""
 
     if config.all_data:
@@ -662,7 +662,7 @@ def model_slug(base_model: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name).strip("-")
 
 
-def build_run_name(config: GRPOConfig, effective_steps: int) -> str:
+def build_run_name(config: Arguments, effective_steps: int) -> str:
     """生成 SwanLab run 和最终 LoRA 权重共用的名称。"""
 
     if config.run_name:
@@ -672,7 +672,7 @@ def build_run_name(config: GRPOConfig, effective_steps: int) -> str:
 
 
 def init_swanlab_run(
-    config: GRPOConfig,
+    config: Arguments,
     effective_steps: int,
     dataset_size: int,
     run_name: str,
@@ -731,7 +731,7 @@ def count_train_tokens(datums: list[trio.Datum]) -> int:
     )
 
 
-def main(config: GRPOConfig) -> None:
+def main(config: Arguments) -> None:
     """运行同步 PyTRIO GRPO 训练循环并保存最终 LoRA 权重。"""
 
     np.random.seed(config.seed)

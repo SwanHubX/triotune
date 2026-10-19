@@ -1,6 +1,6 @@
 # PyTRIO PPO 算法族：接口、功能边界与测试方法
 
-本文对应 [`trainer/ppo`](../trio-cookbook/trainer/ppo/README.md) 的当前实现，
+本文对应 [`trainer/ppo`](../trio-cookbook/trainer/ppo/) 的当前实现，
 说明如何测试、已经实现哪些能力，以及与 AReaL 相比还缺少什么。
 核对环境为 Python 3.12.14、PyTRIO 0.2.9、PyTorch 2.14.0+cpu、NumPy 2.5.3、SwanLab 0.10.1；
 AReaL 参考版本为 `b2f2f56f3701f46fef867036797a44d9f8226546`。
@@ -18,7 +18,8 @@ critic 用两个固定 marker 的 logprob 差读出 value，经 GAE 生成 actor
 PyTRIO 没有原生 value head 接口，但 logprob 和自定义损失接口足以实现这种 critic；
 此前文档把“没有原生 value head”解释成“不能完成纯 PyTRIO PPO”，这个判断已纠正。
 
-已有的 `GRPOTrainer` 与本目录的新 `PPOTrainer` 是两个入口；本次实现没有将前者替换为后者。
+GRPO 不再保留独立 trainer；统一通过 `PPOTrainer` 与
+`PPOConfig.for_algorithm("grpo")` 运行。
 新接口统一从以下包导入：
 
 ```python
@@ -475,7 +476,7 @@ SwanLab 0.10.1 每进程仅允许一个活动 run，因此 critic 的日志 writ
 
 ## 8. 对照源码
 
-- [本实现目录说明](../trio-cookbook/trainer/ppo/README.md) 与 [自动测试](../tests/test_ppo_family.py)。
+- [本实现目录](../trio-cookbook/trainer/ppo/) 与 [自动测试](../tests/test_ppo_family.py)。
 - [AReaL RLTrainer](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/rl_trainer.py)：训练编排、资源、评估和恢复。
 - [AReaL PPO actor](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/actor.py)、[critic](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/critic.py)、[GAE](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/gae.py)。
 - [AReaL 策略目标](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/utils/functional/functional.py) 与 [loss reduction](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/loss_reduction.py)。

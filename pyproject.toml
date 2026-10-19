@@ -1,7 +1,7 @@
 [project]
 name = "trio-cookbook"
 version = "0.1.0"
-description = "PyTRIO-native GRPO training utilities and recipes"
+description = "PyTRIO-native training utilities and recipes"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -27,7 +27,6 @@ packages = [
     "trio_cookbook.dataset",
     "trio_cookbook.dataset.swe_sft",
     "trio_cookbook.trainer",
-    "trio_cookbook.trainer.grpo",
     "trio_cookbook.trainer.dpo",
     "trio_cookbook.trainer.sft",
     "trio_cookbook.trainer.opd",

@@ -11,8 +11,8 @@ from trio_cookbook.api import PPOConfig as APIPPOConfig
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
     DPOConfig,
-    GRPOConfig,
     OPDConfig,
+    PPOConfig,
     SFTConfig,
 )
 
@@ -20,7 +20,7 @@ from trio_cookbook.trainer import (
 class TrainerConfigTests(unittest.TestCase):
     def test_algorithm_configs_inherit_common_controls_and_keep_defaults(self) -> None:
         expected = (
-            (GRPOConfig, 1, 4e-5, "trio-cookbook-grpo"),
+            (PPOConfig, 1, 1e-5, "trio-cookbook"),
             (DPOConfig, 1, 5e-6, "trio-cookbook-dpo"),
             (SFTConfig, 1, 2e-5, "trio-cookbook-sft"),
             (OPDConfig, 4, 1e-5, "trio-cookbook-opd"),
@@ -45,7 +45,7 @@ class TrainerConfigTests(unittest.TestCase):
                 )
 
     def test_common_controls_have_one_validation_contract(self) -> None:
-        for config_class in (GRPOConfig, DPOConfig, SFTConfig, OPDConfig):
+        for config_class in (PPOConfig, DPOConfig, SFTConfig, OPDConfig):
             with self.subTest(config=config_class.__name__, field="batch_size"):
                 with self.assertRaisesRegex(ValueError, "batch_size"):
                     config_class(batch_size=0)
@@ -79,7 +79,7 @@ class TrainerConfigTests(unittest.TestCase):
                 DPOConfig(**{field: -1.0})
 
     def test_evaluation_schedule_rejects_invalid_limits(self) -> None:
-        for config_class in (GRPOConfig, DPOConfig, SFTConfig, OPDConfig):
+        for config_class in (PPOConfig, DPOConfig, SFTConfig, OPDConfig):
             for kwargs in (
                 {"eval_steps": -1},
                 {"eval_steps": True},
@@ -109,35 +109,6 @@ class TrainerConfigTests(unittest.TestCase):
         serialized = asdict(config)
         self.assertNotIn("evaluation", serialized)
         self.assertEqual(SFTConfig(**serialized), config)
-
-    def test_grpo_accepts_only_builtin_policy_losses(self) -> None:
-        cases = {
-            "importance_sampling": {},
-            "ppo": {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
-            "cispo": {"clip_low_threshold": 0.0, "clip_high_threshold": 4.0},
-            "dro": {"beta": 0.05},
-        }
-        for loss_fn, loss_fn_config in cases.items():
-            with self.subTest(loss_fn=loss_fn):
-                config = GRPOConfig(
-                    loss_fn=loss_fn,
-                    loss_fn_config=loss_fn_config,
-                )
-                self.assertEqual(config.loss_fn, loss_fn)
-                self.assertEqual(config.loss_fn_config, loss_fn_config)
-
-        with self.assertRaisesRegex(ValueError, "policy loss"):
-            GRPOConfig(loss_fn="cross_entropy")
-        with self.assertRaisesRegex(ValueError, "clip thresholds"):
-            GRPOConfig(
-                loss_fn="ppo",
-                loss_fn_config={
-                    "clip_low_threshold": 2.0,
-                    "clip_high_threshold": 1.0,
-                },
-            )
-
-
 
 if __name__ == "__main__":
     unittest.main()
