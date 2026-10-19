@@ -7,8 +7,10 @@ reverse-KL policy-gradient surrogate, not full-vocabulary KL distillation.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import pytrio as trio
@@ -31,7 +33,133 @@ from .opd.contracts import (
     OPDTrainingSample,
 )
 from .opd.execution import OPDExecutionPlan
-from .opd.metrics import OPDMetricTotals, remote_metrics
+
+
+def _remote_metrics(*responses: Any) -> dict[str, float]:
+    """Normalize finite backend loss and gradient metrics."""
+
+    metrics: dict[str, float] = {}
+    for response in responses:
+        raw = getattr(response, "metrics", None)
+        if not isinstance(raw, Mapping):
+            continue
+        for key, value in raw.items():
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+            ):
+                metrics[str(key)] = float(value)
+    for key in ("loss_mean", "loss", "loss:mean", "scalar/loss_mean"):
+        if key in metrics:
+            metrics["train/loss"] = metrics[key]
+            break
+    for key in ("grad_norm", "gradient_norm"):
+        if key in metrics:
+            metrics["optim/grad_norm"] = metrics[key]
+            break
+    return metrics
+
+
+@dataclass(slots=True)
+class _OPDMetricTotals:
+    """Streaming sufficient statistics for OPD trainer reporting."""
+
+    prompt_count: int = 0
+    completion_count: int = 0
+    token_count: int = 0
+    student_logprob_sum: float = 0.0
+    teacher_logprob_sum: float = 0.0
+    advantage_sum: float = 0.0
+    teacher_weight_token_sum: float = 0.0
+    weighted_reverse_kl_sum: float = 0.0
+
+    def add(
+        self,
+        samples: Sequence[OPDTrainingSample],
+        *,
+        prompt_count: int,
+    ) -> None:
+        if (
+            isinstance(prompt_count, bool)
+            or not isinstance(prompt_count, int)
+            or prompt_count < 0
+        ):
+            raise ValueError("prompt_count must be a nonnegative integer.")
+        self.prompt_count += prompt_count
+        self.completion_count += len(samples)
+        self.token_count += sum(sample.tokens for sample in samples)
+        self.student_logprob_sum += sum(sample.student_sum for sample in samples)
+        self.teacher_logprob_sum += sum(sample.teacher_sum for sample in samples)
+        self.advantage_sum += sum(sample.advantage_sum for sample in samples)
+        self.teacher_weight_token_sum += sum(
+            sample.teacher_weight_sum * sample.tokens for sample in samples
+        )
+        self.weighted_reverse_kl_sum += sum(
+            sample.teacher_weight_sum * (sample.student_sum - sample.teacher_sum)
+            for sample in samples
+        )
+
+    def distillation(self, *, prefix: str) -> dict[str, float]:
+        if self.token_count <= 0:
+            raise ValueError("OPD metrics require at least one completion token.")
+        return {
+            f"{prefix}/reverse_kl_sampled": self.weighted_reverse_kl_sum
+            / self.token_count,
+            f"{prefix}/student_logprob": self.student_logprob_sum
+            / self.token_count,
+            f"{prefix}/teacher_logprob": self.teacher_logprob_sum
+            / self.token_count,
+            f"{prefix}/advantage_mean": self.advantage_sum / self.token_count,
+            f"{prefix}/teacher_weight_sum": self.teacher_weight_token_sum
+            / self.token_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _OPDMetricReducer:
+    """Build training and evaluation views from OPD sufficient statistics."""
+
+    def training(
+        self,
+        samples: Sequence[OPDTrainingSample],
+        *,
+        prompt_count: int,
+        behavior_policy_version: int,
+    ) -> dict[str, float]:
+        totals = _OPDMetricTotals()
+        totals.add(samples, prompt_count=prompt_count)
+        metrics = totals.distillation(prefix="distill")
+        metrics.update(
+            {
+                "data/prompts": float(totals.prompt_count),
+                "data/completions": float(totals.completion_count),
+                "data/completion_tokens": float(totals.token_count),
+                "policy/behavior_version": float(behavior_policy_version),
+            }
+        )
+        return metrics
+
+    def evaluation(
+        self,
+        samples: Sequence[OPDTrainingSample],
+        *,
+        prompt_count: int,
+    ) -> dict[str, float]:
+        totals = _OPDMetricTotals()
+        totals.add(samples, prompt_count=prompt_count)
+        return self.evaluation_totals(totals)
+
+    def evaluation_totals(self, totals: _OPDMetricTotals) -> dict[str, float]:
+        metrics = totals.distillation(prefix="eval")
+        metrics.update(
+            {
+                "eval/prompts": float(totals.prompt_count),
+                "eval/completions": float(totals.completion_count),
+                "eval/tokens": float(totals.token_count),
+            }
+        )
+        return metrics
 
 
 class OPDTrainer:
@@ -175,6 +303,7 @@ class OPDTrainer:
             self.args
         )
         self._objective = self.execution_plan.objective
+        self._metric_reducer = _OPDMetricReducer()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.state = OPDState()
@@ -314,12 +443,6 @@ class OPDTrainer:
     # Backend metrics, checkpointing, and reporting
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _remote_metrics(*responses: Any) -> dict[str, float]:
-        """Normalize finite backend loss and gradient metrics."""
-
-        return remote_metrics(*responses)
-
     async def _save_state_async(self) -> str:
         """Save student weights and optimizer state at the current step."""
 
@@ -380,9 +503,9 @@ class OPDTrainer:
         input_tokens = compute_train_tokens(datums)
         sample_input_tokens = sum(len(prompt.tokens) for prompt in prompts)
         sample_output_tokens = sum(sample.tokens for sample in scored)
-        metrics = self._remote_metrics(update.forward, update.optimizer)
+        metrics = _remote_metrics(update.forward, update.optimizer)
         metrics.update(
-            self.execution_plan.metrics.training(
+            self._metric_reducer.training(
                 scored,
                 prompt_count=len(prompts),
                 behavior_policy_version=version,
@@ -474,14 +597,14 @@ class OPDTrainer:
         sampler = await call_async(
             self._training_client, "save_weights_and_get_sampling_client"
         )
-        totals = OPDMetricTotals()
+        totals = _OPDMetricTotals()
         for rows in self._evaluation_batches(dataset):
             prompts = await asyncio.to_thread(self._prompts, rows)
             scored = await self._rollout_and_score(prompts, sampler)
             totals.add(scored, prompt_count=len(prompts))
         if totals.prompt_count == 0 or totals.token_count == 0:
             raise ValueError("eval_dataset must contain trainable OPD prompts.")
-        metrics = self.execution_plan.metrics.evaluation_totals(totals)
+        metrics = self._metric_reducer.evaluation_totals(totals)
         return self._publish_evaluation(metrics)
 
     async def evaluate_async(

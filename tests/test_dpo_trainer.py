@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from triotune.trainer import DPOConfig, DPOTrainer
 from triotune.trainer.dpo.loss import make_loss_fn as _loss_fn
-from triotune.trainer.dpo_trainer import _datum, _reference_logprob
+from triotune.trainer.dpo.datum import build_dpo_datum
 
 
 class _Tokenizer:
@@ -454,7 +454,10 @@ class DPOTrainerTests(unittest.TestCase):
     def test_pairwise_loss_and_completion_gradients(self) -> None:
         import torch
 
-        datums = [_datum([10, 11], [12]), _datum([10, 11], [13])]
+        datums = [
+            build_dpo_datum([10, 11], [12]),
+            build_dpo_datum([10, 11], [13]),
+        ]
         chosen = torch.tensor([0.0, -0.5], requires_grad=True)
         rejected = torch.tensor([0.0, -1.0], requires_grad=True)
         loss, metrics = _loss_fn([-0.5, -1.0], 0.1)(datums, [chosen, rejected])
@@ -465,15 +468,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(chosen.grad[0].item(), 0.0)
         self.assertEqual(metrics["reward/margin"], 0.0)
 
-    def test_reference_logprobs_require_complete_finite_response(self) -> None:
-        self.assertAlmostEqual(_reference_logprob([None, -1.0, -2.0], 1, 3), -3.0)
-        with self.assertRaisesRegex(ValueError, "wrong number"):
-            _reference_logprob([None], 1, 3)
-        with self.assertRaisesRegex(ValueError, "missing"):
-            _reference_logprob([None, -1.0, None], 1, 3)
-
     def test_datum_masks_prompt_and_shifts_completion(self) -> None:
-        datum = _datum([10, 11], [12, 13])
+        datum = build_dpo_datum([10, 11], [12, 13])
         self.assertEqual(datum.model_input.to_ints(), [10, 11, 12])
         self.assertEqual(datum.loss_fn_inputs["target_tokens"].data, [-100, 12, 13])
 

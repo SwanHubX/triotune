@@ -20,63 +20,23 @@ from tqdm import tqdm
 from ..api.cli_args import DPOConfig
 from ..api.client_api import call, call_async, optimizer_params
 from ..dataset import (
-    IGNORE_INDEX,
     PreferenceExample,
     PromptExample,
-    SupervisedExample,
     prepare_preference,
     prepare_prompt,
 )
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
 from ..utils.dataloader import iter_batches
-from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
 from ..utils.scoring import (
-    completion_logprobs,
     score_completion,
     score_completion_async,
 )
 from ..utils.token_usage import compute_sample_tokens, compute_train_tokens
 from ..utils.updates import run_update, run_update_async
-from .dpo.loss import DPOObjective
+from .dpo.datum import build_dpo_datum
+from .dpo.loss import DPOObjective, dpo_evaluation_metrics
 from .dpo.state import DPOResult, DPOState
-
-
-def _datum(prompt: list[int], completion: list[int]) -> Any:
-    """Build the masked, next-token-aligned PyTRIO sequence used by DPO."""
-
-    example = SupervisedExample(
-        input_ids=prompt + completion,
-        labels=[IGNORE_INDEX] * len(prompt) + completion,
-    )
-    return causal_datum(example.input_ids, example.target_tokens)
-
-
-def _reference_logprob(
-    values: Sequence[float | None], prompt_length: int, total_length: int
-) -> float:
-    """Reduce reference token scores over the completion only."""
-
-    if len(values) != total_length:
-        raise ValueError("Reference sampler returned the wrong number of token logprobs.")
-    try:
-        scores = completion_logprobs(
-            values,
-            prompt_length=prompt_length,
-            completion_length=total_length - prompt_length,
-            source="Reference sampler",
-        )
-    except ValueError as error:
-        raise ValueError(
-            "Reference sampler returned missing or non-finite completion logprobs."
-        ) from error
-    return sum(scores)
-
-
-def _softplus(value: float) -> float:
-    """Numerically stable ``log(1 + exp(value))`` for DPO evaluation."""
-
-    return max(value, 0.0) + math.log1p(math.exp(-abs(value)))
 
 
 class DPOTrainer:
@@ -180,7 +140,7 @@ class DPOTrainer:
         """Expand every pair to chosen then rejected PyTRIO datums."""
 
         return [
-            _datum(pair.prompt, completion)
+            build_dpo_datum(pair.prompt, completion)
             for pair in pairs
             for completion in (pair.chosen, pair.rejected)
         ]
@@ -252,33 +212,11 @@ class DPOTrainer:
     ) -> dict[str, float]:
         """Compute the actual pairwise DPO objective without accumulating gradients."""
 
-        if len(policy_scores) != len(reference_scores) or len(policy_scores) % 2:
-            raise ValueError("DPO evaluation scores must contain aligned preference pairs.")
-        losses = []
-        margins = []
-        chosen_rewards = []
-        rejected_rewards = []
-        for index in range(0, len(policy_scores), 2):
-            chosen_reward = self.args.beta * (
-                policy_scores[index] - reference_scores[index]
-            )
-            rejected_reward = self.args.beta * (
-                policy_scores[index + 1] - reference_scores[index + 1]
-            )
-            margin = chosen_reward - rejected_reward
-            losses.append(_softplus(-margin))
-            margins.append(margin)
-            chosen_rewards.append(chosen_reward)
-            rejected_rewards.append(rejected_reward)
-        count = len(losses)
-        return {
-            "eval/loss": sum(losses) / count,
-            "eval/reward_accuracy": sum(margin > 0 for margin in margins) / count,
-            "eval/reward_margin": sum(margins) / count,
-            "eval/reward_chosen": sum(chosen_rewards) / count,
-            "eval/reward_rejected": sum(rejected_rewards) / count,
-            "eval/pairs": float(count),
-        }
+        return dpo_evaluation_metrics(
+            policy_scores,
+            reference_scores,
+            beta=self.args.beta,
+        )
 
     def _evaluation_batches(
         self, dataset: Iterable[Mapping[str, Any]]

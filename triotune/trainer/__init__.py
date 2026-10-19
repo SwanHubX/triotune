@@ -28,6 +28,7 @@ from ..dataset import (
     prepare_swe_sft_dataset,
     render_prompt,
 )
+from .dpo.datum import build_dpo_datum
 from .dpo.state import DPOResult, DPOState
 from .dpo_trainer import DPOTrainer
 from .opd.contracts import (
@@ -43,7 +44,6 @@ from .opd.contracts import (
 from .opd.datum import build_opd_datum
 from .opd.execution import OPDExecutionPlan
 from .opd.loss import SampledReverseKLLoss, distillation_advantages
-from .opd.metrics import OPDMetricReducer, OPDMetricTotals
 from .opd.rollout import OPDRolloutPhase
 from .opd.targets import OPDTargetBuilder
 from .opd.teacher_phase import OPDTeacherPhase
@@ -140,8 +140,6 @@ __all__ = [
     "IGNORE_INDEX",
     "OPDConfig",
     "OPDExecutionPlan",
-    "OPDMetricReducer",
-    "OPDMetricTotals",
     "OPDPrompt",
     "OPDResult",
     "OPDRollout",
@@ -170,6 +168,7 @@ __all__ = [
     "SupervisedExample",
     "SampledReverseKLLoss",
     "build_opd_datum",
+    "build_dpo_datum",
     "distillation_advantages",
     "prepare_preference",
     "prepare_prompt",
