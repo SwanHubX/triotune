@@ -10,7 +10,7 @@
                         - (log pi_rejected - log ref_rejected))).
 
 训练命令（默认最多 50 步，与 dpo_rlhf.yaml 的主要训练参数一致）：
-uv run --extra dpo python trio-cookbook/recipes/dpo_rlhf.py
+uv run --extra dpo python triotune/recipes/dpo_rlhf.py
 
 只检查本地训练流程时可加 --no-swanlab；首次运行会下载 HH-RLHF 数据。
 

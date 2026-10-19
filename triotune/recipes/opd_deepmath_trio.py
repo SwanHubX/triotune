@@ -27,7 +27,7 @@ from trio_cookbook.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "trio-cookbook" / "configs" / "opd_deepmath.yaml"
+DEFAULT_CONFIG = ROOT / "triotune" / "configs" / "opd_deepmath.yaml"
 DEEPMATH_SHARDS = 10
 
 

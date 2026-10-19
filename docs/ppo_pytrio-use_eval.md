@@ -1,6 +1,6 @@
 # PyTRIO PPO 算法族：接口、功能边界与测试方法
 
-本文对应 [`trainer/ppo`](../trio-cookbook/trainer/ppo/) 的当前实现，
+本文对应 [`trainer/ppo`](../triotune/trainer/ppo/) 的当前实现，
 说明如何测试、已经实现哪些能力，以及与 AReaL 相比还缺少什么。
 核对环境为 Python 3.12.14、PyTRIO 0.2.9、PyTorch 2.14.0+cpu、NumPy 2.5.3、SwanLab 0.10.1；
 AReaL 参考版本为 `b2f2f56f3701f46fef867036797a44d9f8226546`。
@@ -48,18 +48,18 @@ flowchart TD
 
 | 模块 | 当前职责 |
 | --- | --- |
-| [cli_args.py](../trio-cookbook/api/cli_args.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
-| [contracts.py](../trio-cookbook/trainer/ppo/contracts.py) | `Trajectory`、`PreparedBatch`、`PPOState` |
-| [rollout.py](../trio-cookbook/trainer/ppo/rollout.py) | 文本采样、reward 调用、动态补采、固定 reference 评分 |
-| [advantages.py](../trio-cookbook/trainer/ppo/advantages.py) | 奖励整形、batch/group 归一化、KL reward 组合和优势归一化 |
-| [gae.py](../trio-cookbook/trainer/ppo/gae.py) | 独立的 token/turn 级 GAE 递推、mask/bootstrap 与 turn metadata 校验 |
-| [datum.py](../trio-cookbook/trainer/ppo/datum.py) | 因果 token 对齐、prompt/tool label mask、PyTRIO Datum 构建 |
-| [loss.py](../trio-cookbook/trainer/ppo/loss.py) | PPO、SAPO、CISPO、GSPO 比率、双重裁剪、reduction、行为过滤 |
-| [actor.py](../trio-cookbook/trainer/ppo/actor.py) | proximal 重算、目标冻结、minibatch 和重复更新 |
-| [critic.py](../trio-cookbook/trainer/ppo/critic.py) | `PyTRIOCritic` 评分、更新、保存；保留外部 `Critic` 协议 |
-| [critic.py](../trio-cookbook/trainer/ppo/critic.py) | marker targets、无界 value 读出、clipped value regression 和 critic 更新 |
-| [reporting.py](../trio-cookbook/utils/reporting.py) | 进程隔离的第二个 SwanLab run reporter（公共 utility） |
-| [rl_trainer.py](../trio-cookbook/trainer/rl_trainer.py) | 训练编排、日志、actor/critic checkpoint 保存 |
+| [cli_args.py](../triotune/api/cli_args.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
+| [contracts.py](../triotune/trainer/ppo/contracts.py) | `Trajectory`、`PreparedBatch`、`PPOState` |
+| [rollout.py](../triotune/trainer/ppo/rollout.py) | 文本采样、reward 调用、动态补采、固定 reference 评分 |
+| [advantages.py](../triotune/trainer/ppo/advantages.py) | 奖励整形、batch/group 归一化、KL reward 组合和优势归一化 |
+| [gae.py](../triotune/trainer/ppo/gae.py) | 独立的 token/turn 级 GAE 递推、mask/bootstrap 与 turn metadata 校验 |
+| [datum.py](../triotune/trainer/ppo/datum.py) | 因果 token 对齐、prompt/tool label mask、PyTRIO Datum 构建 |
+| [loss.py](../triotune/trainer/ppo/loss.py) | PPO、SAPO、CISPO、GSPO 比率、双重裁剪、reduction、行为过滤 |
+| [actor.py](../triotune/trainer/ppo/actor.py) | proximal 重算、目标冻结、minibatch 和重复更新 |
+| [critic.py](../triotune/trainer/ppo/critic.py) | `PyTRIOCritic` 评分、更新、保存；保留外部 `Critic` 协议 |
+| [critic.py](../triotune/trainer/ppo/critic.py) | marker targets、无界 value 读出、clipped value regression 和 critic 更新 |
+| [reporting.py](../triotune/utils/reporting.py) | 进程隔离的第二个 SwanLab run reporter（公共 utility） |
+| [rl_trainer.py](../triotune/trainer/rl_trainer.py) | 训练编排、日志、actor/critic checkpoint 保存 |
 
 初始化是惰性的；创建 `PPOTrainer` 本身不会立即创建远端训练客户端。
 训练方法使用 `async/await`，同一批 prompt 的采样请求可以并发执行。
@@ -253,7 +253,7 @@ native PPO 的梯度归一化还受 Trio-Train 服务端配置影响，不能默
 
 ## 5. 如何测试
 
-以下命令均在仓库根目录 `/data/home/wzc/trio-cookbook` 执行。
+以下命令均在仓库根目录 `/data/home/wzc/triotune` 执行。
 
 ### 5.1 安装与本地自动测试
 
@@ -476,7 +476,7 @@ SwanLab 0.10.1 每进程仅允许一个活动 run，因此 critic 的日志 writ
 
 ## 8. 对照源码
 
-- [本实现目录](../trio-cookbook/trainer/ppo/) 与 [自动测试](../tests/test_ppo_family.py)。
+- [本实现目录](../triotune/trainer/ppo/) 与 [自动测试](../tests/test_ppo_family.py)。
 - [AReaL RLTrainer](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/rl_trainer.py)：训练编排、资源、评估和恢复。
 - [AReaL PPO actor](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/actor.py)、[critic](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/critic.py)、[GAE](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/gae.py)。
 - [AReaL 策略目标](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/utils/functional/functional.py) 与 [loss reduction](https://github.com/inclusionAI/AReaL/blob/b2f2f56f3701f46fef867036797a44d9f8226546/areal/trainer/ppo/loss_reduction.py)。

@@ -1,6 +1,6 @@
 # DPO PyTRIO 框架与独立脚本评测
 
-对比 HH-RLHF `helpful-base` 的两次 SwanLab 本地运行：A 为框架版 `dpo_rlhf_trio.py`（`swanlog/run-20261008_150647-jszmqss9`），B 为独立版 `dpo_rlhf.py`（`trio-cookbook/recipes/swanlog/run-20261008_164906-0c4gtvvp`）。两边配置均为 Qwen3.5-4B、LoRA 32、1000 条抽样数据、batch 2、最大长度 2048、学习率 1e-5、β=0.1、seed=42，均完成 50 步。下表读取 `.swanlab` 标量；除总量和总耗时外，均为 50 步均值。
+对比 HH-RLHF `helpful-base` 的两次 SwanLab 本地运行：A 为框架版 `dpo_rlhf_trio.py`（`swanlog/run-20261008_150647-jszmqss9`），B 为独立版 `dpo_rlhf.py`（`triotune/recipes/swanlog/run-20261008_164906-0c4gtvvp`）。两边配置均为 Qwen3.5-4B、LoRA 32、1000 条抽样数据、batch 2、最大长度 2048、学习率 1e-5、β=0.1、seed=42，均完成 50 步。下表读取 `.swanlab` 标量；除总量和总耗时外，均为 50 步均值。
 
 逐步比较时，将 A 的 step 1–50 对齐 B 的 step 0–49；下文统一使用 A 的 step 编号。
 
@@ -59,7 +59,7 @@
 
 两次均完成 **50 步、100 对样本、35,898 个输入 token**，逐步 token 数完全一致，核心训练参数及依赖版本也一致。因此，三个吞吐指标同时变化，是因为它们都用相同训练量除以总耗时，并非三个独立异常。
 
-差距主要来自 [DPO 训练流程中的远端调用等待](../trio-cookbook/trainer/dpo_trainer.py)：
+差距主要来自 [DPO 训练流程中的远端调用等待](../triotune/trainer/dpo_trainer.py)：
 
 - **参考模型评分 `_reference_scores()`**：平均每步从旧版 0.456 s 降至新版 0.279 s，累计节省 **8.86 s**；新版在 49/50 步更快。
 - **优化器调用 `optim_step()`**：平均从 0.464 s 降至 0.245 s，累计节省 **10.96 s**。旧版第 1、21、34、45 步出现超过 1 秒的等待，新版没有。两边中位数都约 0.239 s，说明均值差主要来自旧版的慢请求。

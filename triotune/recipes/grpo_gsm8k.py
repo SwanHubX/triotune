@@ -21,9 +21,9 @@ GRPO 训练流程：
 
 最小试跑：
 
-先运行 `bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only` 准备数据。
+先运行 `bash triotune/scripts/train_grpo_gms8k.sh --prepare-only` 准备数据。
 
-uv run python trio-cookbook/recipes/grpo_gsm8k.py \
+uv run python triotune/recipes/grpo_gsm8k.py \
     --steps 2 \
     --batch-size 2 \
     --group-size 4 \
@@ -33,7 +33,7 @@ uv run python trio-cookbook/recipes/grpo_gsm8k.py \
 
 正式训练：
 
-uv run python trio-cookbook/recipes/grpo_gsm8k.py \
+uv run python triotune/recipes/grpo_gsm8k.py \
     --steps 100 \
     --batch-size 4 \
     --group-size 8 \
@@ -252,7 +252,7 @@ def load_gsm8k_train(data_file: Path) -> Dataset:
     if not path.is_file():
         raise FileNotFoundError(
             f"GSM8K data not found at {path}; prepare it with "
-            "bash trio-cookbook/scripts/train_grpo_gms8k.sh --prepare-only"
+            "bash triotune/scripts/train_grpo_gms8k.sh --prepare-only"
         )
     dataset = load_dataset("json", data_files=str(path), split="train")
     if not isinstance(dataset, Dataset):

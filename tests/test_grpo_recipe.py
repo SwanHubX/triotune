@@ -12,7 +12,7 @@ from unittest.mock import patch
 from datasets import Dataset
 
 def _load_recipe() -> ModuleType:
-    path = Path(__file__).parents[1] / "trio-cookbook" / "recipes" / "grpo_gsm8k.py"
+    path = Path(__file__).parents[1] / "triotune" / "recipes" / "grpo_gsm8k.py"
     spec = importlib.util.spec_from_file_location("trio_cookbook_grpo_gsm8k_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load recipe from {path}")

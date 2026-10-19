@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 
 def _load_script() -> ModuleType:
-    path = Path(__file__).parents[1] / "trio-cookbook" / "recipes" / "dpo_rlhf_trio.py"
+    path = Path(__file__).parents[1] / "triotune" / "recipes" / "dpo_rlhf_trio.py"
     spec = importlib.util.spec_from_file_location("dpo_rlhf_trio_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load {path}")

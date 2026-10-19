@@ -1,6 +1,6 @@
 """Prepare GSM8K data and train GRPO using a YAML recipe configuration.
 
-Launch this recipe with ``bash trio-cookbook/scripts/train_grpo_gms8k.sh``.
+Launch this recipe with ``bash triotune/scripts/train_grpo_gms8k.sh``.
 Use ``--prepare-only`` to inspect the JSONL data before creating PyTRIO clients.
 """
 
@@ -22,7 +22,7 @@ from trio_cookbook.utils.config import load_yaml_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = REPOSITORY_ROOT / "trio-cookbook" / "configs" / "grpo_gms8k.yaml"
+DEFAULT_CONFIG = REPOSITORY_ROOT / "triotune" / "configs" / "grpo_gms8k.yaml"
 
 QUESTION_SUFFIX = "Provide a numerical answer without units, written inside \\boxed{}."
 FEWSHOT_PREFIX = [
