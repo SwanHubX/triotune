@@ -6,7 +6,7 @@
 
 | 启动脚本 | Recipe | 配置 | Python 入口 |
 | --- | --- | --- | --- |
-| [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) | [grpo_gms8k.toml](../configs/grpo_gms8k.toml) | `trio_cookbook.trainer.grpo` |
+| [train_grpo_gms8k.sh](./train_grpo_gms8k.sh) | [grpo_gms8k_trio.py](../recipes/grpo_gms8k_trio.py) | [grpo_gms8k.toml](../configs/grpo_gms8k.toml) | `PPOConfig.for_algorithm("grpo")` |
 | [train_dpo_rlhf.sh](./train_dpo_rlhf.sh) | [dpo_rlhf_trio.py](../recipes/dpo_rlhf_trio.py) | [dpo_rlhf.toml](../configs/dpo_rlhf.toml) | `trio_cookbook.trainer.dpo` |
 | [train_sft_huanhuan.sh](./train_sft_huanhuan.sh) | [sft_huanhuan_trio.py](../recipes/sft_huanhuan_trio.py) | [sft_huanhuan.toml](../configs/sft_huanhuan.toml) | `trio_cookbook.trainer.sft` |
 | [train_opd_deepmath.sh](./train_opd_deepmath.sh) | [opd_deepmath_trio.py](../recipes/opd_deepmath_trio.py) | [opd_deepmath.toml](../configs/opd_deepmath.toml) | `trio_cookbook.trainer.opd` |
@@ -16,9 +16,8 @@
 训练器目录调整不影响脚本路径和配置字段，原有启动命令仍可使用。
 DPO 脚本保留 `uv run --extra dpo`，用于安装本地损失计算需要的 PyTorch。
 
-数独框架示例 [grpo_sudoku_trio.py](../recipes/grpo_sudoku_trio.py)
-同样使用 `trio_cookbook.trainer.grpo`，通过自己的命令行参数配置。
-独立版 recipe 直接调用 PyTRIO。OPD 另有 `[teacher]` 配置教师模型，
+GRPO 由统一的 PPO trainer 执行；独立版 recipe 仍可直接调用 PyTRIO。
+OPD 另有 `[teacher]` 配置教师模型，
 `[runtime].timeout` 设置 PyTRIO 与数据下载超时。
 
 ## 输入数据集格式

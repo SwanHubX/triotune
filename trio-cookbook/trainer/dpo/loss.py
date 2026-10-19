@@ -1,7 +1,11 @@
 """Local DPO objective and gradient callback for PyTRIO."""
 
+import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
+
+from ...api.client_api import call, call_async
 
 
 def make_loss_fn(reference: Sequence[float], beta: float):
@@ -40,3 +44,47 @@ def make_loss_fn(reference: Sequence[float], beta: float):
         return objective, metrics
 
     return loss
+
+
+@dataclass(frozen=True, slots=True)
+class DPOObjective:
+    """Adapt one batch-specific pairwise DPO callback to the Objective protocol."""
+
+    reference_scores: Sequence[float]
+    beta: float
+
+    def __post_init__(self) -> None:
+        scores = tuple(float(value) for value in self.reference_scores)
+        if not scores or len(scores) % 2:
+            raise ValueError("DPO reference scores must contain chosen/rejected pairs.")
+        if any(not math.isfinite(value) for value in scores):
+            raise ValueError("DPO reference scores must be finite.")
+        if not math.isfinite(float(self.beta)) or self.beta <= 0:
+            raise ValueError("DPO beta must be finite and positive.")
+        object.__setattr__(self, "reference_scores", scores)
+        object.__setattr__(self, "beta", float(self.beta))
+
+    def forward_backward(self, client: Any, datums: Sequence[Any]) -> Any:
+        """Run and resolve the synchronous custom-loss request."""
+
+        return call(
+            client,
+            "forward_backward_custom",
+            list(datums),
+            make_loss_fn(self.reference_scores, self.beta),
+        )
+
+    async def forward_backward_async(
+        self, client: Any, datums: Sequence[Any]
+    ) -> Any:
+        """Run and resolve the asynchronous custom-loss request."""
+
+        return await call_async(
+            client,
+            "forward_backward_custom",
+            list(datums),
+            make_loss_fn(self.reference_scores, self.beta),
+        )
+
+
+__all__ = ["DPOObjective", "make_loss_fn"]

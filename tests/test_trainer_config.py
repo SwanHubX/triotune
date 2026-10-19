@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import tomllib
 import unittest
 from dataclasses import asdict
-import tomllib
 
+from trio_cookbook.api import NormConfig as APINormConfig
+from trio_cookbook.api import PPOConfig as APIPPOConfig
 from trio_cookbook.trainer import (
     BaseTrainerConfig,
     DPOConfig,
-    GRPOConfig,
     OPDConfig,
+    PPOConfig,
     SFTConfig,
 )
 
@@ -18,7 +20,7 @@ from trio_cookbook.trainer import (
 class TrainerConfigTests(unittest.TestCase):
     def test_algorithm_configs_inherit_common_controls_and_keep_defaults(self) -> None:
         expected = (
-            (GRPOConfig, 1, 4e-5, "trio-cookbook-grpo"),
+            (PPOConfig, 1, 1e-5, "trio-cookbook"),
             (DPOConfig, 1, 5e-6, "trio-cookbook-dpo"),
             (SFTConfig, 1, 2e-5, "trio-cookbook-sft"),
             (OPDConfig, 4, 1e-5, "trio-cookbook-opd"),
@@ -43,7 +45,7 @@ class TrainerConfigTests(unittest.TestCase):
                 )
 
     def test_common_controls_have_one_validation_contract(self) -> None:
-        for config_class in (GRPOConfig, DPOConfig, SFTConfig, OPDConfig):
+        for config_class in (PPOConfig, DPOConfig, SFTConfig, OPDConfig):
             with self.subTest(config=config_class.__name__, field="batch_size"):
                 with self.assertRaisesRegex(ValueError, "batch_size"):
                     config_class(batch_size=0)
@@ -53,6 +55,19 @@ class TrainerConfigTests(unittest.TestCase):
             with self.subTest(config=config_class.__name__, field="tags"):
                 with self.assertRaisesRegex(ValueError, "tags"):
                     config_class(tags=[""])
+
+    def test_ppo_config_is_defined_by_the_public_api_contract(self) -> None:
+        from trio_cookbook.trainer.ppo import NormConfig, PPOConfig
+
+        self.assertIs(PPOConfig, APIPPOConfig)
+        self.assertIs(NormConfig, APINormConfig)
+        self.assertIsInstance(PPOConfig(), BaseTrainerConfig)
+        self.assertIs(
+            __import__("trio_cookbook.trainer.ppo.config", fromlist=["PPOConfig"]),
+            __import__("trio_cookbook.api.cli_args", fromlist=["PPOConfig"]),
+        )
+        self.assertFalse(PPOConfig.for_algorithm("grpo").use_critic)
+        self.assertTrue(PPOConfig.for_algorithm("ppo").use_critic)
 
     def test_optimizer_contract_exposes_decay_and_gradient_clipping(self) -> None:
         config = DPOConfig(weight_decay=0.01, grad_clip_norm=1.0)
@@ -64,7 +79,7 @@ class TrainerConfigTests(unittest.TestCase):
                 DPOConfig(**{field: -1.0})
 
     def test_evaluation_schedule_rejects_invalid_limits(self) -> None:
-        for config_class in (GRPOConfig, DPOConfig, SFTConfig, OPDConfig):
+        for config_class in (PPOConfig, DPOConfig, SFTConfig, OPDConfig):
             for kwargs in (
                 {"eval_steps": -1},
                 {"eval_steps": True},
@@ -94,8 +109,6 @@ class TrainerConfigTests(unittest.TestCase):
         serialized = asdict(config)
         self.assertNotIn("evaluation", serialized)
         self.assertEqual(SFTConfig(**serialized), config)
-
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,11 +11,6 @@ from unittest.mock import patch
 
 from datasets import Dataset
 
-from trio_cookbook.trainer.grpo.datum import build_aligned_datum, to_client_datum
-from trio_cookbook.trainer.grpo.metrics import _sample_train_kl
-from trio_cookbook.trainer.grpo.contracts import SequenceSample
-
-
 def _load_recipe() -> ModuleType:
     path = Path(__file__).parents[1] / "trio-cookbook" / "recipes" / "grpo_gsm8k.py"
     spec = importlib.util.spec_from_file_location("trio_cookbook_grpo_gsm8k_test", path)
@@ -161,21 +156,18 @@ class MetricParityTests(unittest.TestCase):
         forward = SimpleNamespace(loss_fn_outputs=[{}])
         self.assertIsNone(recipe.sample_train_kl([datum], forward))
 
-    def test_datum_alignment_matches_trainer(self) -> None:
+    def test_datum_alignment(self) -> None:
         sample = recipe.RolloutSample([3, 4], [-0.1, -0.2], "\\boxed{42}", 1.0, 0.5)
         actual = recipe.build_grpo_datum([1, 2], sample)
-        expected = to_client_datum(
-            build_aligned_datum(
-                [1, 2], SequenceSample(sample.tokens, sample.logprobs, sample.text),
-                sample.advantage, prompt_id="0", sample_id=0,
-                model_input_builder=recipe.trio.ModelInput.from_ints,
-            ),
-            recipe.trio.Datum,
-        )
-
-        self.assertEqual(actual.model_input.to_ints(), expected.model_input.to_ints())
-        for name in ("target_tokens", "logprobs", "advantages"):
-            self.assertEqual(actual.loss_fn_inputs[name].data, expected.loss_fn_inputs[name].data)
+        self.assertEqual(actual.model_input.to_ints(), [1, 2, 3])
+        self.assertEqual(actual.loss_fn_inputs["target_tokens"].data, [-100, 3, 4])
+        for actual_value, expected_value in zip(
+            actual.loss_fn_inputs["logprobs"].data,
+            [0.0, -0.1, -0.2],
+            strict=True,
+        ):
+            self.assertAlmostEqual(actual_value, expected_value)
+        self.assertEqual(actual.loss_fn_inputs["advantages"].data, [0.0, 0.5, 0.5])
 
     def test_kl_and_step_metrics_match_trainer_definitions(self) -> None:
         samples = [
@@ -202,7 +194,10 @@ class MetricParityTests(unittest.TestCase):
         )
         metrics = recipe.build_step_metrics([samples], datums, 0, training, 4e-5)
 
-        self.assertAlmostEqual(metrics["policy/kl_sample_train"], _sample_train_kl(datums, forward))
+        self.assertAlmostEqual(
+            metrics["policy/kl_sample_train"],
+            recipe.sample_train_kl(datums, forward),
+        )
         self.assertEqual(metrics["trainer/loss"], 0.25)
         self.assertEqual(metrics["optim/grad_norm"], 1.5)
         self.assertEqual(metrics["reward/mean"], 0.5)

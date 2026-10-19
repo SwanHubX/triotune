@@ -32,6 +32,7 @@ max_concurrent_sampling = 16
 max_concurrent_scoring = 32
 kl_coef = 1.0
 discount_factor = 0.0
+importance_ratio_cap = 5.0
 learning_rate = 4e-5
 beta1 = 0.9
 beta2 = 0.95

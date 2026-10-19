@@ -7,6 +7,7 @@ Use ``--prepare-only`` to inspect the JSONL data before creating PyTRIO clients.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import tomllib
@@ -16,7 +17,7 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from trio_cookbook.trainer.grpo import GRPOConfig, GRPOTrainer
+from trio_cookbook.trainer import PPOConfig, PPOTrainer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -75,7 +76,7 @@ def build_prompt(question: str) -> list[dict[str, str]]:
 
 
 def prepare_gsm8k_dataset(data_file: Path, cache_dir: Path, *, rebuild: bool) -> None:
-    """Download GSM8K and create the JSONL contract consumed by GRPOTrainer."""
+    """Download GSM8K and create the JSONL contract consumed by PPOTrainer."""
 
     if data_file.is_file() and not rebuild:
         return
@@ -140,24 +141,17 @@ def load_training_rows(data_file: Path, max_examples: int | None) -> list[dict[s
 
 def boxed_answer_reward(
     *,
-    completions: list[str | list[int]],
-    answer: list[str],
-    **_: Any,
-) -> list[float]:
+    row: dict[str, Any],
+    completion: str,
+    completion_ids: list[int],
+) -> float:
     """Return 1 when the last boxed completion equals the GSM8K answer."""
 
-    if len(completions) != len(answer):
-        raise ValueError("completions and answer must have the same length")
-
-    rewards: list[float] = []
-    for completion, expected in zip(completions, answer, strict=True):
-        if not isinstance(completion, str):
-            rewards.append(0.0)
-            continue
-        matches = BOXED_ANSWER.findall(completion)
-        predicted = normalize_answer(matches[-1]) if matches else None
-        rewards.append(float(predicted == normalize_answer(expected)))
-    return rewards
+    del completion_ids
+    expected = row["answer"]
+    matches = BOXED_ANSWER.findall(completion)
+    predicted = normalize_answer(matches[-1]) if matches else None
+    return float(predicted == normalize_answer(expected))
 
 
 def resolve_path(value: str | Path) -> Path:
@@ -186,7 +180,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train GSM8K through trio_cookbook.trainer.grpo.GRPOTrainer")
+    parser = argparse.ArgumentParser(description="Train GSM8K with the PPO trainer's GRPO preset")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=positive_int, help="override grpo.max_steps")
     parser.add_argument("--batch-size", type=positive_int, help="override grpo.batch_size")
@@ -240,15 +234,15 @@ def main() -> None:
         if (value := getattr(args, field)) is not None:
             swanlab_options[field] = value
 
-    config = GRPOConfig(**grpo, **swanlab_options)
-    trainer = GRPOTrainer(
-        model_name=settings["model"]["name"],
-        reward_funcs=boxed_answer_reward,
+    config = PPOConfig.for_algorithm("grpo", **grpo, **swanlab_options)
+    trainer = PPOTrainer(
+        model=settings["model"]["name"],
+        reward_fn=boxed_answer_reward,
         args=config,
         train_dataset=rows,
         lora_rank=settings["model"]["lora_rank"],
     )
-    trainer.train()
+    asyncio.run(trainer.train())
 
 
 if __name__ == "__main__":

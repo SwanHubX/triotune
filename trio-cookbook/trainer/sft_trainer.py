@@ -13,9 +13,9 @@ from tqdm import tqdm
 
 from ..api.cli_args import SFTConfig
 from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
+from ..api.loss_api import BuiltinPyTrioObjective, LossSpec, SupervisedLossInput
 from ..dataset import SupervisedExample, prepare_sft
 from ..utils.dataloader import iter_batches
-from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
 from .sft.state import SFTState
 
@@ -56,6 +56,7 @@ class SFTTrainer:
             base_model=self.model, rank=lora_rank, seed=self.args.seed
         )
         self._tokenizer = self._client.get_tokenizer()
+        self._objective = BuiltinPyTrioObjective(LossSpec("cross_entropy"))
         self.state = SFTState()
         self._last_eval_step: int | None = None
         self._metrics_api = MetricsAPI.from_config(
@@ -89,7 +90,10 @@ class SFTTrainer:
 
         examples = [self._prepare_example(row) for row in rows]
         datums = [
-            causal_datum(example.input_ids, example.target_tokens)
+            SupervisedLossInput(
+                model_tokens=example.model_input,
+                target_tokens=example.target_tokens,
+            ).to_datum()
             for example in examples
         ]
         return examples, datums
@@ -131,13 +135,7 @@ class SFTTrainer:
         batch_count = 0
         for rows in self._evaluation_batches(dataset):
             examples, datums = self._prepare_datums(rows)
-            response = await call_async(
-                self._client,
-                "forward",
-                datums,
-                loss_fn="cross_entropy",
-                auto_shift=False,
-            )
+            response = await self._objective.forward_async(self._client, datums)
             raw = getattr(response, "metrics", {})
             active_tokens = int(
                 raw.get(
@@ -195,13 +193,7 @@ class SFTTrainer:
 
         # Await submission only; result resolution happens in collect(). The
         # PyTRIO client preserves FB -> optim -> save request ordering.
-        forward_future = await submit_async(
-            self._client,
-            "forward_backward",
-            datums,
-            loss_fn="cross_entropy",
-            auto_shift=False,
-        )
+        forward_future = await self._objective.submit_async(self._client, datums)
         optim_future = await submit_async(
             self._client,
             "optim_step",

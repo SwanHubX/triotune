@@ -1419,6 +1419,9 @@ dependencies = [
 dpo = [
     { name = "torch" },
 ]
+ppo = [
+    { name = "torch" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1427,9 +1430,10 @@ requires-dist = [
     { name = "pytrio", specifier = "==0.2.9" },
     { name = "swanlab", specifier = "==0.10.1" },
     { name = "torch", marker = "extra == 'dpo'", specifier = ">=2.3" },
+    { name = "torch", marker = "extra == 'ppo'", specifier = ">=2.3" },
     { name = "tqdm", specifier = "==4.70.1" },
 ]
-provides-extras = ["dpo"]
+provides-extras = ["dpo", "ppo"]
 
 [[package]]
 name = "triton"

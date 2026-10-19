@@ -7,16 +7,16 @@ clients supplied by the caller.
 
 from . import utils
 from .api.client_api import call, call_async, wait, wait_async
-from .trainer import DPOConfig, DPOTrainer, GRPOConfig, GRPOTrainer, RenderedPrompt, render_prompt
-from .trainer import OPDConfig, OPDTrainer
+from .trainer import DPOConfig, DPOTrainer, OPDConfig, OPDTrainer
+from .trainer import PPOConfig, PPOTrainer, RenderedPrompt, render_prompt
 
 __all__ = [
     "DPOConfig",
     "DPOTrainer",
-    "GRPOConfig",
-    "GRPOTrainer",
     "OPDConfig",
     "OPDTrainer",
+    "PPOConfig",
+    "PPOTrainer",
     "RenderedPrompt",
     "call",
     "call_async",

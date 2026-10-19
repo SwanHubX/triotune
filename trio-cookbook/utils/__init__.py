@@ -15,8 +15,11 @@ from ..api.client_api import (
 )
 from .checkpoint import checkpoint_path, save_checkpoint, save_checkpoint_async
 from .dataloader import iter_batches
-from .datums import causal_datum, materialize_datum
+from .datums import causal_datum, materialize_datum, materialize_model_input
 from .metrics import MetricsAPI, metric_name, normalize_metrics
+from .reporting import isolated_metrics
+from .scoring import completion_logprobs, score_completion, score_completion_async
+from .updates import UpdateResult, run_update, run_update_async
 
 # ``trio_cookbook.utils.client`` was public before client contracts moved into
 # ``api``. Keep that import path without duplicating its implementation here.
@@ -24,19 +27,27 @@ sys.modules[f"{__name__}.client"] = client
 
 __all__ = [
     "MetricsAPI",
+    "UpdateResult",
     "call",
     "call_async",
+    "causal_datum",
     "checkpoint_path",
     "client",
-    "causal_datum",
+    "completion_logprobs",
     "iter_batches",
+    "isolated_metrics",
     "materialize_datum",
+    "materialize_model_input",
     "metric_name",
     "normalize_metrics",
     "optimizer_params",
+    "run_update",
+    "run_update_async",
     "sampling_params",
     "save_checkpoint",
     "save_checkpoint_async",
+    "score_completion",
+    "score_completion_async",
     "sdk_object",
     "submit_async",
     "wait",

@@ -54,12 +54,11 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset, load_dataset
 import numpy as np
 import pytrio as trio
 import swanlab
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
-
 
 LOSS_FNS = ("importance_sampling", "ppo")
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -67,7 +66,7 @@ DEFAULT_DATA_FILE = REPOSITORY_ROOT / "data" / "gsm8k_train.jsonl"
 
 
 @dataclass
-class GRPOConfig:
+class Arguments:
     """命令行参数解析后的训练配置。"""
 
     base_model: str
@@ -122,7 +121,7 @@ class RolloutSample:
     advantage: float = 0.0
 
 
-def parse_args() -> GRPOConfig:
+def parse_args() -> Arguments:
     """把训练配置集中到命令行参数，避免依赖环境变量。"""
     parser = argparse.ArgumentParser(description="PyTRIO 同步版 GRPO / GSM8K 教学脚本")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B", help="PyTRIO 基础模型名")
@@ -165,7 +164,7 @@ def parse_args() -> GRPOConfig:
     parser.add_argument("--exp-name", help="SwanLab 实验名称；默认按训练参数自动生成")
     args = parser.parse_args()
 
-    return GRPOConfig(
+    return Arguments(
         base_model=args.base_model,
         data_file=args.data_file,
         lora_rank=args.lora_rank,
@@ -335,7 +334,7 @@ def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Da
     # 从最后一个 prompt token 开始预测 completion 的每个 token。
     observation_len = len(prompt_tokens) - 1
     input_tokens = prompt_tokens + sample.tokens[:-1]
-    target_tokens = [0] * observation_len + sample.tokens
+    target_tokens = [-100] * observation_len + sample.tokens
     padded_logprobs = [0.0] * observation_len + sample.logprobs
     padded_advantages = [0.0] * observation_len + [sample.advantage] * len(sample.tokens)
 
@@ -385,7 +384,7 @@ def run_optimization_step(
 
 
 def sample_train_kl(datums: list[trio.Datum], forward_result: Any) -> float | None:
-    """和 GRPOTrainer 一样，仅在非零 advantage token 上计算采样/训练 KL。"""
+    """仅在非零 advantage token 上计算采样/训练 KL。"""
     outputs = getattr(forward_result, "loss_fn_outputs", None)
     if not isinstance(outputs, list) or len(outputs) != len(datums):
         return None
@@ -417,7 +416,7 @@ def sample_train_kl(datums: list[trio.Datum], forward_result: Any) -> float | No
     return 0.5 * sum(differences) / len(differences) if differences else None
 
 
-def get_num_steps(dataset: Dataset, config: GRPOConfig) -> int:
+def get_num_steps(dataset: Dataset, config: Arguments) -> int:
     """计算实际训练 step 数；all-data 模式会覆盖命令行里的 steps。"""
     if config.all_data:
         return (len(dataset) + config.batch_size - 1) // config.batch_size
@@ -431,7 +430,7 @@ def model_slug(base_model: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name).strip("-")
 
 
-def build_run_name(config: GRPOConfig, effective_steps: int) -> str:
+def build_run_name(config: Arguments, effective_steps: int) -> str:
     """SwanLab experiment name 和最终权重名共用同一个规则生成值。"""
     loss_slug = config.loss_fn.replace("_", "-")
     return (
@@ -453,7 +452,7 @@ def pick_batch(dataset: Dataset, step: int, batch_size: int, all_data: bool) -> 
 
 
 def init_swanlab_run(
-    config: GRPOConfig,
+    config: Arguments,
     effective_steps: int,
     dataset_size: int,
     run_name: str,
@@ -519,7 +518,7 @@ def build_step_metrics(
     training_metrics: dict[str, Any],
     learning_rate: float,
 ) -> dict[str, float]:
-    """用与 GRPOTrainer 相同的名称和分母汇总一步训练指标。"""
+    """汇总一步训练的关键指标。"""
     samples = [sample for group in groups for sample in group]
     rewards = [sample.reward for sample in samples]
     lengths = [len(sample.tokens) for sample in samples]
@@ -569,7 +568,7 @@ def build_step_metrics(
     return metrics
 
 
-def main(config: GRPOConfig) -> None:
+def main(config: Arguments) -> None:
     run_started = time.perf_counter()
     np.random.seed(config.seed)
 
@@ -628,7 +627,7 @@ def main(config: GRPOConfig) -> None:
             ]
 
             rollout_started = time.perf_counter()
-            # 每步发布当前 LoRA 权重，和 GRPOTrainer 一样使用当前策略采样。
+            # 每步发布当前 LoRA 权重，使用当前策略采样。
             sampling_client = training_client.save_weights_and_get_sampling_client()
             groups = [
                 run_rollout_group(

@@ -1,5 +1,13 @@
 """Public configuration and client contracts for trainer algorithms."""
 
+from .cli_args import (
+    BaseTrainerConfig,
+    DPOConfig,
+    NormConfig,
+    OPDConfig,
+    PPOConfig,
+    SFTConfig,
+)
 from .client_api import (
     call,
     call_async,
@@ -10,20 +18,32 @@ from .client_api import (
     wait,
     wait_async,
 )
-from .cli_args import (
-    BaseTrainerConfig,
-    DPOConfig,
-    GRPOConfig,
-    OPDConfig,
-    SFTConfig,
+from .loss_api import (
+    BUILTIN_LOSS_FNS,
+    CE_LOSS_FNS,
+    POLICY_LOSS_FNS,
+    BuiltinObjective,
+    BuiltinPyTrioObjective,
+    LossSpec,
+    PolicyLossInput,
+    SupervisedLossInput,
 )
 
 __all__ = [
+    "BUILTIN_LOSS_FNS",
+    "CE_LOSS_FNS",
+    "POLICY_LOSS_FNS",
     "BaseTrainerConfig",
+    "BuiltinObjective",
+    "BuiltinPyTrioObjective",
     "DPOConfig",
-    "GRPOConfig",
+    "LossSpec",
+    "NormConfig",
     "OPDConfig",
+    "PPOConfig",
+    "PolicyLossInput",
     "SFTConfig",
+    "SupervisedLossInput",
     "call",
     "call_async",
     "optimizer_params",

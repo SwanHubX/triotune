@@ -28,6 +28,26 @@ script = _load_script()
 
 
 class ScriptArgumentsTests(unittest.TestCase):
+    def test_reward_uses_ppo_scalar_contract(self) -> None:
+        row = {"answer": "42"}
+
+        self.assertEqual(
+            script.boxed_answer_reward(
+                row=row,
+                completion="The result is \\boxed{42}.",
+                completion_ids=[1, 2],
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            script.boxed_answer_reward(
+                row=row,
+                completion="The result is \\boxed{41}.",
+                completion_ids=[1, 2],
+            ),
+            0.0,
+        )
+
     def test_prepared_gsm8k_rows_use_messages_column(self) -> None:
         source = Dataset.from_list([{"question": "6 * 7?", "answer": "work #### 42"}])
         with TemporaryDirectory() as directory:
@@ -53,9 +73,8 @@ class ScriptArgumentsTests(unittest.TestCase):
         self.assertEqual(settings["model"]["name"], "Qwen/Qwen3.5-9B")
         self.assertEqual(settings["data"]["file"], "data/gsm8k_train.jsonl")
         self.assertEqual(settings["grpo"]["max_steps"], 100)
-        self.assertIs(settings["grpo"]["stop"], True)
+        self.assertEqual(settings["grpo"]["max_tokens"], 1024)
         self.assertEqual(settings["grpo"]["chat_template_kwargs"], {"enable_thinking": False})
-        self.assertGreaterEqual(settings["swanlab"]["logging_step"], 1)
 
     def test_swanlab_options_default_to_none(self) -> None:
         with patch.object(sys, "argv", ["grpo_gms8k_trio.py"]):
@@ -88,7 +107,8 @@ class ScriptArgumentsTests(unittest.TestCase):
                 script, "load_training_rows",
                 return_value=[{"messages": [{"role": "user", "content": "6 * 7?"}], "answer": "42"}],
             ),
-            patch.object(script, "GRPOTrainer") as trainer_class,
+            patch.object(script, "PPOTrainer") as trainer_class,
+            patch.object(script.asyncio, "run") as run,
             patch.object(script, "print", create=True),
         ):
             script.main()
@@ -97,7 +117,8 @@ class ScriptArgumentsTests(unittest.TestCase):
         self.assertEqual(config.report_to, "swanlab")
         self.assertEqual(config.workspace, "my-organization")
         self.assertEqual(config.tags, ["grpo", "gsm8k"])
-        self.assertEqual(config.logging_step, script.load_config(script.DEFAULT_CONFIG)["swanlab"]["logging_step"])
+        self.assertFalse(config.use_critic)
+        run.assert_called_once()
 
     def test_invalid_report_target_prints_error(self) -> None:
         for target in ("none", "other"):
@@ -117,7 +138,8 @@ class ScriptArgumentsTests(unittest.TestCase):
             patch.object(sys, "argv", argv),
             patch.object(script, "prepare_gsm8k_dataset"),
             patch.object(script, "load_training_rows", return_value=[{"messages": [1], "answer": "42"}]),
-            patch.object(script, "GRPOTrainer") as trainer_class,
+            patch.object(script, "PPOTrainer") as trainer_class,
+            patch.object(script.asyncio, "run"),
             patch.object(script, "print", create=True),
         ):
             script.main()
@@ -125,7 +147,7 @@ class ScriptArgumentsTests(unittest.TestCase):
         config = trainer_class.call_args.kwargs["args"]
         self.assertEqual((config.max_steps, config.batch_size, config.num_generations), (2, 1, 4))
         self.assertEqual(config.save_every, 2)
-        self.assertEqual(trainer_class.call_args.kwargs["model_name"], "Qwen/Qwen3.5-9B")
+        self.assertEqual(trainer_class.call_args.kwargs["model"], "Qwen/Qwen3.5-9B")
 
     def test_rejects_missing_config_section(self) -> None:
         settings = {

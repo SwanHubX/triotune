@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from trio_cookbook.trainer import PPOConfig
 from trio_cookbook.utils.checkpoint import (
     checkpoint_path,
     save_checkpoint,
@@ -13,13 +14,18 @@ from trio_cookbook.utils.checkpoint import (
 from trio_cookbook.utils.dataloader import iter_batches
 from trio_cookbook.utils.datums import causal_datum, materialize_datum
 from trio_cookbook.utils.metrics import (
+    MetricsAPI,
     accumulate_metrics,
     averaged_metrics,
     finish_run,
+    normalize_metrics,
     start_run,
 )
-from trio_cookbook.utils.metrics import MetricsAPI, normalize_metrics
-from trio_cookbook.trainer.grpo import GRPOConfig
+from trio_cookbook.utils.scoring import (
+    completion_logprobs,
+    score_completion,
+    score_completion_async,
+)
 
 
 class LoggingTests(unittest.TestCase):
@@ -35,7 +41,8 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(averaged_metrics(window), {"loss": 10.0})
 
     def test_run_initialization_retains_config_and_metadata(self):
-        args = GRPOConfig(
+        args = PPOConfig.for_algorithm(
+            "grpo",
             report_to="swanlab",
             run_name="custom",
             tags=["grpo"],
@@ -191,6 +198,59 @@ class CheckpointTests(unittest.TestCase):
             save_checkpoint(client, "grpo", 1)
 
 
+class ScoringTests(unittest.TestCase):
+    def test_completion_logprobs_validate_full_sequence_alignment(self):
+        self.assertEqual(
+            completion_logprobs(
+                [None, -0.1, -0.2, -0.3],
+                prompt_length=2,
+                completion_length=2,
+                source="Reference",
+            ),
+            [-0.2, -0.3],
+        )
+        with self.assertRaisesRegex(ValueError, "full prompt plus completion"):
+            completion_logprobs(
+                [None, -0.1],
+                prompt_length=2,
+                completion_length=1,
+            )
+        for values in ([None, -0.1, None], [None, -0.1, float("nan")], [None, -0.1, 0.1]):
+            with self.subTest(values=values), self.assertRaisesRegex(
+                ValueError, "finite, nonpositive"
+            ):
+                completion_logprobs(
+                    values,
+                    prompt_length=2,
+                    completion_length=1,
+                )
+
+    def test_score_completion_uses_exact_prompt_completion_tokens(self):
+        requests = []
+
+        def model_input(tokens):
+            requests.append(("input", list(tokens)))
+            return tuple(tokens)
+
+        client = SimpleNamespace(
+            compute_logprobs=Mock(
+                side_effect=lambda value: [None, -0.1, -0.2, -0.3]
+            )
+        )
+        self.assertEqual(
+            score_completion(
+                client,
+                [10, 11],
+                [12, 13],
+                model_input_factory=model_input,
+                source="Teacher",
+            ),
+            [-0.2, -0.3],
+        )
+        self.assertEqual(requests, [("input", [10, 11, 12, 13])])
+        client.compute_logprobs.assert_called_once_with((10, 11, 12, 13))
+
+
 class AsyncCheckpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_save_resolves_both_sdk_stages(self):
         class Future:
@@ -233,3 +293,20 @@ class AsyncCheckpointTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertTrue(released.is_set())
+
+
+class AsyncScoringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_score_completion_async_resolves_sdk_method(self):
+        client = SimpleNamespace(
+            compute_logprobs_async=AsyncMock(
+                return_value=[None, -0.1, -0.2]
+            )
+        )
+        values = await score_completion_async(
+            client,
+            [1, 2],
+            [3],
+            model_input_factory=tuple,
+        )
+        self.assertEqual(values, [-0.2])
+        client.compute_logprobs_async.assert_awaited_once_with((1, 2, 3))

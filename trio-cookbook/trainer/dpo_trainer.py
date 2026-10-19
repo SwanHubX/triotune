@@ -31,7 +31,13 @@ from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
 from ..utils.dataloader import iter_batches
 from ..utils.datums import causal_datum
 from ..utils.metrics import MetricsAPI
-from .dpo.loss import make_loss_fn as _loss_fn
+from ..utils.scoring import (
+    completion_logprobs,
+    score_completion,
+    score_completion_async,
+)
+from ..utils.updates import run_update, run_update_async
+from .dpo.loss import DPOObjective
 from .dpo.state import DPOResult, DPOState
 
 
@@ -52,12 +58,18 @@ def _reference_logprob(
 
     if len(values) != total_length:
         raise ValueError("Reference sampler returned the wrong number of token logprobs.")
-    completion_values = values[prompt_length:]
-    if not completion_values or any(
-        value is None or not math.isfinite(value) for value in completion_values
-    ):
-        raise ValueError("Reference sampler returned missing or non-finite completion logprobs.")
-    return sum(float(value) for value in completion_values if value is not None)
+    try:
+        scores = completion_logprobs(
+            values,
+            prompt_length=prompt_length,
+            completion_length=total_length - prompt_length,
+            source="Reference sampler",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "Reference sampler returned missing or non-finite completion logprobs."
+        ) from error
+    return sum(scores)
 
 
 def _softplus(value: float) -> float:
@@ -176,13 +188,16 @@ class DPOTrainer:
         scores = []
         for pair in pairs:
             for completion in (pair.chosen, pair.rejected):
-                tokens = pair.prompt + completion
-                values = call(
+                # DPO uses one scalar score per response. The shared scoring
+                # helper preserves token alignment; DPO owns the sequence sum.
+                values = score_completion(
                     client,
-                    "compute_logprobs",
-                    trio.ModelInput.from_ints(tokens),
+                    pair.prompt,
+                    completion,
+                    model_input_factory=trio.ModelInput.from_ints,
+                    source="Reference sampler",
                 )
-                scores.append(_reference_logprob(values, len(pair.prompt), len(tokens)))
+                scores.append(sum(values))
         return scores
 
     async def _scores_async(
@@ -197,18 +212,19 @@ class DPOTrainer:
         ]
         values = await asyncio.gather(
             *(
-                call_async(
+                # Each request returns token-level completion scores. Reduction
+                # remains below so sync and async DPO follow the same contract.
+                score_completion_async(
                     client,
-                    "compute_logprobs",
-                    trio.ModelInput.from_ints(prompt + completion),
+                    prompt,
+                    completion,
+                    model_input_factory=trio.ModelInput.from_ints,
+                    source="Reference sampler",
                 )
                 for prompt, completion in requests
             )
         )
-        return [
-            _reference_logprob(result, len(prompt), len(prompt) + len(completion))
-            for (prompt, completion), result in zip(requests, values, strict=True)
-        ]
+        return [sum(result) for result in values]
 
     def _reference_scores(self, pairs: Sequence[PreferenceExample]) -> list[float]:
         """Score preference completions under the fixed reference policy."""
@@ -438,26 +454,19 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = self._reference_scores(pairs)
         referenced = time.perf_counter()
-        forward = call(
+        update = run_update(
             self._training_client,
-            "forward_backward_custom",
+            DPOObjective(reference, self.args.beta),
             datums,
-            _loss_fn(reference, self.args.beta),
-        )
-        forwarded = time.perf_counter()
-        optim = call(
-            self._training_client,
-            "optim_step",
             optimizer_params(self.args, trio.AdamParams),
         )
-        optimized = time.perf_counter()
-        metrics = self._metrics(forward, optim)
+        metrics = self._metrics(update.forward, update.optimizer)
         metrics.update({
             "data/tokens": sum(datum.model_input.length for datum in datums),
             "time/prepare": prepared - started,
             "time/reference": referenced - prepared,
-            "time/forward_backward": forwarded - referenced,
-            "time/optim": optimized - forwarded,
+            "time/forward_backward": update.forward_seconds,
+            "time/optim": update.optimizer_seconds,
         })
         return self._finish_step(metrics, len(pairs), started)
 
@@ -470,24 +479,19 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = await self._reference_scores_async(pairs)
         referenced = time.perf_counter()
-        forward = await call_async(
+        update = await run_update_async(
             self._training_client,
-            "forward_backward_custom",
+            DPOObjective(reference, self.args.beta),
             datums,
-            _loss_fn(reference, self.args.beta),
+            optimizer_params(self.args, trio.AdamParams),
         )
-        forwarded = time.perf_counter()
-        optim = await call_async(
-            self._training_client, "optim_step", optimizer_params(self.args, trio.AdamParams)
-        )
-        optimized = time.perf_counter()
-        metrics = self._metrics(forward, optim)
+        metrics = self._metrics(update.forward, update.optimizer)
         metrics.update({
             "data/tokens": sum(datum.model_input.length for datum in datums),
             "time/prepare": prepared - started,
             "time/reference": referenced - prepared,
-            "time/forward_backward": forwarded - referenced,
-            "time/optim": optimized - forwarded,
+            "time/forward_backward": update.forward_seconds,
+            "time/optim": update.optimizer_seconds,
         })
         self.state.global_step += 1
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
