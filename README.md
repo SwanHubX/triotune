@@ -21,9 +21,9 @@ advantage calculation, token alignment, and training-loop orchestration.
 - [Introduction](#introduction)
 - [News](#news)
 - [Installation](#installation)
-- [Quick start](#quick-start)
 - [Algorithms](#algorithms)
 - [Data contracts](#data-contracts)
+- [Token usage metrics](#token-usage-metrics)
 - [Python API](#python-api)
 - [Documentation](#documentation)
 - [Repository layout](#repository-layout)
@@ -92,36 +92,17 @@ pip install -e .
 
 The distribution name and Python import name are both `triotune`.
 
-## 🚀 Quick start
-
-The GSM8K recipe prepares a JSONL dataset and then runs the PPO trainer with
-its GRPO preset. The preparation command does not create a PyTRIO client, so it is a
-safe first check for the local environment:
-
-```bash
-# From the repository root
-bash triotune/scripts/train_grpo_gms8k.sh --prepare-only
-
-# Start training with the default YAML configuration
-bash triotune/scripts/train_grpo_gms8k.sh
-```
-
-Useful overrides include `--steps`, `--batch-size`, `--group-size`,
-`--max-examples`, and `--help`. The default configuration uses a Qwen model,
-LoRA, SwanLab logging, and the GSM8K boxed-answer reward. Change the model and
-training settings in `triotune/configs/grpo_gms8k.yaml` for your setup.
-
 ## 🔧 Support Matrix
 
 ### 🧠 Algorithms
 
-| Algorithm | Documentation | Paper | Configuration |
-| --- | --- | --- | --- |
-| **GRPO** | - | [📄 Paper](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K Example](triotune/configs/grpo_gms8k.yaml) |
-| **PPO** | - | [📄 Paper](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K Example](triotune/configs/ppo_gsm8k.yaml) |
-| **DPO** | - | [📄 Paper](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF Example](triotune/configs/dpo_rlhf.yaml) |
-| **OPD** | - |  | [🔗 DeepMath-103K Example](triotune/configs/opd_deepmath.yaml) |
-| **SFT** | - |  | [🔗 Huanhuan Chat Example](triotune/configs/sft_huanhuan.yaml) |
+| Algorithm | Documentation | Paper |
+| --- | --- | --- |
+| **GRPO** | - | [📄 Paper](https://arxiv.org/abs/2402.03300) |
+| **PPO** | - | [📄 Paper](https://arxiv.org/abs/1707.06347) |
+| **DPO** | - | [📄 Paper](https://arxiv.org/abs/2305.18290) |
+| **OPD** | - |  |
+| **SFT** | - |  |
 
 ### 📖 Models
 
@@ -147,8 +128,29 @@ Algorithm-specific fields are:
   `input_ids` (optionally with `labels`);
 - **OPD:** prompt rows; the teacher scores the student's sampled completion.
 
-See the [trainer guide](triotune/trainer/README.md) and [script guide](triotune/scripts/README.md)
-for validation rules and complete JSONL examples.
+See the [trainer guide](triotune/trainer/README.md) for validation rules and
+complete JSONL examples.
+
+## Token usage metrics
+
+Trainer-backed SwanLab runs report the tokens submitted to training compute as
+`usage/train_tokens` and its running total as `usage/train_tokens_total`.
+Sampling workflows additionally report `usage/sample_input_tokens`,
+`usage/sample_output_tokens`, and their `_total` counterparts. Training usage
+counts every actual remote training pass, including repeated PPO epochs and
+minibatches. Sampling usage uses PyTRIO's response counters when available and
+falls back to the tokenized prompt and returned sequences for compatible test
+or older clients.
+
+`usage/sample_input_tokens` is intentionally not labeled as either prefill or
+cache usage. Prefix-cache hits are decided inside the serving system after
+request routing: they depend on the selected replica, the prefixes currently
+resident in that replica's cache, partial-prefix matching, and cache eviction.
+The client sends the same prompt tokens whether they are recomputed or served
+from cache, so prompt length alone cannot recover that split. PyTRIO 0.2.9
+returns aggregate sampling input/output tokens but no cached-input or
+uncached-prefill counters. Triotune therefore does not guess the split or
+calculate a monetary cost from a hard-coded model price table.
 
 ## 🐍 Python API
 
@@ -179,10 +181,10 @@ asyncio.run(trainer.train())
 
 ```text
 triotune/
-├── configs/       # YAML configurations for the built-in workflows
-├── recipes/       # Trainer-based and standalone PyTRIO examples
-├── scripts/       # Shell launchers and dataset preparation guides
-└── trainer/       # Trainers plus shared config, dataset, and client contracts
+├── api/           # Public configuration and client contracts
+├── dataset/       # Shared validation and tokenization
+├── trainer/       # Algorithm trainers and components
+└── utils/         # Shared runtime utilities
 ```
 
 ## 🎯 Current scope
@@ -190,6 +192,6 @@ triotune/
 Triotune currently targets text-only, PyTRIO-backed experiments. It does not
 claim to provide a Web UI, Megatron integration, multimodal training, or a
 universal plugin/registry system. If you need a custom model module, first
-adapt it to the public PyTRIO client contract and use the existing recipe or
-trainer interfaces; first-class custom-module registration is planned work,
+adapt it to the public PyTRIO client contract and use the existing trainer
+interfaces; first-class custom-module registration is planned work,
 not a supported promise of version 0.1.2.

@@ -31,8 +31,9 @@ triotune/
     ├── opd_trainer.py   # OPD 训练编排
     ├── rl_trainer.py    # PPO-family 训练编排
     ├── dpo/
-    │   ├── state.py
-    │   └── loss.py
+    │   ├── state.py          # trainer 状态与 step 结果
+    │   ├── datum.py          # 偏好 completion 的因果对齐与 mask
+    │   └── loss.py           # 成对 DPO 目标、隐式奖励与评估指标
     ├── sft/
     │   └── state.py
     ├── opd/
@@ -42,8 +43,7 @@ triotune/
     │   ├── teacher_phase.py  # 路由固定 teacher 并聚合 token score
     │   ├── loss.py           # sampled reverse-KL 信号与远端 surrogate
     │   ├── datum.py          # next-token 对齐与 prompt mask
-    │   ├── targets.py        # teacher score 到训练 target 的转换
-    │   └── metrics.py        # OPD 指标归约
+    │   └── targets.py        # teacher score 到训练 target 的转换
     └── ppo/                  # PPO-family 算法组件
 ```
 
@@ -61,13 +61,13 @@ triotune/
 | [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
 | [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |
 | [评分公共实现](../utils/scoring.py) | 通过 sampling client 为固定 completion 计算 token logprob，并统一校验完整序列与 completion 的位置对齐；DPO、OPD 和 PPO 可复用。 |
-| [DPO 编排](./dpo_trainer.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理，并负责 Datum、固定参考评分、远端反向；损失模块实现成对目标与算法指标。 |
+| [DPO 编排](./dpo_trainer.py)、[Datum](./dpo/datum.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理并负责固定参考评分与远端更新；算法模块分别实现偏好 completion 的因果对齐、成对目标和训练／评估指标。 |
 | [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
-| [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target、loss 与 metric 阶段。 |
+| [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、指标归约、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target 与 loss 阶段。 |
 | [PPO-family 编排](./rl_trainer.py)、[算法组件](./ppo/) | 组织 rollout、reference/value、冻结目标、actor/critic 并发更新、checkpoint 和日志生命周期；包括 GRPO 预设。 |
 | [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；路由组内的固定 teacher 给同一 token 序列评分，并聚合为加权几何 ensemble。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
 | [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
-| [OPD contracts](./opd/contracts.py)、[metrics](./opd/metrics.py) | 隔离 SDK response、校验阶段间数据，并以 completion token 为分母归约蒸馏指标；验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
+| [OPD contracts](./opd/contracts.py) | 隔离 SDK response 并校验阶段间数据；OPD trainer 以 completion token 为分母归约蒸馏指标，验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
 
 ```text
 dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
@@ -286,43 +286,5 @@ trainer = OPDTrainer(
     teacher_groups=groups,
     args=OPDConfig(batch_size=2, max_steps=100),
     train_dataset=rows,
-)
-```
-
-group 权重保持未归一化：loss 使用
-`Σj wj log p_teacher_j - (Σj wj) log p_behavior`，而 teacher logprob 指标使用
-归一化后的加权均值，便于比较不同权重规模的实验。
-
-`OPDConfig.importance_ratio_cap` 默认为 `5.0`。它通过 CISPO 使用
-`detach(clamp(exp(log p_current - log p_behavior), 0, cap))` 作为
-score-function 系数；设为 `None` 可恢复原来的 unbounded
-`importance_sampling`，用于兼容或消融实验。
-
-研究代码也可以只替换一个执行阶段：
-
-```python
-from dataclasses import replace
-
-from triotune.trainer.opd import OPDExecutionPlan, OPDTeacherPhase
-
-
-class ExperimentalTeacherPhase(OPDTeacherPhase):
-    async def score(self, **kwargs):
-        target = await super().score(**kwargs)
-        # Apply an experimental target transformation here.
-        return target
-
-
-config = OPDConfig(batch_size=4, max_steps=100)
-plan = replace(
-    OPDExecutionPlan.from_config(config),
-    teacher_phase=ExperimentalTeacherPhase(),
-)
-trainer = OPDTrainer(
-    model="student-base-model-id",
-    teacher_model="teacher-base-model-id",
-    args=config,
-    execution_plan=plan,
-    train_dataset=prompt_rows,
 )
 ```

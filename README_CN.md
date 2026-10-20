@@ -19,9 +19,9 @@ cookbook。名称中的 **Trio** 来自 PyTRIO，**tune** 参考了 Torchtune。
 - [项目简介](#项目简介)
 - [近期动态](#近期动态)
 - [安装](#安装)
-- [快速开始](#快速开始)
 - [算法](#算法)
 - [数据契约](#数据契约)
+- [Token 用量指标](#token-用量指标)
 - [Python API](#python-api)
 - [文档](#文档)
 - [仓库结构](#仓库结构)
@@ -87,35 +87,17 @@ pip install -e .
 
 发行包名称和 Python 导入名称均为 `triotune`。
 
-## 🚀 快速开始
-
-GSM8K 案例会准备 JSONL 数据集，然后使用 PPO trainer 的 GRPO 预设。准备阶段不会创建
-PyTRIO 客户端，适合作为本地环境的第一步检查：
-
-```bash
-# 在仓库根目录执行
-bash triotune/scripts/train_grpo_gms8k.sh --prepare-only
-
-# 使用默认 YAML 配置启动训练
-bash triotune/scripts/train_grpo_gms8k.sh
-```
-
-常用覆盖参数包括 `--steps`、`--batch-size`、`--group-size`、
-`--max-examples` 和 `--help`。默认配置使用 Qwen 模型、LoRA、SwanLab 记录，
-以及 GSM8K 的 boxed-answer reward。请根据实际环境修改
-`triotune/configs/grpo_gms8k.yaml` 中的模型和训练配置。
-
 ## 🔧 支持矩阵
 
 ### 🧠 算法
 
-| 算法 | 文档 | 论文 | 配置 |
-| --- | --- | --- | --- |
-| **GRPO** | - | [📄 论文](https://arxiv.org/abs/2402.03300) | [🔗 GSM8K 示例](triotune/configs/grpo_gms8k.yaml) |
-| **PPO** | - | [📄 论文](https://arxiv.org/abs/1707.06347) | [🔗 GSM8K 示例](triotune/configs/ppo_gsm8k.yaml) |
-| **DPO** | - | [📄 论文](https://arxiv.org/abs/2305.18290) | [🔗 HH-RLHF 示例](triotune/configs/dpo_rlhf.yaml) |
-| **OPD** | - |  | [🔗 DeepMath-103K 示例](triotune/configs/opd_deepmath.yaml) |
-| **SFT** | - |  | [🔗 嬛嬛对话示例](triotune/configs/sft_huanhuan.yaml) |
+| 算法 | 文档 | 论文 |
+| --- | --- | --- |
+| **GRPO** | - | [📄 论文](https://arxiv.org/abs/2402.03300) |
+| **PPO** | - | [📄 论文](https://arxiv.org/abs/1707.06347) |
+| **DPO** | - | [📄 论文](https://arxiv.org/abs/2305.18290) |
+| **OPD** | - |  |
+| **SFT** | - |  |
 
 ### 📖 模型
 
@@ -142,8 +124,24 @@ PyTRIO 当前支持以下模型：
 - **OPD：** prompt 行，教师会对学生采样的 completion 打分。
 
 字段校验规则和完整 JSONL 示例见
-[trainer 说明](triotune/trainer/README.md) 与
-[脚本说明](triotune/scripts/README.md)。
+[trainer 说明](triotune/trainer/README.md)。
+
+## Token 用量指标
+
+使用 trainer 的 SwanLab run 会通过 `usage/train_tokens` 记录本步提交给训练计算的
+token 数，并通过 `usage/train_tokens_total` 记录累计值。包含采样的流程还会记录
+`usage/sample_input_tokens`、`usage/sample_output_tokens` 及各自的 `_total`
+累计值。训练用量按实际发生的远端计算逐次累加，因此 PPO 重复执行的 epoch、
+minibatch 也会分别计入。采样用量优先采用 PyTRIO 响应中的计数；对于兼容的测试
+客户端或旧响应格式，才根据已经 tokenized 的 prompt 和返回序列计算。
+
+`usage/sample_input_tokens` 不会标成 prefill 或 cache token。前缀缓存是否命中是在
+服务端完成请求路由后决定的，取决于请求被分配到哪个副本、该副本当时驻留的缓存
+前缀、是否只命中部分前缀，以及缓存是否已被淘汰。对客户端而言，无论服务端重新
+计算还是命中缓存，发送的 prompt token 完全相同，所以仅根据 prompt 长度无法还原
+两者的实际拆分。PyTRIO 0.2.9 的采样响应只提供汇总的输入和输出 token 数，没有
+cached-input 或 uncached-prefill 计数。因此 Triotune 不猜测这两个数，也不维护按
+模型硬编码的单价表来计算费用。
 
 ## 🐍 Python API
 
@@ -174,15 +172,15 @@ asyncio.run(trainer.train())
 
 ```text
 triotune/
-├── configs/       # 内置流程的 YAML 配置
-├── recipes/       # trainer 版本和独立 PyTRIO 案例
-├── scripts/       # 启动脚本和数据准备说明
-└── trainer/       # trainer 及公共配置、数据和 client 契约
+├── api/           # 公共配置与 client 契约
+├── dataset/       # 共享数据校验与分词
+├── trainer/       # 算法 trainer 与组件
+└── utils/         # 公共运行时工具
 ```
 
 ## 🎯 当前范围
 
 Triotune 当前聚焦于纯文本、基于 PyTRIO 的实验。项目不宣称提供 Web UI、
 Megatron 集成、多模态训练，也不提供通用的插件/注册表系统。如果需要使用
-自定义模型模块，请先让它适配 PyTRIO 的公共客户端契约，再使用现有 recipe
-或 trainer 接口；“任意自定义模块注册”是后续工作，不是 0.1.2 已支持的能力。
+自定义模型模块，请先让它适配 PyTRIO 的公共客户端契约，再使用现有 trainer
+接口；“任意自定义模块注册”是后续工作，不是 0.1.2 已支持的能力。

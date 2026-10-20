@@ -4,8 +4,8 @@
 
 | 运行 | 本地日志目录 | 入口 |
 | --- | --- | --- |
-| A：框架版 | `swanlog/run-20261010_115950-prvgeouh` | [opd_deepmath_trio.py](../triotune/recipes/opd_deepmath_trio.py) |
-| B：独立版 | `triotune/recipes/swanlog/run-20261010_115926-y6ez99w4` | [opd_async.py](../triotune/recipes/opd_async.py) |
+| A：框架版 | `swanlog/run-20261010_115950-prvgeouh` | `opd_deepmath_trio.py` |
+| B：独立版 | `triotune/recipes/swanlog/run-20261010_115926-y6ez99w4` | `opd_async.py` |
 
 ## 配置与完成情况
 

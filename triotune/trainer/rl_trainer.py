@@ -23,10 +23,11 @@ from ..api.cli_args import PPOConfig
 from ..api.client_api import call_async
 from ..utils.checkpoint import save_checkpoint_async
 from ..utils.metrics import MetricsAPI
+from ..utils.reporting import isolated_metrics as critic_metrics
+from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
 from .ppo.contracts import PPOState, Trajectory
 from .ppo.critic import Critic, PyTRIOCritic
-from ..utils.reporting import isolated_metrics as critic_metrics
 from .ppo.rollout import (
     filter_informative_groups,
     gather_cancel_on_error,
@@ -110,6 +111,8 @@ class PPOTrainer:
         self._sampling = None
         self._next_group = 0
         self._metrics = None
+        self._sample_input_tokens = 0
+        self._sample_output_tokens = 0
         self.state = PPOState()
 
     # ------------------------------------------------------------------
@@ -238,6 +241,9 @@ class PPOTrainer:
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
         await self.initialize()
+        initial_train_tokens = self._actor.train_tokens + int(
+            getattr(self.critic, "train_tokens", 0)
+        )
         start = time.perf_counter()
         await self._references(trajectories)
         if self.critic is not None:
@@ -271,6 +277,10 @@ class PPOTrainer:
             )
             self._sampling = None
         self.state.global_step += 1
+        total_train_tokens = self._actor.train_tokens + int(
+            getattr(self.critic, "train_tokens", 0)
+        )
+        train_tokens = total_train_tokens - initial_train_tokens
         rewards = [t.reward for t in trajectories]
         metrics.update(
             {
@@ -281,6 +291,8 @@ class PPOTrainer:
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
                 "train/learning_rate": self.args.learning_rate,
+                "usage/train_tokens": float(train_tokens),
+                "usage/train_tokens_total": float(total_train_tokens),
                 "time/prepare": prepared_at - start,
                 "time/update": time.perf_counter() - prepared_at,
             }
@@ -351,6 +363,7 @@ class PPOTrainer:
                 self.reward_fn,
                 self.args,
                 first_group=self._next_group,
+                sample_usage_callback=self._record_sample_usage,
             )
             self._next_group += len(source)
             if self.args.dynamic_sampling:
@@ -363,6 +376,12 @@ class PPOTrainer:
                     "Dynamic sampling found too many consecutive uninformative batches."
                 )
         return accepted
+
+    def _record_sample_usage(self, usage: SampleTokens) -> None:
+        """Accumulate authoritative PyTRIO sampling usage across refill calls."""
+
+        self._sample_input_tokens += usage.input_tokens
+        self._sample_output_tokens += usage.output_tokens
 
     async def train(self) -> PPOState:
         """Collect rollout batches until ``max_steps`` and return final state."""
@@ -378,11 +397,33 @@ class PPOTrainer:
                 or self.state.global_step < self.args.max_steps
             ):
                 start = time.perf_counter()
+                initial_sample_input = self._sample_input_tokens
+                initial_sample_output = self._sample_output_tokens
                 trajectories = await self._collect(rows)
                 rollout_time = time.perf_counter() - start
                 if not trajectories:
                     break
                 await self.step(trajectories)
+                sample_metrics = {
+                    "usage/sample_input_tokens": float(
+                        self._sample_input_tokens - initial_sample_input
+                    ),
+                    "usage/sample_output_tokens": float(
+                        self._sample_output_tokens - initial_sample_output
+                    ),
+                    "usage/sample_input_tokens_total": float(
+                        self._sample_input_tokens
+                    ),
+                    "usage/sample_output_tokens_total": float(
+                        self._sample_output_tokens
+                    ),
+                }
+                self.state.metrics.update(
+                    self._metrics.publish(
+                        sample_metrics,
+                        step=self.state.global_step,
+                    )
+                )
                 self.state.metrics.update(
                     self._metrics.publish(
                         {

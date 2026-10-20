@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from triotune.trainer import DPOConfig, DPOTrainer
 from triotune.trainer.dpo.loss import make_loss_fn as _loss_fn
-from triotune.trainer.dpo_trainer import _datum, _reference_logprob
+from triotune.trainer.dpo.datum import build_dpo_datum
 
 
 class _Tokenizer:
@@ -284,7 +284,10 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertNotIn("loss_mean", metrics)
         self.assertNotIn("scalar/loss_mean", metrics)
         payload = self.run.logs[0][0]
-        self.assertEqual({name.split("/", 1)[0] for name in payload}, {"train", "reward", "time"})
+        self.assertEqual(
+            {name.split("/", 1)[0] for name in payload},
+            {"train", "reward", "time", "usage"},
+        )
         self.assertEqual(payload["train/loss"], 0.5)
         self.assertEqual(payload["reward/accuracy"], 1.0)
         self.assertEqual(payload["reward/margin"], 0.3)
@@ -295,6 +298,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(payload["train/backend_token_count"], 4)
         self.assertEqual(payload["train/step"], 1)
         self.assertEqual(payload["train/pairs"], 1)
+        self.assertEqual(payload["usage/train_tokens"], 4)
+        self.assertEqual(payload["usage/train_tokens_total"], 4)
         self.assertNotIn("loss_sum", payload)
         for key in ("time/prepare", "time/reference", "time/forward_backward", "time/optim", "time/save"):
             self.assertGreaterEqual(metrics[key], 0)
@@ -369,10 +374,14 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual((sample.caption, sample.content), ("P", "generated answer"))
         self.assertEqual(self.service.training.sampler.requests[0][0], [80])
         self.assertEqual(
-            {name.split("/", 1)[0] for name in self.run.logs[-1][0]}, {"train", "time"}
+            {name.split("/", 1)[0] for name in self.run.logs[-1][0]},
+            {"train", "time", "usage"},
         )
         self.assertEqual(state.metrics["data/total_tokens"], 4)
         self.assertEqual(state.metrics["data/total_pairs"], 1)
+        self.assertEqual(state.metrics["usage/train_tokens_total"], 4)
+        self.assertEqual(state.metrics["usage/sample_input_tokens_total"], 1)
+        self.assertEqual(state.metrics["usage/sample_output_tokens_total"], 2)
         self.assertGreater(state.metrics["time/train_runtime"], 0)
         self.assertGreater(state.metrics["time/train_steps_per_second"], 0)
         self.assertGreater(state.metrics["time/train_pairs_per_second"], 0)
@@ -386,7 +395,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertIn("time/save", result.metrics)
         self.assertNotIn("loss_mean", result.metrics)
         self.assertEqual(
-            {name.split("/", 1)[0] for name in self.run.logs[0][0]}, {"train", "reward", "time"}
+            {name.split("/", 1)[0] for name in self.run.logs[0][0]},
+            {"train", "reward", "time", "usage"},
         )
 
     def test_async_train_saves_final_checkpoint(self) -> None:
@@ -444,7 +454,10 @@ class DPOTrainerTests(unittest.TestCase):
     def test_pairwise_loss_and_completion_gradients(self) -> None:
         import torch
 
-        datums = [_datum([10, 11], [12]), _datum([10, 11], [13])]
+        datums = [
+            build_dpo_datum([10, 11], [12]),
+            build_dpo_datum([10, 11], [13]),
+        ]
         chosen = torch.tensor([0.0, -0.5], requires_grad=True)
         rejected = torch.tensor([0.0, -1.0], requires_grad=True)
         loss, metrics = _loss_fn([-0.5, -1.0], 0.1)(datums, [chosen, rejected])
@@ -455,15 +468,8 @@ class DPOTrainerTests(unittest.TestCase):
         self.assertEqual(chosen.grad[0].item(), 0.0)
         self.assertEqual(metrics["reward/margin"], 0.0)
 
-    def test_reference_logprobs_require_complete_finite_response(self) -> None:
-        self.assertAlmostEqual(_reference_logprob([None, -1.0, -2.0], 1, 3), -3.0)
-        with self.assertRaisesRegex(ValueError, "wrong number"):
-            _reference_logprob([None], 1, 3)
-        with self.assertRaisesRegex(ValueError, "missing"):
-            _reference_logprob([None, -1.0, None], 1, 3)
-
     def test_datum_masks_prompt_and_shifts_completion(self) -> None:
-        datum = _datum([10, 11], [12, 13])
+        datum = build_dpo_datum([10, 11], [12, 13])
         self.assertEqual(datum.model_input.to_ints(), [10, 11, 12])
         self.assertEqual(datum.loss_fn_inputs["target_tokens"].data, [-100, 12, 13])
 

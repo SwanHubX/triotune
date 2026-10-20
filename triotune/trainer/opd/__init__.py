@@ -25,7 +25,6 @@ from .contracts import (
 from .datum import build_opd_datum
 from .execution import OPDExecutionPlan
 from .loss import SampledReverseKLLoss, distillation_advantages
-from .metrics import OPDMetricReducer, OPDMetricTotals
 from .rollout import OPDRolloutPhase
 from .targets import OPDTargetBuilder
 from .teacher_phase import (
@@ -57,8 +56,6 @@ sys.modules[f"{__name__}.state"] = sys.modules[f"{__name__}.contracts"]
 __all__ = [
     "OPDConfig",
     "OPDExecutionPlan",
-    "OPDMetricReducer",
-    "OPDMetricTotals",
     "OPDPrompt",
     "OPDResult",
     "OPDRollout",

@@ -8,6 +8,64 @@ from typing import Any
 from ...api.client_api import call, call_async
 
 
+def _pair_rewards(
+    policy_chosen: Any,
+    policy_rejected: Any,
+    reference_chosen: Any,
+    reference_rejected: Any,
+    beta: float,
+) -> tuple[Any, Any, Any]:
+    """Return chosen/rejected implicit rewards and their pairwise margin."""
+
+    chosen = beta * (policy_chosen - reference_chosen)
+    rejected = beta * (policy_rejected - reference_rejected)
+    return chosen, rejected, chosen - rejected
+
+
+def dpo_evaluation_metrics(
+    policy_scores: Sequence[float],
+    reference_scores: Sequence[float],
+    *,
+    beta: float,
+) -> dict[str, float]:
+    """Evaluate the same pairwise DPO objective without tensor gradients."""
+
+    policy = tuple(float(value) for value in policy_scores)
+    reference = tuple(float(value) for value in reference_scores)
+    if not policy or len(policy) != len(reference) or len(policy) % 2:
+        raise ValueError("DPO evaluation scores must contain aligned pairs.")
+    if any(not math.isfinite(value) for value in policy + reference):
+        raise ValueError("DPO evaluation scores must be finite.")
+    if not math.isfinite(float(beta)) or beta <= 0:
+        raise ValueError("DPO beta must be finite and positive.")
+
+    losses = []
+    margins = []
+    chosen_rewards = []
+    rejected_rewards = []
+    for index in range(0, len(policy), 2):
+        chosen, rejected, margin = _pair_rewards(
+            policy[index],
+            policy[index + 1],
+            reference[index],
+            reference[index + 1],
+            float(beta),
+        )
+        losses.append(max(-margin, 0.0) + math.log1p(math.exp(-abs(margin))))
+        margins.append(margin)
+        chosen_rewards.append(chosen)
+        rejected_rewards.append(rejected)
+    count = len(losses)
+    return {
+        "eval/loss": sum(losses) / count,
+        "eval/reward_accuracy": sum(margin > 0 for margin in margins) / count,
+        "eval/reward_margin": sum(margins) / count,
+        "eval/reward_chosen": sum(chosen_rewards) / count,
+        "eval/reward_rejected": sum(rejected_rewards) / count,
+        "eval/pairs": float(count),
+    }
+
+
 def make_loss_fn(reference: Sequence[float], beta: float):
     """Return PyTRIO's local custom-loss callback for ordered chosen/rejected pairs."""
 
@@ -28,9 +86,13 @@ def make_loss_fn(reference: Sequence[float], beta: float):
         policy_rejected = torch.stack(scores[1::2])
         reference_chosen = policy_chosen.new_tensor(reference[::2])
         reference_rejected = policy_chosen.new_tensor(reference[1::2])
-        chosen_rewards = beta * (policy_chosen - reference_chosen)
-        rejected_rewards = beta * (policy_rejected - reference_rejected)
-        margins = chosen_rewards - rejected_rewards
+        chosen_rewards, rejected_rewards, margins = _pair_rewards(
+            policy_chosen,
+            policy_rejected,
+            reference_chosen,
+            reference_rejected,
+            beta,
+        )
         objective = F.softplus(-margins).mean()
         metrics = {
             "train/loss": objective.item(),
@@ -87,4 +149,4 @@ class DPOObjective:
         )
 
 
-__all__ = ["DPOObjective", "make_loss_fn"]
+__all__ = ["DPOObjective", "dpo_evaluation_metrics", "make_loss_fn"]

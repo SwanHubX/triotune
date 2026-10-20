@@ -486,6 +486,12 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metrics["reward/mean"], 0.5)
         self.assertNotEqual(result.metrics["train/loss"], 999.0)
         self.assertEqual(result.metrics["train/action_tokens"], 8)
+        self.assertEqual(result.metrics["usage/train_tokens"], 12)
+        self.assertEqual(result.metrics["usage/train_tokens_total"], 24)
+        self.assertEqual(result.metrics["usage/sample_input_tokens"], 4)
+        self.assertEqual(result.metrics["usage/sample_output_tokens"], 8)
+        self.assertEqual(result.metrics["usage/sample_input_tokens_total"], 8)
+        self.assertEqual(result.metrics["usage/sample_output_tokens_total"], 16)
         sequence = [
             event for event in client.trace if "custom" in event or "optim" in event
         ]

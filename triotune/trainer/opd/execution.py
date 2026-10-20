@@ -10,7 +10,6 @@ from typing import Any, Protocol
 from ...api.loss_api import Objective
 from .contracts import OPDPrompt, OPDRollout, OPDTeacherTarget, OPDTrainingSample
 from .loss import SampledReverseKLLoss
-from .metrics import OPDMetricReducer
 from .rollout import OPDRolloutPhase
 from .targets import OPDTargetBuilder
 from .teacher_phase import OPDTeacherPhase
@@ -78,7 +77,6 @@ class OPDExecutionPlan:
     teacher_phase: TeacherPhase
     target_builder: TargetBuilder
     objective: Objective
-    metrics: OPDMetricReducer
 
     def __post_init__(self) -> None:
         # Protocol annotations aid static typing, while this small runtime check
@@ -88,9 +86,6 @@ class OPDExecutionPlan:
             (self.teacher_phase, "score"),
             (self.target_builder, "build"),
             (self.objective, "forward_backward_async"),
-            (self.metrics, "training"),
-            (self.metrics, "evaluation"),
-            (self.metrics, "evaluation_totals"),
         )
         for component, method in required:
             if not callable(getattr(component, method, None)):
@@ -112,7 +107,6 @@ class OPDExecutionPlan:
             teacher_phase=OPDTeacherPhase(),
             target_builder=OPDTargetBuilder(loss),
             objective=loss.objective,
-            metrics=OPDMetricReducer(),
         )
 
     async def materialize(

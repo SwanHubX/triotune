@@ -17,6 +17,7 @@ from ..api.loss_api import BuiltinPyTrioObjective, LossSpec, SupervisedLossInput
 from ..dataset import SupervisedExample, prepare_sft
 from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.token_usage import compute_train_tokens
 from .sft.state import SFTState
 
 
@@ -59,6 +60,7 @@ class SFTTrainer:
         self._objective = BuiltinPyTrioObjective(LossSpec("cross_entropy"))
         self.state = SFTState()
         self._last_eval_step: int | None = None
+        self._train_tokens = 0
         self._metrics_api = MetricsAPI.from_config(
             self.args,
             default_name=f"{self.model.rsplit('/', 1)[-1]}-sft",
@@ -190,6 +192,7 @@ class SFTTrainer:
             raise ValueError("An SFT step requires at least one row.")
         started = time.perf_counter()
         examples, datums = self._prepare_datums(rows)
+        train_tokens = compute_train_tokens(datums)
 
         # Await submission only; result resolution happens in collect(). The
         # PyTRIO client preserves FB -> optim -> save request ordering.
@@ -221,6 +224,7 @@ class SFTTrainer:
             # Results may arrive out of order; publish state/logs in batch order.
             if previous is not None:
                 await previous
+            self._train_tokens += train_tokens
             metrics = {
                 str(key): float(value)
                 for result in (forward, optim)
@@ -234,6 +238,8 @@ class SFTTrainer:
                 {
                     "train/tokens": float(token_count),
                     "train/learning_rate": self.args.learning_rate,
+                    "usage/train_tokens": float(train_tokens),
+                    "usage/train_tokens_total": float(self._train_tokens),
                     "time/request_latency": latency,
                     "time/step": now
                     - (clock[1] if clock is not None else started),

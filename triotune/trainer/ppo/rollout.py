@@ -14,6 +14,10 @@ import pytrio as trio
 
 from ...api.client_api import call_async
 from ...dataset import prepare_prompt
+from ...utils.token_usage import (
+    SampleUsageCallback,
+    compute_sample_tokens,
+)
 from .contracts import Trajectory
 
 
@@ -30,7 +34,14 @@ async def gather_cancel_on_error(coroutines):
 
 
 async def generate_rollouts(
-    client, tokenizer, rows, reward_fn, config, *, first_group: int
+    client,
+    tokenizer,
+    rows,
+    reward_fn,
+    config,
+    *,
+    first_group: int,
+    sample_usage_callback: SampleUsageCallback | None = None,
 ):
     """Sample prompt groups and convert responses into validated trajectories.
 
@@ -62,6 +73,10 @@ async def generate_rollouts(
                 seed=None if config.seed is None else config.seed + index,
             ),
         )
+        if sample_usage_callback is not None:
+            sample_usage_callback(
+                compute_sample_tokens(result, prompt_tokens=len(prompt.tokens))
+            )
         if len(result.sequences) != config.num_generations:
             raise ValueError("Sampler returned an unexpected number of responses.")
         trajectories = []

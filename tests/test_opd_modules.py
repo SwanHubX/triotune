@@ -8,7 +8,6 @@ from triotune.dataset import PromptExample
 from triotune.trainer import OPDConfig
 from triotune.trainer.opd import (
     OPDExecutionPlan,
-    OPDMetricReducer,
     OPDRollout,
     OPDTargetBuilder,
     OPDTeacherGroup,
@@ -16,7 +15,7 @@ from triotune.trainer.opd import (
     OPDTeacherTarget,
     SampledReverseKLLoss,
 )
-from triotune.trainer.opd.metrics import OPDMetricTotals
+from triotune.trainer.opd_trainer import _OPDMetricReducer, _OPDMetricTotals
 
 
 class _RolloutPhase:
@@ -98,7 +97,6 @@ class OPDModuleTests(unittest.TestCase):
             teacher_phase=teacher,
             target_builder=OPDTargetBuilder(loss),
             objective=loss.objective,
-            metrics=OPDMetricReducer(),
         )
         prompts = [PromptExample(str(index), [index]) for index in (10, 11, 12)]
         config = SimpleNamespace(
@@ -131,9 +129,9 @@ class OPDModuleTests(unittest.TestCase):
         rollout = OPDRollout([1], [2], [-2.0], 0, 0, 0)
         target = OPDTeacherTarget(rollout, [-1.0])
         sample = OPDTargetBuilder(SampledReverseKLLoss()).build(target)
-        reducer = OPDMetricReducer()
+        reducer = _OPDMetricReducer()
         direct = reducer.evaluation([sample, sample], prompt_count=2)
-        totals = OPDMetricTotals()
+        totals = _OPDMetricTotals()
         totals.add([sample], prompt_count=1)
         totals.add([sample], prompt_count=1)
 

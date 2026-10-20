@@ -17,6 +17,7 @@ import numpy as np
 from ...api.client_api import call_async, optimizer_params
 from ...utils.checkpoint import save_checkpoint_async
 from ...utils.datums import materialize_datum
+from ...utils.token_usage import compute_train_tokens
 from .contracts import Trajectory
 from .datum import IGNORE_INDEX
 
@@ -205,6 +206,7 @@ class PyTRIOCritic:
         self.metrics = metrics
         self.global_step = 0
         self.optimizer_steps = 0
+        self.train_tokens = 0
         self.checkpoint_path = None
 
     async def compute_values(self, trajectories):
@@ -216,13 +218,15 @@ class PyTRIOCritic:
             raise ValueError("critic_n_minibatches must not exceed trajectory count.")
         for t in trajectories:
             t.__post_init__()
+        data = critic_datums(trajectories, self.token_ids)
         result = await call_async(
             self.client,
             "forward",
-            critic_datums(trajectories, self.token_ids),
+            data,
             loss_fn="cross_entropy",
             auto_shift=False,
         )
+        self.train_tokens += compute_train_tokens(data)
         logprobs = [
             np.asarray(output["logprobs"].tolist(), dtype=np.float64)
             for output in result.loss_fn_outputs
@@ -266,6 +270,7 @@ class PyTRIOCritic:
                 result = await call_async(
                     self.client, "forward_backward_custom", data, loss_fn=loss_fn
                 )
+                self.train_tokens += compute_train_tokens(data)
                 await call_async(
                     self.client, "optim_step", optimizer_params(self._optimizer_config)
                 )
