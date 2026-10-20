@@ -48,7 +48,7 @@ flowchart TD
 
 | 模块 | 当前职责 |
 | --- | --- |
-| [cli_args.py](../triotune/api/cli_args.py) | `PPOConfig`、`NormConfig`、算法预设、配置兼容性检查 |
+| [cli_args.py](../triotune/api/cli_args.py) | 组合 `TrainingConfig`、`OptimizerConfig`、`PPORolloutConfig`、`PPOActorConfig`、`PPOCriticConfig` 等职责模块，并提供算法预设与旧扁平参数兼容层 |
 | [contracts.py](../triotune/trainer/ppo/contracts.py) | `Trajectory`、`PreparedBatch`、`PPOState` |
 | [rollout.py](../triotune/trainer/ppo/rollout.py) | 文本采样、reward 调用、动态补采、固定 reference 评分 |
 | [advantages.py](../triotune/trainer/ppo/advantages.py) | 奖励整形、batch/group 归一化、KL reward 组合和优势归一化 |
@@ -300,7 +300,17 @@ import asyncio
 import math
 import os
 
-from triotune.trainer.ppo import PPOConfig, PPOTrainer
+from triotune.trainer import (
+    CheckpointConfig,
+    OptimizerConfig,
+    PPOActorConfig,
+    PPOConfig,
+    PPOCriticConfig,
+    PPORolloutConfig,
+    ReportingConfig,
+    TrainingConfig,
+)
+from triotune.trainer.ppo import PPOTrainer
 
 
 def reward(*, row, completion, completion_ids):
@@ -315,23 +325,30 @@ async def main():
     ]
     args = PPOConfig.for_algorithm(
         "ppo",
-        batch_size=1,
-        num_generations=2,
-        max_steps=2,
-        max_tokens=16,
-        learning_rate=1e-5,
-        critic_learning_rate=1e-4,
-        critic_lora_rank=8,
-        discount=0.99,
-        gae_lambda=0.95,
-        adv_norm=None,
-        seed=42,
-        kl_ctl=0.0,
-        loss_backend=os.getenv("PPO_TEST_BACKEND", "custom"),
-        chat_template_kwargs={"enable_thinking": False},
-        report_to="swanlab",
-        project="ppo-family-smoke",
-        run_name="ppo-two-run-smoke",
+        training=TrainingConfig(batch_size=1, max_steps=2, seed=42),
+        optimizer=OptimizerConfig(learning_rate=1e-5),
+        checkpoint=CheckpointConfig(save_every=0),
+        rollout=PPORolloutConfig(
+            num_generations=2,
+            max_tokens=16,
+            chat_template_kwargs={"enable_thinking": False},
+        ),
+        actor=PPOActorConfig(
+            discount=0.99,
+            gae_lambda=0.95,
+            adv_norm=None,
+            kl_ctl=0.0,
+            loss_backend=os.getenv("PPO_TEST_BACKEND", "custom"),
+        ),
+        critic=PPOCriticConfig(
+            lora_rank=8,
+            optimizer=OptimizerConfig(learning_rate=1e-4),
+        ),
+        reporting=ReportingConfig(
+            report_to="swanlab",
+            project="ppo-family-smoke",
+            run_name="ppo-two-run-smoke",
+        ),
     )
     state = await PPOTrainer(
         os.environ["PPO_TEST_MODEL"], args, rows, reward_fn=reward, lora_rank=8,

@@ -53,16 +53,24 @@ class DPOTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         ref_model: str | None = None,
         args: DPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
     ) -> None:
         """Create policy/reference clients and validate their token contract."""
 
+        self.args = args or DPOConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if ref_model is None and self.args.reference is not None:
+            ref_model = self.args.reference.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if ref_model is not None and (
@@ -71,7 +79,6 @@ class DPOTrainer:
             raise ValueError("ref_model must be a PyTRIO base-model ID when provided.")
         self.model = model.strip()
         self.ref_model = ref_model.strip() if ref_model is not None else self.model
-        self.args = args or DPOConfig()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self._service_client = trio.ServiceClient()

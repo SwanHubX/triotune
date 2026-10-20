@@ -182,13 +182,13 @@ class OPDTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         teacher_model: str | None = None,
         args: OPDConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
         teacher_model_path: str | None = None,
         teachers: Sequence[OPDTeacherSpec] | None = None,
         teacher_groups: Sequence[OPDTeacherGroup] | None = None,
@@ -197,6 +197,17 @@ class OPDTrainer:
     ) -> None:
         """Create clients and bind an immutable OPD algorithm execution plan."""
 
+        self.args = args or OPDConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
+        if teachers is None and self.args.teacher is not None:
+            if teacher_model is None:
+                teacher_model = self.args.teacher.name
+            if teacher_model_path is None:
+                teacher_model_path = self.args.teacher.model_path
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if (
@@ -294,7 +305,6 @@ class OPDTrainer:
         self.teacher_model_path = (
             teacher_specs[0].model_path if len(teacher_specs) == 1 else None
         )
-        self.args = args or OPDConfig()
         if execution_plan is not None and not isinstance(
             execution_plan, OPDExecutionPlan
         ):

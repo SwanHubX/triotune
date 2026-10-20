@@ -104,7 +104,10 @@ def start_run(args: Any, *, default_name: str, metadata: Mapping[str, Any]) -> A
         tags=args.tags,
         name=args.run_name or default_name,
         log_dir=args.log_dir,
-        config={**metadata, **asdict(args)},
+        # Runtime metadata describes the concrete client actually created by
+        # the trainer and therefore overrides optional experiment fields that
+        # may be omitted for legacy constructor-based configurations.
+        config={**asdict(args), **metadata},
     )
 
 

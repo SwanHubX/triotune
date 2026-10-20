@@ -51,14 +51,14 @@ class PPOTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         args: PPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         reward_fn: Callable | None = None,
         *,
         reference_model: str | None = None,
         critic: Critic | None = None,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
         training_client=None,
         critic_training_client=None,
         tokenizer=None,
@@ -70,6 +70,14 @@ class PPOTrainer:
         Clients are accepted as dependencies for tests and custom workflows;
         missing clients are created during :meth:`initialize`.
         """
+        self.args = args or PPOConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if reference_model is None and self.args.reference is not None:
+            reference_model = self.args.reference.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if reference_model is not None and (
@@ -82,10 +90,9 @@ class PPOTrainer:
             or lora_rank < 1
         ):
             raise ValueError("lora_rank must be a positive integer.")
-        self.model, self.reference_model, self.args = (
+        self.model, self.reference_model = (
             model.strip(),
             reference_model.strip() if reference_model is not None else None,
-            args or PPOConfig(),
         )
         if (
             critic is not None or critic_training_client is not None
@@ -176,7 +183,10 @@ class PPOTrainer:
         # both clients, while preserving one public actor metrics stream.
         name = self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-ppo-family"
         actor_args = (
-            replace(self.args, run_name=f"{name}-actor")
+            replace(
+                self.args,
+                reporting=replace(self.args.reporting, run_name=f"{name}-actor"),
+            )
             if self._owns_critic
             else self.args
         )

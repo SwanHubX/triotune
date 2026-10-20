@@ -159,7 +159,13 @@ The public imports are grouped by algorithm:
 ```python
 import asyncio
 
-from triotune.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import (
+    ModelConfig,
+    PPOConfig,
+    PPORolloutConfig,
+    PPOTrainer,
+    TrainingConfig,
+)
 
 rows = [
     {
@@ -169,9 +175,13 @@ rows = [
 ]
 
 trainer = PPOTrainer(
-    model="your-pytrio-model-id",
     reward_fn=your_reward_function,
-    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
+    args=PPOConfig.for_algorithm(
+        "grpo",
+        model=ModelConfig(name="your-pytrio-model-id"),
+        training=TrainingConfig(max_steps=100),
+        rollout=PPORolloutConfig(num_generations=4),
+    ),
     train_dataset=rows,
 )
 asyncio.run(trainer.train())

@@ -9,7 +9,6 @@ training clients, while both consume the same frozen rollout targets.
 
 import math
 import time
-from dataclasses import replace
 from typing import Protocol
 
 import numpy as np
@@ -200,9 +199,9 @@ class PyTRIOCritic:
             )
         ):
             raise ValueError("Critic needs two distinct positive/negative marker IDs.")
-        self._optimizer_config = replace(
-            config, learning_rate=config.critic_learning_rate or config.learning_rate
-        )
+        # The critic owns a complete optimizer module instead of inheriting all
+        # actor Adam settings except for a legacy learning-rate override.
+        self._optimizer_config = config.critic.optimizer
         self.metrics = metrics
         self.global_step = 0
         self.optimizer_steps = 0

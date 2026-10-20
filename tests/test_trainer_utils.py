@@ -53,7 +53,10 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(init.call_args.kwargs["name"], "custom")
         self.assertEqual(init.call_args.kwargs["workspace"], "team")
         self.assertEqual(init.call_args.kwargs["config"]["model"], "test")
-        self.assertEqual(init.call_args.kwargs["config"]["num_generations"], args.num_generations)
+        self.assertEqual(
+            init.call_args.kwargs["config"]["rollout"]["num_generations"],
+            args.rollout.num_generations,
+        )
         self.assertEqual(init.call_args.kwargs["tags"], ["grpo"])
 
     def test_finish_disabled_and_failed_runs(self):

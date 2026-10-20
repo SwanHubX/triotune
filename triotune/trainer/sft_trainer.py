@@ -38,19 +38,24 @@ class SFTTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         args: SFTConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
     ) -> None:
         """Create the remote training client and local pipeline state."""
 
+        self.args = args or SFTConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         self.model = model.strip()
-        self.args = args or SFTConfig()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self._client = trio.ServiceClient().create_lora_training_client(

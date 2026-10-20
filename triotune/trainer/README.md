@@ -50,7 +50,7 @@ triotune/
 | 模块 | 职责 |
 | --- | --- |
 | [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
-| [配置契约](../api/cli_args.py) | 定义 `BaseTrainerConfig` 以及 DPO、SFT、OPD、PPO 配置；GRPO 使用 `PPOConfig.for_algorithm("grpo")`。 |
+| [配置契约](../api/cli_args.py) | 按模型、训练／验证数据源、训练循环、优化器、保存、评估、日志、rollout、actor/critic、reference/teacher 等职责定义可组合配置；DPO、SFT、OPD、PPO 顶层对象可表示完整实验，同时保留依赖注入兼容性。 |
 | [客户端契约](../api/client_api.py) | 统一 TrainingClient、SamplingClient 的同步／异步调用、future 解析及 SDK 参数构造；client 刷新时机由算法决定。 |
 | [输入渲染](../dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
@@ -83,8 +83,8 @@ dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/d
 
 ```python
 # PPO-family / OPD：每行传入一个生成 prompt。
-# 字段名默认是 messages，可分别通过 PPOConfig.prompt_key 和
-# OPDConfig.prompt_key 修改。字段值支持纯文本、token ID 或聊天消息。
+# 字段名默认是 messages，可分别通过 PPOConfig.rollout.prompt_key 和
+# OPDConfig.rollout.prompt_key 修改。字段值支持纯文本、token ID 或聊天消息。
 prompt_rows = [
     {"messages": "Explain why the sky is blue."},
     {"messages": [151644, 8948, 198]},
@@ -187,13 +187,12 @@ trainer = SFTTrainer(
 ```python
 import asyncio
 
-from triotune.trainer import SFTConfig, SFTTrainer
+from triotune.trainer import EvaluationConfig, SFTConfig, SFTTrainer
 
 trainer = SFTTrainer(
     model="Qwen/Qwen3.5-4B",
     args=SFTConfig(
-        eval_steps=50,
-        eval_after_train=False,
+        evaluation=EvaluationConfig(steps=50, after_train=False),
     ),
     train_dataset=train_rows,
     eval_dataset=eval_rows,
@@ -206,12 +205,16 @@ state = asyncio.run(trainer.train())
 ```python
 import asyncio
 
-from triotune.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import PPOConfig, PPORolloutConfig, PPOTrainer, TrainingConfig
 
 trainer = PPOTrainer(
     model="Qwen/Qwen3.5-4B",
     reward_fn=my_reward,
-    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
+    args=PPOConfig.for_algorithm(
+        "grpo",
+        training=TrainingConfig(max_steps=100),
+        rollout=PPORolloutConfig(num_generations=4),
+    ),
     train_dataset=prompt_rows,
 )
 state = asyncio.run(trainer.train())
@@ -224,11 +227,19 @@ uv sync --extra dpo
 ```
 
 ```python
-from triotune.trainer import DPOConfig, DPOTrainer
+from triotune.trainer import (
+    DPOConfig,
+    DPOObjectiveConfig,
+    DPOTrainer,
+    TrainingConfig,
+)
 
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
-    args=DPOConfig(beta=0.1, batch_size=1, max_steps=1),
+    args=DPOConfig(
+        training=TrainingConfig(batch_size=1, max_steps=1),
+        objective=DPOObjectiveConfig(beta=0.1),
+    ),
     train_dataset=preference_rows,
 )
 state = trainer.train()
@@ -237,13 +248,13 @@ state = trainer.train()
 ## OPD 训练
 
 ```python
-from triotune.trainer import OPDConfig, OPDTrainer
+from triotune.trainer import OPDConfig, OPDTrainer, TrainingConfig
 
 trainer = OPDTrainer(
     model="student-base-model-id",
     teacher_model="teacher-base-model-id",
     # teacher_model_path="trio://...",  # 可选的教师 LoRA checkpoint。
-    args=OPDConfig(batch_size=4, max_steps=100),
+    args=OPDConfig(training=TrainingConfig(batch_size=4, max_steps=100)),
     train_dataset=prompt_rows,
 )
 state = trainer.train()
@@ -284,7 +295,7 @@ trainer = OPDTrainer(
     model="student-base-model-id",
     teachers=teachers,
     teacher_groups=groups,
-    args=OPDConfig(batch_size=2, max_steps=100),
+    args=OPDConfig(training=TrainingConfig(batch_size=2, max_steps=100)),
     train_dataset=rows,
 )
 ```
