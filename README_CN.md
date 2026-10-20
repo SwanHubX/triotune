@@ -55,9 +55,9 @@ SwanLab 指标记录。
 - **2026-10-12：** Triotune 0.1.0（`pytrio-cookbook`）首次发布到
   [PyPI](https://pypi.org/project/pytrio-cookbook/)。
 
-## 📦 安装
+## 🚀 开始使用
 
-### ✅ 环境要求
+### 📦 安装
 
 - Python 3.12（当前包声明 `>=3.12,<3.13`）
 - 可用的 PyTRIO 训练服务，以及该案例所使用模型的访问权限
@@ -84,8 +84,13 @@ uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-`uv sync` 会在项目目录创建 `.venv`；后续命令应通过 `uv run` 执行，以确保
-使用锁定后的项目环境。
+### 📚 快速开始
+
+通过 YAML 配置运行 GSM8K PPO 示例：
+
+```bash
+uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
+```
 
 ## 🔧 支持矩阵
 
@@ -145,37 +150,22 @@ cached-input 或 uncached-prefill 计数。因此 Triotune 不猜测这两个数
 
 ## 🐍 Python API
 
-公开入口按算法组织：
+最简 GRPO 训练流程会使用默认配置，为每个 prompt 采样 4 个回复：
 
 ```python
 import asyncio
 
-from triotune.trainer import (
-    ModelConfig,
-    PPOConfig,
-    PPORolloutConfig,
-    PPOTrainer,
-    TrainingConfig,
-)
+from triotune.trainer import PPOConfig, PPOTrainer
 
-rows = [
-    {
-        "messages": [{"role": "user", "content": "What is 2 + 2?"}],
-        "answer": "4",
-    },
-]
 
-trainer = PPOTrainer(
-    reward_fn=your_reward_function,
-    args=PPOConfig.for_algorithm(
-        "grpo",
-        model=ModelConfig(name="your-pytrio-model-id"),
-        training=TrainingConfig(max_steps=100),
-        rollout=PPORolloutConfig(num_generations=4),
-    ),
-    train_dataset=rows,
+asyncio.run(
+    PPOTrainer(
+        model="your-pytrio-model-id",
+        args=PPOConfig.for_algorithm("grpo"),
+        reward_fn=lambda row, completion, **_: float(row["answer"] in completion),
+        train_dataset=[{"messages": "What is 2 + 2?", "answer": "4"}],
+    ).train()
 )
-asyncio.run(trainer.train())
 ```
 
 ## 🗃️ 仓库结构

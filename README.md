@@ -58,9 +58,9 @@ token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
   and on-policy distillation pipelines plus YAML-based recipe configuration.
 - **2026-10-12:** Triotune 0.1.0 (`pytrio-cookbook`) was published to [PyPI](https://pypi.org/project/pytrio-cookbook/).
 
-## 📦 Installation
+## 🚀 Get Started
 
-### ✅ Requirements
+### 📦 Installation
 
 - Python 3.12 (the package currently declares `>=3.12,<3.13`)
 - Access to a PyTRIO-compatible training service and the models used by your
@@ -88,8 +88,13 @@ uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-`uv sync` creates the project-local `.venv`; subsequent commands should be run
-through `uv run` so they use the locked environment.
+### 📚 Quick Start
+
+Run the GSM8K PPO example with its YAML configuration:
+
+```bash
+uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
+```
 
 ## 🔧 Support Matrix
 
@@ -153,37 +158,22 @@ calculate a monetary cost from a hard-coded model price table.
 
 ## 🐍 Python API
 
-The public imports are grouped by algorithm:
+The minimal GRPO training loop uses the default four generations per prompt:
 
 ```python
 import asyncio
 
-from triotune.trainer import (
-    ModelConfig,
-    PPOConfig,
-    PPORolloutConfig,
-    PPOTrainer,
-    TrainingConfig,
-)
+from triotune.trainer import PPOConfig, PPOTrainer
 
-rows = [
-    {
-        "messages": [{"role": "user", "content": "What is 2 + 2?"}],
-        "answer": "4",
-    },
-]
 
-trainer = PPOTrainer(
-    reward_fn=your_reward_function,
-    args=PPOConfig.for_algorithm(
-        "grpo",
-        model=ModelConfig(name="your-pytrio-model-id"),
-        training=TrainingConfig(max_steps=100),
-        rollout=PPORolloutConfig(num_generations=4),
-    ),
-    train_dataset=rows,
+asyncio.run(
+    PPOTrainer(
+        model="your-pytrio-model-id",
+        args=PPOConfig.for_algorithm("grpo"),
+        reward_fn=lambda row, completion, **_: float(row["answer"] in completion),
+        train_dataset=[{"messages": "What is 2 + 2?", "answer": "4"}],
+    ).train()
 )
-asyncio.run(trainer.train())
 ```
 
 ## 🗃️ Repository layout

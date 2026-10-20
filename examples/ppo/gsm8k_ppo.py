@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    uv run python examples/ppo/gsm8k_ppo.py
+    uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from triotune.utils.config import load_yaml_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = Path(__file__).with_name("gsm8k_ppo_args.yaml")
 BOXED_ANSWER = re.compile(r"\\boxed\{([^{}]+)\}")
 
 
@@ -48,13 +47,17 @@ def resolve_path(path: str | Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train GSM8K with PPO")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, required=True, help="Path to the PPO experiment YAML file.")
     args = parser.parse_args()
 
     settings = load_yaml_config(args.config)
     config = PPOConfig(**settings)
     train_source = config.train_dataset
-    train_dataset = load_dataset("json", data_files={train_source.split: str(resolve_path(train_source.path))}, split=train_source.split)
+    train_dataset = load_dataset(
+        "json",
+        data_files={train_source.split: str(resolve_path(train_source.path))},
+        split=train_source.split,
+    )
 
     valid_dataset = None
     if config.valid_dataset is not None:

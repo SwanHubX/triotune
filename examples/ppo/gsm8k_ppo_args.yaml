@@ -1,6 +1,6 @@
 # Complete GSM8K PPO experiment configuration.
 # Run from the repository root with:
-#   uv run python examples/ppo/gsm8k_ppo.py
+#   uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
 #
 # This document maps directly to PPOConfig. There is no `algorithm` selector
 # and no `ppo` wrapper: actor/critic modules explicitly define PPO behavior.
