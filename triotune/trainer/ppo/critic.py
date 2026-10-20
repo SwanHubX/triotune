@@ -154,11 +154,24 @@ def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
                 -config.critic_eps_clip, config.critic_eps_clip
             )
             clip_mask = (bounded - target).square() > (prediction - target).square()
+            target_values = target[mask]
+            prediction_values = prediction.detach()[mask]
+            target_variance = target_values.var(unbiased=False)
+            explained_variance = (
+                1 - (target_values - prediction_values).var(unbiased=False)
+                / target_variance
+                if target_variance > 0
+                else target_variance.new_tensor(0.0)
+            )
         return objective, {
             "critic/loss": objective.detach().item(),
-            "critic/value_mean": prediction.detach()[mask].mean().item(),
-            "critic/return_mean": target[mask].mean().item(),
+            "critic/value_mean": prediction_values.mean().item(),
+            "critic/value_std": prediction_values.std(unbiased=False).item(),
+            "critic/return_mean": target_values.mean().item(),
+            "critic/return_std": target_values.std(unbiased=False).item(),
+            "critic/explained_variance": explained_variance.item(),
             "critic/clip_fraction": clip_mask[mask].float().mean().item(),
+            "critic/action_tokens": float(mask.sum().item()),
         }
 
     return loss
@@ -288,10 +301,59 @@ class PyTRIOCritic:
                         break
                 rows.append(row)
         self.global_step += 1
-        metrics = {
-            key: float(np.mean([row[key] for row in rows if key in row]))
-            for key in {k for row in rows for k in row}
-        }
+        metrics = {}
+        for key in {k for row in rows for k in row}:
+            present = [row for row in rows if key in row]
+            if key.startswith("critic/") and key not in {
+                "critic/grad_norm",
+                "critic/action_tokens",
+            }:
+                weights = [row["critic/action_tokens"] for row in present]
+                metrics[key] = float(
+                    np.average([row[key] for row in present], weights=weights)
+                )
+            else:
+                metrics[key] = float(np.mean([row[key] for row in present]))
+        for stem in ("critic/value", "critic/return"):
+            mean_name, std_name = stem + "_mean", stem + "_std"
+            present = [
+                row for row in rows if mean_name in row and std_name in row
+            ]
+            if present:
+                weights = [row["critic/action_tokens"] for row in present]
+                second_moment = np.average(
+                    [row[std_name] ** 2 + row[mean_name] ** 2 for row in present],
+                    weights=weights,
+                )
+                metrics[std_name] = float(
+                    np.sqrt(max(0.0, second_moment - metrics[mean_name] ** 2))
+                )
+        old_values = np.asarray(
+            [
+                value
+                for trajectory, mask in zip(trajectories, masks, strict=True)
+                for value, active in zip(
+                    trajectory.values[:-1], mask, strict=True
+                )
+                if active
+            ],
+            dtype=np.float64,
+        )
+        target_values = np.asarray(
+            [
+                value
+                for row, mask in zip(returns, masks, strict=True)
+                for value, active in zip(row, mask, strict=True)
+                if active
+            ],
+            dtype=np.float64,
+        )
+        target_variance = float(np.var(target_values))
+        metrics["critic/explained_variance"] = (
+            1.0 - float(np.var(target_values - old_values)) / target_variance
+            if target_variance > 0
+            else 0.0
+        )
         metrics.update(
             {
                 "critic/optimizer_steps": float(self.optimizer_steps),

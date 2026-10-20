@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -128,6 +129,7 @@ class PPOTrainer:
         self._eval_sample_input_tokens = 0
         self._eval_sample_output_tokens = 0
         self._last_eval_step: int | None = None
+        self._rollout_metrics: dict[str, float] = {}
         self.state = PPOState()
 
     # ------------------------------------------------------------------
@@ -198,6 +200,7 @@ class PPOTrainer:
                 "lora_rank": self.lora_rank,
                 "components": ["actor", "critic"] if self._owns_critic else ["actor"],
             },
+            logging_step=self.args.logging_step,
         )
         self._actor = PPOActor(self._client, self.args)
 
@@ -276,10 +279,79 @@ class PPOTrainer:
         )
         train_tokens = total_train_tokens - initial_train_tokens
         rewards = [t.reward for t in trajectories]
+        active_logprobs = [
+            logprob
+            for trajectory in batch.trajectories
+            for logprob, active in zip(
+                trajectory.logprobs, trajectory.loss_mask, strict=True
+            )
+            if active
+        ]
+        active_advantages = [
+            value
+            for row, mask in zip(batch.advantages, batch.masks, strict=True)
+            for value, active in zip(row, mask, strict=True)
+            if active
+        ]
+        active_returns = [
+            value
+            for row, mask in zip(batch.returns, batch.masks, strict=True)
+            for value, active in zip(row, mask, strict=True)
+            if active
+        ]
+        lengths = [len(t.completion_tokens) for t in trajectories]
+        reward_components = {
+            name: [
+                trajectory.reward_components[name]
+                for trajectory in trajectories
+                if name in trajectory.reward_components
+            ]
+            for name in {
+                name
+                for trajectory in trajectories
+                for name in trajectory.reward_components
+            }
+        }
+        reference_differences = [
+            behavior - reference
+            for trajectory in batch.trajectories
+            if trajectory.reference_logprobs is not None
+            for behavior, reference, active in zip(
+                trajectory.logprobs,
+                trajectory.reference_logprobs,
+                trajectory.loss_mask,
+                strict=True,
+            )
+            if active
+        ]
+        overlong_penalties = []
+        if self.args.overlong_tokens:
+            for length in lengths:
+                excess = max(
+                    0,
+                    length - (self.args.max_tokens - self.args.overlong_tokens),
+                )
+                overlong_penalties.append(
+                    min(1.0, excess / self.args.overlong_tokens)
+                    * self.args.overlong_penalty_factor
+                )
         metrics.update(
             {
                 "reward/mean": float(np.mean(rewards)),
                 "reward/std": float(np.std(rewards)),
+                "reward/min": float(np.min(rewards)),
+                "reward/max": float(np.max(rewards)),
+                "policy/entropy_sampled": float(-np.mean(active_logprobs)),
+                "advantage/mean": float(np.mean(active_advantages)),
+                "advantage/std": float(np.std(active_advantages)),
+                "return/mean": float(np.mean(active_returns)),
+                "return/std": float(np.std(active_returns)),
+                "rollout/completion_length_mean": float(np.mean(lengths)),
+                "rollout/completion_length_min": float(np.min(lengths)),
+                "rollout/completion_length_max": float(np.max(lengths)),
+                "rollout/truncated_fraction": float(
+                    np.mean([t.truncated for t in trajectories])
+                ),
                 "train/trajectories": float(len(trajectories)),
                 "train/action_tokens": float(sum(sum(mask) for mask in batch.masks)),
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
@@ -291,7 +363,86 @@ class PPOTrainer:
                 "time/update": time.perf_counter() - prepared_at,
             }
         )
-        self.state.metrics = self._metrics.record(metrics, step=self.state.global_step)
+        if reference_differences:
+            sampled_kl = float(np.mean(reference_differences))
+            estimated_kl = [
+                difference
+                if self.args.kl_estimator == "k1"
+                else 0.5 * difference**2
+                if self.args.kl_estimator == "k2"
+                else math.expm1(min(700.0, -difference)) + difference
+                for difference in reference_differences
+            ]
+            metrics.update(
+                {
+                    "policy/reference_kl_sampled": sampled_kl,
+                    "reward/kl_penalty_mean": float(
+                        np.mean(
+                            [
+                                -self.args.kl_ctl * max(-10.0, min(10.0, value))
+                                for value in estimated_kl
+                            ]
+                        )
+                    ),
+                }
+            )
+        if overlong_penalties:
+            metrics.update(
+                {
+                    "reward/overlong_penalty_mean": float(
+                        np.mean(overlong_penalties)
+                    ),
+                    "rollout/overlong_fraction": float(
+                        np.mean([value > 0 for value in overlong_penalties])
+                    ),
+                }
+            )
+        if set(rewards) <= {0.0, 1.0}:
+            metrics["reward/success_rate"] = float(np.mean(rewards))
+        for name, values in reward_components.items():
+            metrics[f"reward/{name}/mean"] = float(np.mean(values))
+        if "success" in reward_components:
+            metrics["reward/success_rate"] = float(
+                np.mean(reward_components["success"])
+            )
+        metrics.update(self._rollout_metrics)
+        self._rollout_metrics = {}
+        action_weight = metrics["train/action_tokens"]
+        loss_weight = (
+            action_weight
+            if self.args.loss_aggregation == "token_mean"
+            else metrics["train/trajectories"]
+            if self.args.loss_aggregation in {"seq_mean", "constant"}
+            else metrics["train/prompt_groups"]
+        )
+        weights = {
+            name: action_weight
+            for name in metrics
+            if name.startswith(("policy/", "advantage/", "return/"))
+            or (
+                name.startswith("critic/")
+                and name
+                not in {
+                    "critic/grad_norm",
+                    "critic/learning_rate",
+                    "critic/optimizer_steps",
+                }
+            )
+        }
+        weights["train/loss"] = loss_weight
+        weights.update(
+            {
+                name: metrics["train/trajectories"]
+                for name in metrics
+                if name.startswith(("reward/", "rollout/completion_length"))
+                or name == "rollout/truncated_fraction"
+            }
+        )
+        self.state.metrics = self._metrics.record(
+            metrics,
+            step=self.state.global_step,
+            weights=weights,
+        )
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
             await self.save_checkpoint()
         return self.state.metrics
@@ -351,6 +502,7 @@ class PPOTrainer:
                 self._client, "save_weights_and_get_sampling_client"
             )
         accepted, empty = [], 0
+        sampled_groups = rejected_groups = refill_count = 0
         group_count = 0
         while group_count < self.args.batch_size:
             # Dynamic sampling may reject entire prompt groups, so keep reading
@@ -368,8 +520,23 @@ class PPOTrainer:
                 sample_usage_callback=self._record_sample_usage,
             )
             self._next_group += len(source)
+            sampled_groups += len(source)
             if self.args.dynamic_sampling:
-                generated = filter_informative_groups(generated)
+                filtered = filter_informative_groups(generated)
+                rejected_groups += len(source) - len(
+                    {trajectory.group_id for trajectory in filtered}
+                )
+                generated = filtered
+                if (
+                    len(
+                        {
+                            trajectory.group_id
+                            for trajectory in accepted + generated
+                        }
+                    )
+                    < self.args.batch_size
+                ):
+                    refill_count += 1
             accepted.extend(generated)
             group_count = len({t.group_id for t in accepted})
             empty = empty + 1 if not generated else 0
@@ -377,6 +544,14 @@ class PPOTrainer:
                 raise RuntimeError(
                     "Dynamic sampling found too many consecutive uninformative batches."
                 )
+        if self.args.dynamic_sampling:
+            self._rollout_metrics = {
+                "rollout/degenerate_group_fraction": (
+                    rejected_groups / sampled_groups if sampled_groups else 0.0
+                ),
+                "rollout/rejected_groups": float(rejected_groups),
+                "rollout/refill_count": float(refill_count),
+            }
         return accepted
 
     def _record_sample_usage(self, usage: SampleTokens) -> None:
@@ -479,6 +654,8 @@ class PPOTrainer:
         metrics = {
             "eval/reward_mean": float(np.mean(rewards)),
             "eval/reward_std": float(np.std(rewards)),
+            "eval/reward_min": float(np.min(rewards)),
+            "eval/reward_max": float(np.max(rewards)),
             "eval/prompts": float(prompt_count),
             "eval/trajectories": float(len(trajectories)),
             "eval/batches": float(batch_count),
@@ -499,6 +676,24 @@ class PPOTrainer:
             ),
             "time/eval": time.perf_counter() - started,
         }
+        components = {
+            name: [
+                trajectory.reward_components[name]
+                for trajectory in trajectories
+                if name in trajectory.reward_components
+            ]
+            for name in {
+                name
+                for trajectory in trajectories
+                for name in trajectory.reward_components
+            }
+        }
+        if set(rewards.tolist()) <= {0.0, 1.0}:
+            metrics["eval/success_rate"] = float(np.mean(rewards))
+        for name, values in components.items():
+            metrics[f"eval/reward_{name}_mean"] = float(np.mean(values))
+        if "success" in components:
+            metrics["eval/success_rate"] = float(np.mean(components["success"]))
         return self._publish_evaluation(metrics)
 
     async def train(self) -> PPOState:

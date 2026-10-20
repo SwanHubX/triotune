@@ -39,6 +39,8 @@ class DPOLossTests(unittest.TestCase):
 
         self.assertGreater(metrics["eval/reward_margin"], 0)
         self.assertEqual(metrics["eval/reward_accuracy"], 1.0)
+        self.assertAlmostEqual(metrics["eval/logratio_margin"], 1.0)
+        self.assertEqual(metrics["eval/reference_logp_chosen"], -1.5)
         self.assertEqual(metrics["eval/pairs"], 1.0)
         with self.assertRaisesRegex(ValueError, "aligned pairs"):
             dpo_evaluation_metrics([-1.0], [-1.0], beta=0.1)

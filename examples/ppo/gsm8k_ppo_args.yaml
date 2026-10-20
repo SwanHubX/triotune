@@ -44,22 +44,21 @@ training:
   # batch_size * rollout.num_generations trajectories.
   batch_size: 4
   # Maximum rollout updates. Training ends earlier if the dataset is exhausted.
-  max_steps: 500
+  max_steps: 100
   # Actor/client seed. The owned critic client derives seed + 1.
   seed: 42
 
 checkpoint:
   # Save actor and critic every N rollout updates. Zero would save only the
   # final checkpoints; 20 also provides intermediate recovery points.
-  save_every: 50
+  save_every: 20
 
 evaluation:
   # Evaluate before training, every 50 updates, and once at the final step.
-  steps: 50
+  steps: 20
   before_train: true
   after_train: true
-  batch_size: 8
-  max_batches: 10
+  batch_size: 4
 
 optimizer:
   # Independent AdamW settings for the policy actor.

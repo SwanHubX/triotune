@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -96,6 +97,24 @@ class LoggingTests(unittest.TestCase):
             step=2,
         )
 
+    def test_metrics_api_uses_weights_and_pools_standard_deviations(self):
+        run = Mock()
+        api = MetricsAPI(run, logging_step=2)
+        api.record(
+            {"reward/mean": 0.0, "reward/std": 0.0, "reward/min": -1.0},
+            weights={"reward/mean": 1, "reward/std": 1},
+            step=1,
+        )
+        api.record(
+            {"reward/mean": 2.0, "reward/std": 0.0, "reward/min": 1.0},
+            weights={"reward/mean": 3, "reward/std": 3},
+            step=2,
+        )
+        payload = run.log.call_args.args[0]
+        self.assertEqual(payload["reward/mean"], 1.5)
+        self.assertAlmostEqual(payload["reward/std"], math.sqrt(0.75))
+        self.assertEqual(payload["reward/min"], -1.0)
+
     def test_metrics_api_publishes_eval_and_finishes_once(self):
         run = Mock()
         api = MetricsAPI(run)
@@ -118,6 +137,16 @@ class LoggingTests(unittest.TestCase):
             step=3,
         )
         run.finish.assert_called_once_with(state="success", error=None)
+
+    def test_finish_flushes_a_partial_logging_window(self):
+        run = Mock()
+        api = MetricsAPI(run, logging_step=3)
+        api.record({"train/loss": 1.0}, step=1)
+        api.finish()
+        run.log.assert_called_once_with(
+            {"train/loss": 1.0, "train/step": 1.0},
+            step=1,
+        )
 
     def test_metrics_api_writes_step_checkpoint_and_final_jsonl(self):
         with tempfile.TemporaryDirectory() as folder:

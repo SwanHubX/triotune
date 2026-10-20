@@ -70,6 +70,7 @@ class SFTTrainer:
             self.args,
             default_name=f"{self.model.rsplit('/', 1)[-1]}-sft",
             metadata={"model": self.model, "lora_rank": lora_rank},
+            logging_step=self.args.logging_step,
         )
 
     # ------------------------------------------------------------------
@@ -175,6 +176,7 @@ class SFTTrainer:
             raise ValueError("eval_dataset must contain at least one row.")
         metrics = {
             "eval/loss": loss_sum / token_count,
+            "eval/perplexity": math.exp(min(700.0, loss_sum / token_count)),
             "eval/tokens": float(token_count),
             "eval/examples": float(example_count),
             "eval/batches": float(batch_count),
@@ -248,6 +250,13 @@ class SFTTrainer:
             }
             if "loss_mean" in metrics:
                 metrics["train/loss"] = metrics["loss_mean"]
+                metrics["train/perplexity"] = math.exp(
+                    min(700.0, metrics["loss_mean"])
+                )
+            for name in ("token_accuracy", "accuracy"):
+                if name in metrics:
+                    metrics["train/token_accuracy"] = metrics.pop(name)
+                    break
             now = time.perf_counter()
             metrics.update(
                 {
@@ -267,7 +276,19 @@ class SFTTrainer:
                 self.state.checkpoint_path = (await wait_async(save_future)).path
             self.state.global_step = step
             self.state.metrics = metrics
-            self._metrics_api.record(metrics, step=step)
+            self._metrics_api.record(
+                metrics,
+                step=step,
+                weights={
+                    name: float(token_count)
+                    for name in (
+                        "train/loss",
+                        "train/perplexity",
+                        "train/token_accuracy",
+                    )
+                    if name in metrics
+                },
+            )
             return metrics
 
         return asyncio.create_task(collect())

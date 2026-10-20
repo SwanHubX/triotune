@@ -4,6 +4,7 @@ Advantage preparation lives in :mod:`trainer.ppo.advantages`; this module
 keeps prompt-group minibatching and remote actor updates.
 """
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 import numpy as np
@@ -15,6 +16,60 @@ from .advantages import prepare_advantages
 from .contracts import PreparedBatch, Trajectory
 from .datum import batch_datums, build_datum, completion_logprobs
 from .loss import make_loss_fn
+
+
+def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
+    """Recover policy-drift diagnostics from a built-in PPO response."""
+
+    outputs = getattr(result, "loss_fn_outputs", None)
+    if not isinstance(outputs, list) or len(outputs) != len(batch.trajectories):
+        return {}
+    deltas = []
+    for output, trajectory, proximal, mask in zip(
+        outputs,
+        batch.trajectories,
+        batch.proximal_logprobs,
+        batch.masks,
+        strict=True,
+    ):
+        if not isinstance(output, Mapping):
+            return {}
+        values = getattr(output.get("logprobs"), "data", None)
+        if not isinstance(values, list):
+            return {}
+        start = len(trajectory.prompt_tokens) - 1
+        current = values[start:]
+        if len(current) != len(mask):
+            return {}
+        deltas.extend(
+            float(now) - float(old)
+            for now, old, active in zip(current, proximal, mask, strict=True)
+            if active
+        )
+    if not deltas:
+        return {}
+    delta = np.asarray(deltas, dtype=np.float64)
+    ratio = np.exp(np.clip(delta, -700, 700))
+    low = 1 - config.eps_clip
+    high = 1 + (
+        config.eps_clip
+        if config.eps_clip_higher is None
+        else config.eps_clip_higher
+    )
+    return {
+        "policy/ratio": float(np.mean(ratio)),
+        "policy/ratio_std": float(np.std(ratio)),
+        "policy/ratio_p95": float(np.quantile(ratio, 0.95)),
+        "policy/ratio_max": float(np.max(ratio)),
+        "policy/update_approx_kl": float(np.mean(ratio - 1 - delta)),
+        "policy/clip_fraction": float(np.mean((ratio < low) | (ratio > high))),
+        "policy/clip_fraction_low": float(np.mean(ratio < low)),
+        "policy/clip_fraction_high": float(np.mean(ratio > high)),
+        "_delta": delta.tolist(),
+        "_ratio": ratio.tolist(),
+        "_clipped": ((ratio < low) | (ratio > high)).astype(float).tolist(),
+        "_rejected": np.zeros_like(ratio).tolist(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +163,7 @@ class PPOActor:
         config = self.config
         chunks = list(minibatches(batch, config.ppo_n_minibatches))
         metrics = []
+        diagnostics = []
         for _ in range(config.update_epochs):
             for chunk in chunks:
                 data = batch_datums(chunk, native=config.loss_backend == "native")
@@ -133,7 +189,7 @@ class PPOActor:
                         self.client,
                         "forward_backward_custom",
                         data,
-                        loss_fn=make_loss_fn(chunk, config),
+                        loss_fn=make_loss_fn(chunk, config, diagnostics),
                     )
                 self.train_tokens += compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
@@ -143,6 +199,17 @@ class PPOActor:
                 )
                 self.optimizer_steps += 1
                 row = dict(result.metrics)
+                if config.loss_backend == "native":
+                    native = _native_policy_metrics(result, chunk, config)
+                    diagnostics.append(
+                        {
+                            "delta": native.pop("_delta", []),
+                            "ratio": native.pop("_ratio", []),
+                            "clipped": native.pop("_clipped", []),
+                            "rejected": native.pop("_rejected", []),
+                        }
+                    )
+                    row.update(native)
                 for name in ("grad_norm", "gradient_norm", "optim/grad_norm"):
                     value = getattr(optimizer, "metrics", {}).get(name)
                     if isinstance(value, (int, float)) and np.isfinite(value):
@@ -155,14 +222,75 @@ class PPOActor:
                     row.pop("loss", None)
                     row.pop("scalar/loss", None)
                     row.pop("trainer/loss", None)
+                row.setdefault(
+                    "train/action_tokens",
+                    float(sum(sum(mask) for mask in chunk.masks)),
+                )
+                row["_loss_weight"] = float(
+                    row["train/action_tokens"]
+                    if config.loss_aggregation == "token_mean"
+                    else sum(any(mask) for mask in chunk.masks)
+                    if config.loss_aggregation in {"seq_mean", "constant"}
+                    else 1.0
+                )
                 metrics.append(row)
         keys = {
             key
             for row in metrics
             for key, value in row.items()
-            if isinstance(value, (int, float)) and np.isfinite(value)
+            if not key.startswith("_")
+            and isinstance(value, (int, float))
+            and np.isfinite(value)
         }
-        return {
-            key: float(np.mean([row[key] for row in metrics if key in row]))
-            for key in keys
-        }
+        aggregated = {}
+        for key in keys:
+            rows = [row for row in metrics if key in row]
+            if key == "train/loss":
+                weights = np.asarray(
+                    [row["_loss_weight"] for row in rows], dtype=np.float64
+                )
+                aggregated[key] = float(
+                    np.average([row[key] for row in rows], weights=weights)
+                )
+            elif key.startswith("policy/"):
+                weights = np.asarray(
+                    [row["train/action_tokens"] for row in rows], dtype=np.float64
+                )
+                aggregated[key] = float(
+                    np.average([row[key] for row in rows], weights=weights)
+                )
+            else:
+                aggregated[key] = float(np.mean([row[key] for row in rows]))
+        ratios = np.asarray(
+            [value for item in diagnostics for value in item["ratio"]],
+            dtype=np.float64,
+        )
+        deltas = np.asarray(
+            [value for item in diagnostics for value in item["delta"]],
+            dtype=np.float64,
+        )
+        if ratios.size:
+            clipped = [value for item in diagnostics for value in item["clipped"]]
+            rejected = [value for item in diagnostics for value in item["rejected"]]
+            low = 1 - config.eps_clip
+            high = 1 + (
+                config.eps_clip
+                if config.eps_clip_higher is None
+                else config.eps_clip_higher
+            )
+            aggregated.update(
+                {
+                    "policy/ratio": float(np.mean(ratios)),
+                    "policy/ratio_std": float(np.std(ratios)),
+                    "policy/ratio_p95": float(np.quantile(ratios, 0.95)),
+                    "policy/ratio_max": float(np.max(ratios)),
+                    "policy/update_approx_kl": float(
+                        np.mean(ratios - 1 - deltas)
+                    ),
+                    "policy/clip_fraction": float(np.mean(clipped)),
+                    "policy/clip_fraction_low": float(np.mean(ratios < low)),
+                    "policy/clip_fraction_high": float(np.mean(ratios > high)),
+                    "policy/rejected_fraction": float(np.mean(rejected)),
+                }
+            )
+        return aggregated

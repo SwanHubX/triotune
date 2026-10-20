@@ -81,21 +81,41 @@ def normalize_metrics(
 
 
 def accumulate_metrics(
-    window: dict[str, tuple[float, int]], metrics: Mapping[str, float],
+    window: dict[str, tuple[float, float]],
+    metrics: Mapping[str, float],
+    weights: Mapping[str, float] | None = None,
 ) -> None:
-    """Accumulate sparse metrics using an independent count for each key."""
+    """Accumulate sparse metrics with an independent observation weight."""
 
     for name, value in metrics.items():
+        weight = 1.0 if weights is None else float(weights.get(name, 1.0))
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("Metric weights must be finite and positive.")
         total, count = window.get(name, (0.0, 0))
-        window[name] = (total + value, count + 1)
+        window[name] = (total + value * weight, count + weight)
 
 
 def averaged_metrics(
-    window: Mapping[str, tuple[float, int]],
+    window: Mapping[str, tuple[float, float]],
 ) -> dict[str, float]:
     """Return one mean for every metric currently present in the window."""
 
     return {name: total / count for name, (total, count) in window.items()}
+
+
+def _mean_for_std(name: str) -> str | None:
+    """Return the companion mean series for a reported standard deviation."""
+
+    if name.endswith("/std"):
+        return name[:-4] + "/mean"
+    if name.endswith("_std"):
+        stem = name[:-4]
+        if stem.endswith("_sampled"):
+            return stem
+        if stem in {"policy/ratio", "critic/value", "critic/return"}:
+            return stem if stem == "policy/ratio" else stem + "_mean"
+        return stem + "_mean"
+    return None
 
 
 def start_run(args: Any, *, default_name: str, metadata: Mapping[str, Any]) -> Any:
@@ -141,7 +161,9 @@ class MetricsAPI:
             raise ValueError("logging_step must be a positive integer.")
         self._run = run
         self._logging_step = logging_step
-        self._window: dict[str, tuple[float, int]] = {}
+        self._window: dict[str, tuple[float, float]] = {}
+        self._second_moments: dict[str, tuple[float, float]] = {}
+        self._extrema: dict[str, float] = {}
         self._latest: dict[str, float] = {}
         self._last_step = 0
         self._history_path: Path | None = None
@@ -218,6 +240,7 @@ class MetricsAPI:
         metrics: Mapping[str, Any],
         *,
         step: int,
+        weights: Mapping[str, float] | None = None,
         exclude: MetricFilter | None = None,
     ) -> dict[str, float]:
         """Add one training step and flush when its interval is complete."""
@@ -228,7 +251,31 @@ class MetricsAPI:
         self._write_history("metrics", step=step, data={"metrics": payload})
         if self._run is None:
             return payload
-        accumulate_metrics(self._window, payload)
+        normalized_weights = (
+            None
+            if weights is None
+            else {metric_name(name): float(value) for name, value in weights.items()}
+        )
+        accumulate_metrics(self._window, payload, normalized_weights)
+        for name, value in payload.items():
+            if name.endswith(("/min", "_min")):
+                self._extrema[name] = min(self._extrema.get(name, value), value)
+            elif name.endswith(("/max", "_max")):
+                self._extrema[name] = max(self._extrema.get(name, value), value)
+        for name, std in payload.items():
+            mean_name = _mean_for_std(name)
+            if mean_name is None or mean_name not in payload:
+                continue
+            weight = (
+                1.0
+                if normalized_weights is None
+                else normalized_weights.get(name, 1.0)
+            )
+            total, count = self._second_moments.get(name, (0.0, 0.0))
+            self._second_moments[name] = (
+                total + weight * (std**2 + payload[mean_name] ** 2),
+                count + weight,
+            )
         if step % self._logging_step == 0:
             self.flush(step=step)
         return payload
@@ -258,6 +305,19 @@ class MetricsAPI:
 
         payload = averaged_metrics(self._window)
         self._window.clear()
+        payload.update(self._extrema)
+        self._extrema.clear()
+        for name, (second_sum, count) in self._second_moments.items():
+            mean_name = _mean_for_std(name)
+            if mean_name in payload:
+                payload[name] = math.sqrt(
+                    max(0.0, second_sum / count - payload[mean_name] ** 2)
+                )
+        self._second_moments.clear()
+        if "train/loss" in payload and "train/perplexity" in payload:
+            payload["train/perplexity"] = math.exp(
+                min(700.0, payload["train/loss"])
+            )
         if self._run is not None and payload:
             self._run.log(
                 {**payload, "train/step": float(step)},
@@ -280,6 +340,8 @@ class MetricsAPI:
     def finish(self, *, state: str = "success", error: str | None = None) -> None:
         """Finish the active run once and make later calls no-ops."""
 
+        if self._window:
+            self.flush(step=self._last_step)
         self._write_history(
             "finish",
             step=self._last_step,

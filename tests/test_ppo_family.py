@@ -251,6 +251,20 @@ class PolicyLossTests(unittest.TestCase):
         self.assertAlmostEqual(loss, (-1.4 + 0.8 - 0.5 + 2) / 4)
         self.assertEqual(grad[0][-1], 0)
 
+    def test_policy_drift_metrics_cover_ratio_and_approximate_kl(self):
+        ratios = (0.5, 1.0, 2.0)
+        _, _, metrics = objective(
+            raw_config(),
+            [trajectory(n=3)],
+            [[-1 + math.log(value) for value in ratios]],
+            [[1, 1, 1]],
+        )
+        self.assertAlmostEqual(metrics["policy/ratio"], sum(ratios) / 3)
+        self.assertEqual(metrics["policy/ratio_max"], 2.0)
+        self.assertAlmostEqual(metrics["policy/clip_fraction_low"], 1 / 3)
+        self.assertAlmostEqual(metrics["policy/clip_fraction_high"], 1 / 3)
+        self.assertGreater(metrics["policy/update_approx_kl"], 0)
+
     def test_gspo_uses_geometric_ratio_and_mean_advantage(self):
         t = trajectory()
         loss, grad, _ = objective(
@@ -467,6 +481,15 @@ class TrainingClient:
 
 
 class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reporting_uses_configured_logging_interval(self):
+        trainer = PPOTrainer(
+            "fake",
+            raw_config(logging_step=3),
+            training_client=TrainingClient(),
+        )
+        await trainer.initialize()
+        self.assertEqual(trainer._metrics._logging_step, 3)
+
     async def test_train_reports_progress_and_writes_local_metric_history(self):
         client = TrainingClient()
         with tempfile.TemporaryDirectory() as folder, patch(
@@ -482,7 +505,10 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
                     log_dir=folder,
                 ),
                 [{"messages": "train"}],
-                lambda **kwargs: float(kwargs["completion"]),
+                lambda **kwargs: {
+                    "reward": float(kwargs["completion"]),
+                    "correct": bool(float(kwargs["completion"])),
+                },
                 training_client=client,
             )
 
@@ -497,6 +523,11 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["event"], "run")
         self.assertEqual(rows[-1]["event"], "finish")
         self.assertEqual(rows[-1]["metrics"]["reward/mean"], 0.5)
+        self.assertEqual(rows[-1]["metrics"]["reward/correct/mean"], 0.5)
+        self.assertEqual(rows[-1]["metrics"]["reward/success_rate"], 0.5)
+        self.assertIn("policy/entropy_sampled", rows[-1]["metrics"])
+        self.assertIn("advantage/std", rows[-1]["metrics"])
+        self.assertEqual(rows[-1]["metrics"]["rollout/completion_length_mean"], 2)
         self.assertIn("train/loss", rows[-1]["metrics"])
         self.assertEqual(rows[-1]["metrics"]["usage/train_tokens_total"], 6.0)
 
@@ -699,6 +730,8 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         )
         metrics = await trainer.step([trajectory()])
         self.assertEqual(metrics["critic/loss"], 0.25)
+        self.assertEqual(metrics["policy/reference_kl_sampled"], 1.0)
+        self.assertEqual(metrics["reward/kl_penalty_mean"], -0.1)
         np.testing.assert_allclose(critic.returns, [[0.8, 0.9]])
 
     async def test_dynamic_sampling_refill_and_bounded_failure(self):
@@ -712,6 +745,9 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         trainer = PPOTrainer("fake", c, rows, reward, training_client=TrainingClient())
         state = await trainer.train()
         self.assertEqual(state.metrics["train/prompt_groups"], 2)
+        self.assertEqual(state.metrics["rollout/rejected_groups"], 1)
+        self.assertEqual(state.metrics["rollout/refill_count"], 1)
+        self.assertAlmostEqual(state.metrics["rollout/degenerate_group_fraction"], 1 / 3)
         self.assertEqual(trainer._next_group, 3)
         c = replace(c, max_empty_batches=1)
         trainer = PPOTrainer(

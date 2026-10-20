@@ -142,6 +142,8 @@ class CriticLossTests(unittest.TestCase):
         loss.backward()
         self.assertAlmostEqual(loss.item(), 0.5)
         self.assertAlmostEqual(metrics["critic/return_mean"], 1)
+        self.assertEqual(metrics["critic/return_std"], 0)
+        self.assertEqual(metrics["critic/explained_variance"], 0)
         np.testing.assert_allclose(tensors[0].grad, [0, -0.5, 0, -0.5, 0])
         np.testing.assert_allclose(tensors[1].grad, [0, 0.5, 0, 0.5, 0])
 

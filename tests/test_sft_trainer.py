@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -78,7 +79,9 @@ class _Client:
         assert kwargs == {"loss_fn": "cross_entropy", "auto_shift": False}
         if self.fail_forward:
             raise RuntimeError("forward failed")
-        return SimpleNamespace(metrics={"loss_mean": 0.5, "token_count": 2})
+        return SimpleNamespace(
+            metrics={"loss_mean": 0.5, "token_count": 2, "token_accuracy": 0.75}
+        )
 
     def forward(self, datums: list[object], **kwargs: object) -> object:
         self.events.append("evaluate")
@@ -150,6 +153,10 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
 
     def trainer(self, **kwargs: object) -> SFTTrainer:
         return SFTTrainer("test-model", args=SFTConfig(**kwargs))
+
+    def test_reporting_uses_configured_logging_interval(self) -> None:
+        trainer = self.trainer(logging_step=3)
+        self.assertEqual(trainer._metrics_api._logging_step, 3)
 
     async def test_optimizer_submitted_before_forward_result(self) -> None:
         trainer = self.trainer()
@@ -229,6 +236,7 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
             metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
 
         self.assertEqual(metrics["eval/loss"], 0.25)
+        self.assertAlmostEqual(metrics["eval/perplexity"], math.exp(0.25))
         self.assertEqual(metrics["eval/examples"], 2.0)
         self.assertEqual(self.client.eval_calls, 2)
         self.assertEqual(self.client.optim_calls, 0)
@@ -422,6 +430,8 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["usage/train_tokens"], 4)
         self.assertEqual(metrics["usage/train_tokens_total"], 4)
         self.assertEqual(metrics["train/loss"], 0.5)
+        self.assertAlmostEqual(metrics["train/perplexity"], math.exp(0.5))
+        self.assertEqual(metrics["train/token_accuracy"], 0.75)
         self.assertEqual(self.client.optim_calls, 1)
 
     async def test_assistant_mask_and_pretokenized_labels(self) -> None:

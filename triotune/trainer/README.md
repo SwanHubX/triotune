@@ -72,6 +72,13 @@ triotune/
 SFT、DPO、OPD 和 PPO-family 的完整训练入口均显示 train step 进度；所有 evaluation
 入口按 batch 显示独立进度。数据源可求长度时展示准确总 batch 数，流式 iterable 则展示已完成 batch 与速率。
 
+指标按其自然样本数聚合：语言模型损失按有效 token、DPO 按 pair、PPO policy/critic
+按有效 action、OPD 蒸馏指标按 completion token 加权；标准差通过一二阶矩合并，而不是
+直接平均各 batch 的标准差。PPO/OPD 的 KL 与 entropy 字段带有 `sampled` 时仅表示已采样
+action 上的估计，不代表完整词表分布统计。
+SFT 始终从交叉熵报告 perplexity；`train/token_accuracy` 仅在 PyTRIO 后端返回
+`token_accuracy`/`accuracy` 时透传，因为目标 token logprob 本身不足以判断全词表 argmax。
+
 ```text
 dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
 ```

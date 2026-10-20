@@ -9,6 +9,8 @@ Training and inference remain in one PyTRIO client lifecycle for now.
 import asyncio
 import inspect
 from collections import defaultdict
+from collections.abc import Mapping
+from numbers import Real
 
 import pytrio as trio
 
@@ -19,6 +21,28 @@ from ...utils.token_usage import (
     compute_sample_tokens,
 )
 from .contracts import Trajectory
+
+
+def _reward_result(value):
+    """Normalize a scalar or ``{"reward": ..., component: ...}`` result."""
+
+    if not isinstance(value, Mapping):
+        return float(value), {}
+    if "reward" not in value:
+        raise ValueError("A structured reward result must contain 'reward'.")
+    reward = value["reward"]
+    components = {name: item for name, item in value.items() if name != "reward"}
+    if (
+        not isinstance(reward, Real)
+        or isinstance(reward, bool)
+        or any(
+            not isinstance(name, str)
+            or not isinstance(item, Real)
+            for name, item in components.items()
+        )
+    ):
+        raise ValueError("Structured reward values must be numeric scalars.")
+    return float(reward), {str(name): float(item) for name, item in components.items()}
 
 
 async def gather_cancel_on_error(coroutines):
@@ -93,6 +117,7 @@ async def generate_rollouts(
                 reward = await asyncio.to_thread(reward_fn, **kwargs)
                 if inspect.isawaitable(reward):
                     reward = await reward
+            reward, reward_components = _reward_result(reward)
             reason = sequence.stop_reason
             truncated = reason in ("length", "max_tokens", "max_length")
             if reason not in (
@@ -109,9 +134,10 @@ async def generate_rollouts(
                     prompt_tokens=list(prompt.tokens),
                     completion_tokens=list(sequence.tokens),
                     logprobs=list(sequence.logprobs),
-                    reward=float(reward),
+                    reward=reward,
                     group_id=f"prompt-{index}",
                     truncated=truncated,
+                    reward_components=reward_components,
                     # PyTRIO's sampler returns one assistant completion per
                     # request, so every generated token belongs to turn zero.
                     # Custom multi-turn rollouts can provide richer IDs when

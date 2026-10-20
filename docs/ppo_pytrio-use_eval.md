@@ -112,7 +112,7 @@ flowchart TD
 
 | 接口/字段 | 约定 |
 | --- | --- |
-| `reward_fn(*, row, completion, completion_ids)` | 返回有限标量；支持普通函数和协程；普通函数在 worker thread 中执行 |
+| `reward_fn(*, row, completion, completion_ids)` | 返回有限标量，或含 `reward` 总分及数值分项的 mapping；支持普通函数和协程，普通函数在 worker thread 中执行 |
 | `Trajectory.prompt_tokens` | 非空 prompt token ID 列表 |
 | `completion_tokens`、`logprobs` | completion token 和其行为策略 logprob，长度均为 T；不是整段 prompt+completion 的 logprob |
 | `reward`、`group_id` | 任务得分和 prompt 分组标识；同一 group 必须有完全相同的 prompt token |
@@ -473,13 +473,17 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 | 指标 | 口径 |
 | --- | --- |
 | `reward/mean`、`reward/std` | 本轮已接受轨迹的原始任务 reward；不是经长度惩罚、KL 和归一化后的训练信号；std 为总体标准差 |
-| `train/loss` | custom 路径的实际策略目标，跨 minibatch/update epoch 的返回值取算术平均；不是 CE 梯度代理损失，也不保证等于对整批重新计算的 loss |
+| `train/loss` | custom 路径的实际策略目标，跨 minibatch/update epoch 按 loss reduction 的自然分母聚合；不是 CE 梯度代理损失 |
 | `policy/ratio`、`policy/clip_fraction`、`policy/rejected_fraction` | custom 路径的概率比、裁剪/过滤统计；多个更新的返回指标取平均 |
+| `policy/update_approx_kl`、`policy/ratio_std/p95/max`、`policy/clip_fraction_low/high` | 当前策略相对 frozen proximal policy 的 sampled update drift 和 ratio 分布；不是完整词表 KL |
+| `policy/reference_kl_sampled`、`reward/kl_penalty_mean` | 启用 reference scoring 时，行为策略相对固定 reference 的采样 log-ratio，以及按所选 estimator、限幅和 `kl_ctl` 得到的实际平均惩罚 |
+| `policy/entropy_sampled`、`advantage/mean/std`、`return/mean/std` | rollout action 的负平均采样 logprob，以及有效 action 上的冻结 advantage/return 分布；sampled entropy 不是完整词表精确 entropy |
+| `rollout/completion_length_*`、`rollout/truncated_fraction` | 训练 rollout 的 completion 长度和长度截断比例；DAPO 另记录退化组、拒绝组和补采次数 |
 | `train/action_tokens` | 本轮 mask=True 的 completion token 总数；行为过滤保留原分母，因此不扣掉被 rejection 过滤的 token |
 | `train/trajectories`、`train/prompt_groups` | 本轮接受的回答数和 prompt group 数 |
 | `train/optimizer_steps` | 累计成功完成的 Adam update 数 |
 | `train/grad_norm`、`critic/grad_norm` | PyTRIO `optim_step` 返回时记录的 actor/critic 梯度范数；服务端不返回时该指标不存在 |
-| `critic/loss`、`critic/value_mean`、`critic/return_mean`、`critic/clip_fraction` | clipped value MSE、更新前向的 value/冻结 return 均值、裁剪分支实际主导损失的 token 比例；多个 minibatch/epoch 指标取算术平均 |
+| `critic/loss`、`critic/value_mean/std`、`critic/return_mean/std`、`critic/explained_variance`、`critic/clip_fraction` | clipped value MSE、value/return 分布、冻结 value 对 return 的解释方差，以及裁剪分支实际主导损失的 token 比例 |
 | `critic/optimizer_steps`、`critic/learning_rate`、`critic/action_tokens` | critic 累计已完成的 Adam 次数、独立学习率及本轮有效 action 数 |
 | `time/critic_update` | critic 回归更新的墙钟时间，与 actor 更新可重叠 |
 | `time/prepare` | reference、critic value、proximal 重算与优势准备的客户端墙钟耗时，不含惰性初始化 |
@@ -495,8 +499,8 @@ actor 与 critic 仍是两个独立 PyTRIO 客户端，日志合并不改变参�
 更新与保存并非原子事务；发生异常可能有一个模型已更新，状态计数反映已确认完成的更新，
 不能把错误重试当成无副作用操作。外部 critic 的保存和关闭仍由注入方负责。
 直接使用 `step()` 不生成 `time/rollout`、`time/step` 两项。
-当前没有固定输出的独立 KL chart；`kl_ctl` 控制训练信号，不代表会自动生成 AReaL 的全部 KL 统计。
-也没有精确 entropy、GPU 利用率、服务端排队时间或完整训练端到端吞吐量指标。
+当前输出基于已采样 action 的 KL 与 entropy 估计，不等于完整词表精确统计；GPU 利用率和
+服务端排队时间仍不在客户端公开接口中。
 
 ## 8. 对照源码
 

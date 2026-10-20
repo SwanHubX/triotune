@@ -365,6 +365,13 @@ class DPOTrainer:
         self._metrics_api.record(
             {**metrics, "train/pairs": count},
             step=self.state.global_step,
+            weights={
+                name: float(count)
+                for name in metrics
+                if name == "train/loss"
+                or name == "train/logratio_margin"
+                or name.startswith(("reward/", "train/logp", "train/reference_logp"))
+            },
         )
 
     def _flush_swanlab(self) -> None:

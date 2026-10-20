@@ -12,7 +12,11 @@ from .contracts import PreparedBatch
 from .datum import IGNORE_INDEX
 
 
-def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
+def make_loss_fn(
+    batch: PreparedBatch,
+    config: PPOConfig,
+    diagnostics: list[dict[str, list[float]]] | None = None,
+):
     """Create a PyTRIO custom-loss callback for one frozen actor batch.
 
     The callback receives remote current-policy logprobs and returns a local
@@ -28,7 +32,7 @@ def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
 
         if len(datums) != len(batch.trajectories) or len(logprobs) != len(datums):
             raise ValueError("Custom loss needs one logprob tensor per trajectory.")
-        sums, counts, ratios, clipped, rejected = [], [], [], [], []
+        sums, counts, deltas, ratios, clipped, rejected = [], [], [], [], [], []
         # Evaluate each trajectory independently so variable-length completion
         # masks remain aligned before the configured reduction is applied.
         for t, adv, prox, mask, datum, full_lp in zip(
@@ -116,6 +120,7 @@ def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
             # Filter the numerator only; all reductions retain original counts.
             terms = (terms * correction).masked_fill(~keep, 0)
             sums.append(terms.sum() + lp.sum() * 0)
+            deltas.append(delta.detach())
             ratios.append(ratio.detach())
             clipped.append(clip.detach())
             rejected.append((~keep).detach())
@@ -147,13 +152,38 @@ def make_loss_fn(batch: PreparedBatch, config: PPOConfig):
             raise FloatingPointError(
                 "Policy loss is nonfinite; check logprob ratios and rewards."
             )
+        all_deltas = torch.cat(deltas)
+        all_ratios = torch.cat(ratios)
+        low = 1 - config.eps_clip
+        high = 1 + (
+            config.eps_clip
+            if config.eps_clip_higher is None
+            else config.eps_clip_higher
+        )
         metrics = {
             "train/loss": objective.detach().item(),
-            "policy/ratio": torch.cat(ratios).mean().item(),
+            "policy/ratio": all_ratios.mean().item(),
+            "policy/ratio_std": all_ratios.std(unbiased=False).item(),
+            "policy/ratio_p95": torch.quantile(all_ratios.float(), 0.95).item(),
+            "policy/ratio_max": all_ratios.max().item(),
+            "policy/update_approx_kl": (
+                all_ratios - 1 - all_deltas
+            ).mean().item(),
             "policy/clip_fraction": torch.cat(clipped).float().mean().item(),
+            "policy/clip_fraction_low": (all_ratios < low).float().mean().item(),
+            "policy/clip_fraction_high": (all_ratios > high).float().mean().item(),
             "policy/rejected_fraction": torch.cat(rejected).float().mean().item(),
             "train/action_tokens": float(sum(counts)),
         }
+        if diagnostics is not None:
+            diagnostics.append(
+                {
+                    "delta": all_deltas.detach().cpu().tolist(),
+                    "ratio": all_ratios.detach().cpu().tolist(),
+                    "clipped": torch.cat(clipped).float().detach().cpu().tolist(),
+                    "rejected": torch.cat(rejected).float().detach().cpu().tolist(),
+                }
+            )
         return objective, metrics
 
     return loss
