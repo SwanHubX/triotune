@@ -1,0 +1,185 @@
+# Complete GSM8K PPO experiment configuration.
+# Run from the repository root with:
+#   uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
+#
+# This document maps directly to PPOConfig. There is no `algorithm` selector
+# and no `ppo` wrapper: actor/critic modules explicitly define PPO behavior.
+
+model:
+  # PyTRIO base-model ID for both the policy actor and the default critic.
+  name: Qwen/Qwen3.5-9B
+  # LoRA rank for the actor. Higher ranks add capacity and remote compute cost.
+  # PPOCriticConfig.lora_rank inherits this value when it is null.
+  lora_rank: 32
+
+train_dataset:
+  # Local JSONL source. Every row must contain `messages` and `answer`.
+  path: data/gsm8k_train.jsonl
+  # Hugging Face datasets exposes a local JSON source as the `train` split.
+  split: train
+  # Optional positive row limit. Null consumes all 7,473 prepared examples.
+  max_examples: null
+  # Preserve source order. The minimal tutorial does not implement shuffling.
+  shuffle: false
+  # Dataset-only shuffle seed; null would reuse training.seed if shuffling
+  # were added by a custom loader.
+  seed: 42
+  # Reserved loader-specific options; none are needed for local JSONL.
+  loader_options: {}
+
+# Validation prompts are sampled by the current actor and scored by reward_fn.
+valid_dataset:
+  # Official GSM8K test split; it contains no questions from the train file.
+  path: data/gsm8k_test.jsonl
+  split: test
+  max_examples: 100
+
+reference:
+  # Frozen base model used only when actor.kl_ctl > 0. Keeping it explicit
+  # documents the intended policy reference even though kl_ctl is zero below.
+  name: ${model.name}
+
+training:
+  # Prompts consumed by one rollout update. The update samples
+  # batch_size * rollout.num_generations trajectories.
+  batch_size: 4
+  # Maximum rollout updates. Training ends earlier if the dataset is exhausted.
+  max_steps: 100
+  # Actor/client seed. The owned critic client derives seed + 1.
+  seed: 42
+
+checkpoint:
+  # Save actor and critic every N rollout updates. Zero would save only the
+  # final checkpoints; 20 also provides intermediate recovery points.
+  save_every: 20
+
+evaluation:
+  # Evaluate before training, every 50 updates, and once at the final step.
+  steps: 20
+  before_train: true
+  after_train: true
+  batch_size: 4
+
+optimizer:
+  # Independent AdamW settings for the policy actor.
+  learning_rate: 0.00004
+  # First-moment decay; 0.9 is the standard momentum default.
+  beta1: 0.9
+  # Faster second-moment adaptation than Adam's conventional 0.999 default.
+  beta2: 0.95
+  # Denominator stabilizer used by remote AdamW.
+  eps: 0.00000001
+  # LoRA weight decay is disabled for this small supervised signal.
+  weight_decay: 0.0
+  # Positive global gradient-norm ceiling; zero would disable clipping.
+  grad_clip_norm: 1.0
+
+rollout:
+  # Responses sampled per prompt. Multiple samples improve exploration even
+  # though standard PPO uses a critic rather than a group-relative baseline.
+  num_generations: 4
+  # Maximum completion length; prompt tokens are not included in this budget.
+  max_tokens: 1024
+  # Both values must remain 1.0: target-only training logprobs cannot recover
+  # temperature scaling or top-p truncation normalization.
+  temperature: 1.0
+  top_p: 1.0
+  # Raw dataset field rendered as the generation prompt.
+  prompt_key: messages
+  # Qwen template option disabling hidden thinking mode for this tutorial.
+  chat_template_kwargs:
+    enable_thinking: false
+
+actor:
+  # Standard PPO uses critic values as its baseline, so scalar rewards are not
+  # centered within prompt groups. GRPO would normally configure group stats.
+  reward_norm: null
+  # Normalize token advantages across the complete frozen rollout batch.
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+    mean_leave1out: false
+    std_unbiased: true
+    eps: 0.00001
+
+  # Reward shaping is clip((reward + bias) * scaling, -clip, clip).
+  reward_bias: 0.0
+  reward_scaling: 1.0
+  reward_clip: 20.0
+  # Undiscounted, full-trace GAE is appropriate for final-answer-only rewards.
+  discount: 1.0
+  gae_lambda: 1.0
+  gae_timestep_unit: token
+  # Keep answer reward on length-truncated responses. True would zero it while
+  # retaining KL reward and critic bootstrap behavior.
+  mask_no_eos_with_zero: false
+
+  # Ordinary symmetric PPO ratio clipping: [1 - 0.2, 1 + 0.2].
+  eps_clip: 0.2
+  eps_clip_higher: null
+  # Null disables dual clipping of negative-advantage policy terms.
+  c_clip: null
+  loss_type: ppo
+  importance_sampling_level: token
+  loss_aggregation: token_mean
+  # Used only when loss_aggregation is `constant`.
+  loss_aggregation_divisor: null
+  # One actor pass and one prompt-group-preserving minibatch per rollout batch.
+  update_epochs: 1
+  ppo_n_minibatches: 1
+  # `custom` supports the complete actor contract; `native` supports only the
+  # restricted ordinary token-level PPO subset.
+  loss_backend: custom
+
+  # Zero disables fixed-reference scoring and its additional remote requests.
+  kl_ctl: 0.0
+  kl_estimator: k1
+  # Standard on-policy PPO keeps decoupling, recomputation and rejection off.
+  use_decoupled_loss: false
+  recompute_logprob: false
+  rejection_lower: null
+  rejection_upper: null
+  # Dynamic refill is intended for DAPO-style informative-group filtering.
+  dynamic_sampling: false
+  max_empty_batches: 32
+  # Zero disables the optional overlong-completion penalty.
+  overlong_tokens: 0
+  overlong_penalty_factor: 1.0
+
+critic:
+  # Enabling an independently trained value model makes this standard PPO.
+  # GRPO-family configurations normally set this to false.
+  enabled: true
+  # Null inherits model.lora_rank (32).
+  lora_rank: null
+  # The critic has a fully independent optimizer, including moment estimates.
+  optimizer:
+    learning_rate: 0.00004
+    beta1: 0.9
+    beta2: 0.95
+    eps: 0.00000001
+    weight_decay: 0.0
+    grad_clip_norm: 1.0
+  # Null discovers the tokenizer's single-token encodings of "1" and "0" as
+  # positive/negative value markers.
+  token_ids: null
+  # value = scale * (logp("1") - logp("0")) + bias.
+  value_scale: 1.0
+  value_bias: 0.0
+  # PPO-style value clipping and one update over one critic minibatch.
+  eps_clip: 0.2
+  update_epochs: 1
+  n_minibatches: 1
+
+reporting:
+  # Null disables SwanLab network reporting while retaining terminal progress.
+  # Change to `swanlab` to publish the configured run.
+  report_to: swanlab
+  project: triotune-tutorials
+  workspace: pytrio
+  run_name: gsm8k-ppo
+  tags: [ppo, gsm8k, framework]
+  # SwanLab artifacts plus a portable JSONL history of metrics/checkpoint URIs.
+  log_dir: ../output/gsm8k-ppo
+  # DPO/OPD use this metric-window cadence; PPO currently publishes each step.
+  logging_step: 1

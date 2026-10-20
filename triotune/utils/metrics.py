@@ -3,16 +3,21 @@
 Trainers remain responsible for computing metrics with the correct algorithmic
 meaning. ``MetricsAPI`` owns only the shared transport concerns: validating
 numeric values, applying stable chart names, averaging sparse metric windows,
-publishing at a configured step interval, and closing the reporting run.
+writing portable JSONL history, publishing at a configured step interval, and
+closing the reporting run.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
+from datetime import datetime, timezone
 from numbers import Real
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import swanlab
 
@@ -76,21 +81,41 @@ def normalize_metrics(
 
 
 def accumulate_metrics(
-    window: dict[str, tuple[float, int]], metrics: Mapping[str, float],
+    window: dict[str, tuple[float, float]],
+    metrics: Mapping[str, float],
+    weights: Mapping[str, float] | None = None,
 ) -> None:
-    """Accumulate sparse metrics using an independent count for each key."""
+    """Accumulate sparse metrics with an independent observation weight."""
 
     for name, value in metrics.items():
+        weight = 1.0 if weights is None else float(weights.get(name, 1.0))
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("Metric weights must be finite and positive.")
         total, count = window.get(name, (0.0, 0))
-        window[name] = (total + value, count + 1)
+        window[name] = (total + value * weight, count + weight)
 
 
 def averaged_metrics(
-    window: Mapping[str, tuple[float, int]],
+    window: Mapping[str, tuple[float, float]],
 ) -> dict[str, float]:
     """Return one mean for every metric currently present in the window."""
 
     return {name: total / count for name, (total, count) in window.items()}
+
+
+def _mean_for_std(name: str) -> str | None:
+    """Return the companion mean series for a reported standard deviation."""
+
+    if name.endswith("/std"):
+        return name[:-4] + "/mean"
+    if name.endswith("_std"):
+        stem = name[:-4]
+        if stem.endswith("_sampled"):
+            return stem
+        if stem in {"policy/ratio", "critic/value", "critic/return"}:
+            return stem if stem == "policy/ratio" else stem + "_mean"
+        return stem + "_mean"
+    return None
 
 
 def start_run(args: Any, *, default_name: str, metadata: Mapping[str, Any]) -> Any:
@@ -104,7 +129,10 @@ def start_run(args: Any, *, default_name: str, metadata: Mapping[str, Any]) -> A
         tags=args.tags,
         name=args.run_name or default_name,
         log_dir=args.log_dir,
-        config={**metadata, **asdict(args)},
+        # Runtime metadata describes the concrete client actually created by
+        # the trainer and therefore overrides optional experiment fields that
+        # may be omitted for legacy constructor-based configurations.
+        config={**asdict(args), **metadata},
     )
 
 
@@ -118,7 +146,13 @@ def finish_run(run: Any, *, state: str, error: str | None = None) -> None:
 class MetricsAPI:
     """Collect arbitrary trainer metrics and publish them through one API."""
 
-    def __init__(self, run: Any = None, *, logging_step: int = 1) -> None:
+    def __init__(
+        self,
+        run: Any = None,
+        *,
+        logging_step: int = 1,
+        log_dir: str | None = None,
+    ) -> None:
         if (
             isinstance(logging_step, bool)
             or not isinstance(logging_step, int)
@@ -127,7 +161,18 @@ class MetricsAPI:
             raise ValueError("logging_step must be a positive integer.")
         self._run = run
         self._logging_step = logging_step
-        self._window: dict[str, tuple[float, int]] = {}
+        self._window: dict[str, tuple[float, float]] = {}
+        self._second_moments: dict[str, tuple[float, float]] = {}
+        self._extrema: dict[str, float] = {}
+        self._latest: dict[str, float] = {}
+        self._last_step = 0
+        self._history_path: Path | None = None
+        self._history_closed = False
+        if log_dir is not None:
+            root = Path(log_dir).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            self._history_path = root / f"metrics-{stamp}-{uuid4().hex[:8]}.jsonl"
 
     @classmethod
     def from_config(
@@ -140,10 +185,21 @@ class MetricsAPI:
     ) -> MetricsAPI:
         """Create an enabled or disabled reporter from a trainer config."""
 
-        return cls(
+        api = cls(
             start_run(args, default_name=default_name, metadata=metadata),
             logging_step=logging_step,
+            log_dir=args.log_dir,
         )
+        api._write_history(
+            "run",
+            step=0,
+            data={
+                "name": args.run_name or default_name,
+                "report_to": args.report_to,
+                **dict(metadata),
+            },
+        )
+        return api
 
     @property
     def enabled(self) -> bool:
@@ -151,19 +207,75 @@ class MetricsAPI:
 
         return self._run is not None
 
+    @property
+    def history_path(self) -> str | None:
+        """Return the local metric history path when ``log_dir`` is configured."""
+
+        return str(self._history_path) if self._history_path is not None else None
+
+    def _write_history(
+        self,
+        event: str,
+        *,
+        step: int,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Append one durable JSONL event when ``log_dir`` is configured."""
+
+        if self._history_path is None or self._history_closed:
+            return
+        payload = {
+            "event": event,
+            "step": int(step),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if data:
+            payload.update(data)
+        with self._history_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+            stream.write("\n")
+
     def record(
         self,
         metrics: Mapping[str, Any],
         *,
         step: int,
+        weights: Mapping[str, float] | None = None,
         exclude: MetricFilter | None = None,
     ) -> dict[str, float]:
         """Add one training step and flush when its interval is complete."""
 
         payload = normalize_metrics(metrics, exclude=exclude)
+        self._last_step = step
+        self._latest.update(payload)
+        self._write_history("metrics", step=step, data={"metrics": payload})
         if self._run is None:
             return payload
-        accumulate_metrics(self._window, payload)
+        normalized_weights = (
+            None
+            if weights is None
+            else {metric_name(name): float(value) for name, value in weights.items()}
+        )
+        accumulate_metrics(self._window, payload, normalized_weights)
+        for name, value in payload.items():
+            if name.endswith(("/min", "_min")):
+                self._extrema[name] = min(self._extrema.get(name, value), value)
+            elif name.endswith(("/max", "_max")):
+                self._extrema[name] = max(self._extrema.get(name, value), value)
+        for name, std in payload.items():
+            mean_name = _mean_for_std(name)
+            if mean_name is None or mean_name not in payload:
+                continue
+            weight = (
+                1.0
+                if normalized_weights is None
+                else normalized_weights.get(name, 1.0)
+            )
+            total, count = self._second_moments.get(name, (0.0, 0.0))
+            self._second_moments[name] = (
+                total + weight * (std**2 + payload[mean_name] ** 2),
+                count + weight,
+            )
         if step % self._logging_step == 0:
             self.flush(step=step)
         return payload
@@ -178,6 +290,9 @@ class MetricsAPI:
         """Publish evaluation or summary metrics without window averaging."""
 
         payload = normalize_metrics(metrics, exclude=exclude)
+        self._last_step = step
+        self._latest.update(payload)
+        self._write_history("metrics", step=step, data={"metrics": payload})
         if self._run is not None and payload:
             self._run.log(
                 {**payload, "train/step": float(step)},
@@ -190,6 +305,19 @@ class MetricsAPI:
 
         payload = averaged_metrics(self._window)
         self._window.clear()
+        payload.update(self._extrema)
+        self._extrema.clear()
+        for name, (second_sum, count) in self._second_moments.items():
+            mean_name = _mean_for_std(name)
+            if mean_name in payload:
+                payload[name] = math.sqrt(
+                    max(0.0, second_sum / count - payload[mean_name] ** 2)
+                )
+        self._second_moments.clear()
+        if "train/loss" in payload and "train/perplexity" in payload:
+            payload["train/perplexity"] = math.exp(
+                min(700.0, payload["train/loss"])
+            )
         if self._run is not None and payload:
             self._run.log(
                 {**payload, "train/step": float(step)},
@@ -200,12 +328,26 @@ class MetricsAPI:
     def log_text(self, *, key: str, data: Any, step: int) -> None:
         """Publish algorithm-owned text, tables, or qualitative samples."""
 
+        if key.startswith("checkpoint/"):
+            self._write_history(
+                "checkpoint",
+                step=step,
+                data={"key": key, "path": str(data)},
+            )
         if self._run is not None:
             self._run.log_text(key=key, data=data, step=step)
 
     def finish(self, *, state: str = "success", error: str | None = None) -> None:
         """Finish the active run once and make later calls no-ops."""
 
+        if self._window:
+            self.flush(step=self._last_step)
+        self._write_history(
+            "finish",
+            step=self._last_step,
+            data={"state": state, "error": error, "metrics": self._latest},
+        )
+        self._history_closed = True
         if self._run is not None:
             finish_run(self._run, state=state, error=error)
             self._run = None

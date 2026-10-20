@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pytrio as trio
 from tqdm import tqdm
 
@@ -20,7 +21,7 @@ from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
 from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
 from ..utils.updates import run_update_async
@@ -61,6 +62,41 @@ def _remote_metrics(*responses: Any) -> dict[str, float]:
     return metrics
 
 
+def _importance_metrics(forward: Any, datums: Sequence[Any], cap: float | None):
+    """Measure current/behavior ratios returned by the policy forward pass."""
+
+    outputs = getattr(forward, "loss_fn_outputs", None)
+    if not isinstance(outputs, list) or len(outputs) != len(datums):
+        return {}
+    ratios = []
+    for datum, output in zip(datums, outputs, strict=True):
+        if not isinstance(output, Mapping) or "logprobs" not in output:
+            return {}
+        fields = getattr(datum, "loss_fn_inputs", {})
+        labels = getattr(fields.get("target_tokens"), "data", None)
+        behavior = getattr(fields.get("logprobs"), "data", None)
+        current = getattr(output["logprobs"], "data", None)
+        if not all(isinstance(values, list) for values in (labels, behavior, current)):
+            return {}
+        if not len(labels) == len(behavior) == len(current):
+            return {}
+        ratios.extend(
+            math.exp(min(700.0, float(now) - float(old)))
+            for label, old, now in zip(labels, behavior, current, strict=True)
+            if label != -100
+        )
+    if not ratios:
+        return {}
+    values = np.asarray(ratios, dtype=np.float64)
+    metrics = {
+        "policy/importance_ratio_mean": float(np.mean(values)),
+        "policy/importance_ratio_std": float(np.std(values)),
+    }
+    if cap is not None:
+        metrics["policy/cap_fraction"] = float(np.mean(values > cap))
+    return metrics
+
+
 @dataclass(slots=True)
 class _OPDMetricTotals:
     """Streaming sufficient statistics for OPD trainer reporting."""
@@ -68,11 +104,16 @@ class _OPDMetricTotals:
     prompt_count: int = 0
     completion_count: int = 0
     token_count: int = 0
+    completion_length_min: int | None = None
+    completion_length_max: int = 0
+    truncated_count: int = 0
     student_logprob_sum: float = 0.0
     teacher_logprob_sum: float = 0.0
     advantage_sum: float = 0.0
+    advantage_square_sum: float = 0.0
     teacher_weight_token_sum: float = 0.0
     weighted_reverse_kl_sum: float = 0.0
+    weighted_reverse_kl_square_sum: float = 0.0
 
     def add(
         self,
@@ -89,9 +130,22 @@ class _OPDMetricTotals:
         self.prompt_count += prompt_count
         self.completion_count += len(samples)
         self.token_count += sum(sample.tokens for sample in samples)
+        lengths = [sample.tokens for sample in samples]
+        if lengths:
+            smallest = min(lengths)
+            self.completion_length_min = (
+                smallest
+                if self.completion_length_min is None
+                else min(self.completion_length_min, smallest)
+            )
+            self.completion_length_max = max(self.completion_length_max, max(lengths))
+        self.truncated_count += sum(sample.rollout.truncated for sample in samples)
         self.student_logprob_sum += sum(sample.student_sum for sample in samples)
         self.teacher_logprob_sum += sum(sample.teacher_sum for sample in samples)
         self.advantage_sum += sum(sample.advantage_sum for sample in samples)
+        self.advantage_square_sum += sum(
+            value**2 for sample in samples for value in sample.advantages
+        )
         self.teacher_weight_token_sum += sum(
             sample.teacher_weight_sum * sample.tokens for sample in samples
         )
@@ -99,18 +153,43 @@ class _OPDMetricTotals:
             sample.teacher_weight_sum * (sample.student_sum - sample.teacher_sum)
             for sample in samples
         )
+        self.weighted_reverse_kl_square_sum += sum(
+            (
+                sample.teacher_weight_sum * (student - teacher)
+            ) ** 2
+            for sample in samples
+            for student, teacher in zip(
+                sample.rollout.behavior_logprobs,
+                sample.teacher_logprobs,
+                strict=True,
+            )
+        )
 
     def distillation(self, *, prefix: str) -> dict[str, float]:
         if self.token_count <= 0:
             raise ValueError("OPD metrics require at least one completion token.")
+        reverse_kl = self.weighted_reverse_kl_sum / self.token_count
         return {
-            f"{prefix}/reverse_kl_sampled": self.weighted_reverse_kl_sum
-            / self.token_count,
+            f"{prefix}/reverse_kl_sampled": reverse_kl,
+            f"{prefix}/reverse_kl_sampled_std": math.sqrt(
+                max(
+                    0.0,
+                    self.weighted_reverse_kl_square_sum / self.token_count
+                    - reverse_kl**2,
+                )
+            ),
             f"{prefix}/student_logprob": self.student_logprob_sum
             / self.token_count,
             f"{prefix}/teacher_logprob": self.teacher_logprob_sum
             / self.token_count,
             f"{prefix}/advantage_mean": self.advantage_sum / self.token_count,
+            f"{prefix}/advantage_std": math.sqrt(
+                max(
+                    0.0,
+                    self.advantage_square_sum / self.token_count
+                    - (self.advantage_sum / self.token_count) ** 2,
+                )
+            ),
             f"{prefix}/teacher_weight_sum": self.teacher_weight_token_sum
             / self.token_count,
         }
@@ -136,6 +215,18 @@ class _OPDMetricReducer:
                 "data/completions": float(totals.completion_count),
                 "data/completion_tokens": float(totals.token_count),
                 "policy/behavior_version": float(behavior_policy_version),
+                "policy/entropy_sampled": -totals.student_logprob_sum
+                / totals.token_count,
+                "rollout/completion_length_mean": totals.token_count
+                / totals.completion_count,
+                "rollout/completion_length_min": float(
+                    totals.completion_length_min
+                ),
+                "rollout/completion_length_max": float(
+                    totals.completion_length_max
+                ),
+                "rollout/truncated_fraction": totals.truncated_count
+                / totals.completion_count,
             }
         )
         return metrics
@@ -157,6 +248,12 @@ class _OPDMetricReducer:
                 "eval/prompts": float(totals.prompt_count),
                 "eval/completions": float(totals.completion_count),
                 "eval/tokens": float(totals.token_count),
+                "eval/completion_length_mean": totals.token_count
+                / totals.completion_count,
+                "eval/completion_length_min": float(totals.completion_length_min),
+                "eval/completion_length_max": float(totals.completion_length_max),
+                "eval/truncated_fraction": totals.truncated_count
+                / totals.completion_count,
             }
         )
         return metrics
@@ -182,13 +279,13 @@ class OPDTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         teacher_model: str | None = None,
         args: OPDConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
         teacher_model_path: str | None = None,
         teachers: Sequence[OPDTeacherSpec] | None = None,
         teacher_groups: Sequence[OPDTeacherGroup] | None = None,
@@ -197,6 +294,17 @@ class OPDTrainer:
     ) -> None:
         """Create clients and bind an immutable OPD algorithm execution plan."""
 
+        self.args = args or OPDConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
+        if teachers is None and self.args.teacher is not None:
+            if teacher_model is None:
+                teacher_model = self.args.teacher.name
+            if teacher_model_path is None:
+                teacher_model_path = self.args.teacher.model_path
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if (
@@ -294,7 +402,6 @@ class OPDTrainer:
         self.teacher_model_path = (
             teacher_specs[0].model_path if len(teacher_specs) == 1 else None
         )
-        self.args = args or OPDConfig()
         if execution_plan is not None and not isinstance(
             execution_plan, OPDExecutionPlan
         ):
@@ -458,7 +565,19 @@ class OPDTrainer:
     def _log(self, metrics: dict[str, float]) -> None:
         """Accumulate OPD metrics and flush at the configured interval."""
 
-        self._metrics_api.record(metrics, step=self.state.global_step)
+        token_count = metrics.get("data/completion_tokens", 1.0)
+        weights = {
+            name: token_count
+            for name in metrics
+            if name.startswith(("distill/", "policy/"))
+        }
+        if "train/loss" in metrics:
+            weights["train/loss"] = metrics.get("token_count", token_count)
+        self._metrics_api.record(
+            metrics,
+            step=self.state.global_step,
+            weights=weights,
+        )
 
     def _flush_log(self) -> None:
         """Publish and clear the current OPD metric window."""
@@ -504,6 +623,13 @@ class OPDTrainer:
         sample_input_tokens = sum(len(prompt.tokens) for prompt in prompts)
         sample_output_tokens = sum(sample.tokens for sample in scored)
         metrics = _remote_metrics(update.forward, update.optimizer)
+        metrics.update(
+            _importance_metrics(
+                update.forward,
+                datums,
+                self.args.importance_ratio_cap,
+            )
+        )
         metrics.update(
             self._metric_reducer.training(
                 scored,
@@ -598,7 +724,17 @@ class OPDTrainer:
             self._training_client, "save_weights_and_get_sampling_client"
         )
         totals = _OPDMetricTotals()
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="OPD eval",
+            unit="batch",
+        ):
             prompts = await asyncio.to_thread(self._prompts, rows)
             scored = await self._rollout_and_score(prompts, sampler)
             totals.add(scored, prompt_count=len(prompts))
@@ -661,7 +797,16 @@ class OPDTrainer:
                     break
                 result = await self._step_async(rows)
                 progress.set_postfix(
-                    kl=f"{result.metrics['distill/reverse_kl_sampled']:.4f}",
+                    {
+                        label: f"{result.metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("reverse_kl", "distill/reverse_kl_sampled"),
+                            ("grad_norm", "optim/grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in result.metrics
+                    },
                     refresh=False,
                 )
                 progress.update(1)
@@ -675,35 +820,33 @@ class OPDTrainer:
             if self.state.global_step > initial_step:
                 if not self.args.save_every or self.state.global_step % self.args.save_every:
                     await self._save_state_async()
-                if self._metrics_api.enabled:
-                    elapsed = time.perf_counter() - started
-                    self._flush_log()
-                    self._metrics_api.publish(
-                        {
-                            "time/train_runtime": elapsed,
-                            "time/train_steps_per_second": (
-                                self.state.global_step - initial_step
-                            )
-                            / elapsed,
-                            "time/train_tokens_per_second": (
-                                self._total_tokens - initial_tokens
-                            )
-                            / elapsed,
-                            "usage/train_tokens_total": float(self._total_tokens),
-                            "usage/sample_input_tokens_total": float(
-                                self._sample_input_tokens
-                            ),
-                            "usage/sample_output_tokens_total": float(
-                                self._sample_output_tokens
-                            ),
-                        },
-                        step=self.state.global_step,
+                elapsed = time.perf_counter() - started
+                summary = {
+                    "time/train_runtime": elapsed,
+                    "time/train_steps_per_second": (
+                        self.state.global_step - initial_step
                     )
-                    self._metrics_api.log_text(
-                        key="checkpoint/path",
-                        data=self.state.checkpoint_path,
-                        step=self.state.global_step,
+                    / elapsed,
+                    "time/train_tokens_per_second": (
+                        self._total_tokens - initial_tokens
                     )
+                    / elapsed,
+                    "usage/train_tokens_total": float(self._total_tokens),
+                    "usage/sample_input_tokens_total": float(
+                        self._sample_input_tokens
+                    ),
+                    "usage/sample_output_tokens_total": float(
+                        self._sample_output_tokens
+                    ),
+                }
+                self.state.metrics.update(summary)
+                self._flush_log()
+                self._metrics_api.publish(summary, step=self.state.global_step)
+                self._metrics_api.log_text(
+                    key="checkpoint/path",
+                    data=self.state.checkpoint_path,
+                    step=self.state.global_step,
+                )
             if (
                 self.eval_dataset is not None
                 and self.args.eval_after_train

@@ -26,7 +26,7 @@ from ..dataset import (
     prepare_prompt,
 )
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.scoring import (
     score_completion,
@@ -53,16 +53,24 @@ class DPOTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         ref_model: str | None = None,
         args: DPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
     ) -> None:
         """Create policy/reference clients and validate their token contract."""
 
+        self.args = args or DPOConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if ref_model is None and self.args.reference is not None:
+            ref_model = self.args.reference.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if ref_model is not None and (
@@ -71,7 +79,6 @@ class DPOTrainer:
             raise ValueError("ref_model must be a PyTRIO base-model ID when provided.")
         self.model = model.strip()
         self.ref_model = ref_model.strip() if ref_model is not None else self.model
-        self.args = args or DPOConfig()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self._service_client = trio.ServiceClient()
@@ -250,7 +257,17 @@ class DPOTrainer:
         )
         totals: dict[str, float] = {}
         pairs_total = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="DPO eval",
+            unit="batch",
+        ):
             pairs = self._preferences(rows)
             metrics = self._evaluation_metrics(
                 self._scores(policy_client, pairs), self._reference_scores(pairs)
@@ -282,7 +299,17 @@ class DPOTrainer:
         )
         totals: dict[str, float] = {}
         pairs_total = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="DPO eval",
+            unit="batch",
+        ):
             pairs = self._preferences(rows)
             policy, reference = await asyncio.gather(
                 self._scores_async(policy_client, pairs),
@@ -338,6 +365,13 @@ class DPOTrainer:
         self._metrics_api.record(
             {**metrics, "train/pairs": count},
             step=self.state.global_step,
+            weights={
+                name: float(count)
+                for name in metrics
+                if name == "train/loss"
+                or name == "train/logratio_margin"
+                or name.startswith(("reward/", "train/logp", "train/reference_logp"))
+            },
         )
 
     def _flush_swanlab(self) -> None:
@@ -473,13 +507,18 @@ class DPOTrainer:
         """Select compact scalars for the terminal progress bar."""
 
         return {
-            key: f"{value:.4f}"
-            for key, value in result.metrics.items()
-            if key in {"train/loss", "reward/accuracy"}
+            label: f"{result.metrics[name]:.4f}"
+            for label, name in (
+                ("loss", "train/loss"),
+                ("accuracy", "reward/accuracy"),
+                ("grad_norm", "optim/grad_norm"),
+                ("tokens", "usage/train_tokens_total"),
+            )
+            if name in result.metrics
         }
 
     def _log_final_checkpoint(self) -> None:
-        """Publish the final checkpoint URI when reporting is enabled."""
+        """Record the final checkpoint URI in configured metric outputs."""
 
         if self.state.checkpoint_path is not None:
             self._metrics_api.log_text(
@@ -628,7 +667,12 @@ class DPOTrainer:
             raise ValueError("train_dataset is required for train().")
         started = time.perf_counter()
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="DPO train",
+            unit="step",
+        )
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
@@ -682,7 +726,12 @@ class DPOTrainer:
             raise ValueError("train_dataset is required for train_async().")
         started = time.perf_counter()
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="DPO train",
+            unit="step",
+        )
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (

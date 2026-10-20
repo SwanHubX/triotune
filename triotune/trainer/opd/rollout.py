@@ -104,6 +104,9 @@ class OPDRolloutPhase:
                 raise ValueError("Student completion must contain token IDs.")
             if logprobs is None:
                 raise ValueError("Student sampling must return completion logprobs.")
+            reason = _field(sequence, "stop_reason")
+            reason = getattr(reason, "value", getattr(reason, "name", reason))
+            reason = str(reason).lower() if reason is not None else ""
             # The contract copies and validates the values before any teacher
             # request can observe this prompt group.
             rollout = OPDRollout(
@@ -116,6 +119,11 @@ class OPDRolloutPhase:
                 # Routing is framework metadata: the student rollout cannot
                 # alter which teacher group will score its sampled actions.
                 teacher_group=prompt.teacher_group,
+                truncated=(
+                    reason in ("length", "max_tokens", "max_length")
+                    or reason.endswith("_length")
+                    or (not reason and len(tokens) >= max_tokens)
+                ),
             )
             if len(rollout.completion_tokens) > max_tokens:
                 raise ValueError(

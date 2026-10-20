@@ -21,9 +21,9 @@ triotune/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
 │   ├── dataloader.py    # 流式数据集的 batch 迭代
 │   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
-│   ├── reporting.py     # 进程隔离的 SwanLab secondary-run reporter
+│   ├── reporting.py     # 兼容旧调用的进程隔离 secondary-run reporter
 │   ├── scoring.py       # 固定 completion 的 logprob 评分与对齐
-│   └── metrics.py       # 指标规范化、窗口聚合与 SwanLab 提交
+│   └── metrics.py       # 指标规范化、JSONL 历史、窗口聚合与 SwanLab 提交
 └── trainer/
     ├── __init__.py      # 公开导出与历史模块路径兼容
     ├── dpo_trainer.py   # DPO 训练编排
@@ -50,13 +50,13 @@ triotune/
 | 模块 | 职责 |
 | --- | --- |
 | [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
-| [配置契约](../api/cli_args.py) | 定义 `BaseTrainerConfig` 以及 DPO、SFT、OPD、PPO 配置；GRPO 使用 `PPOConfig.for_algorithm("grpo")`。 |
+| [配置契约](../api/cli_args.py) | 按模型、训练／验证数据源、训练循环、优化器、保存、评估、日志、rollout、actor/critic、reference/teacher 等职责定义可组合配置；DPO、SFT、OPD、PPO 顶层对象可表示完整实验，同时保留依赖注入兼容性。 |
 | [客户端契约](../api/client_api.py) | 统一 TrainingClient、SamplingClient 的同步／异步调用、future 解析及 SDK 参数构造；client 刷新时机由算法决定。 |
 | [输入渲染](../dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
 | [训练样本](../dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
 | [SWE 轨迹](../dataset/swe_sft/) | 将包含工具调用、工具结果和多轮决策的软件工程智能体轨迹转换为 PyTRIO SFT 数据。 |
-| [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、窗口聚合、SwanLab 提交、文本记录和 run 结束。 |
+| [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、`log_dir` JSONL 历史、窗口聚合、SwanLab 提交、checkpoint URI 记录和 run 结束。 |
 | [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
 | [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
 | [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |
@@ -68,6 +68,16 @@ triotune/
 | [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；路由组内的固定 teacher 给同一 token 序列评分，并聚合为加权几何 ensemble。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
 | [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
 | [OPD contracts](./opd/contracts.py) | 隔离 SDK response 并校验阶段间数据；OPD trainer 以 completion token 为分母归约蒸馏指标，验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
+
+SFT、DPO、OPD 和 PPO-family 的完整训练入口均显示 train step 进度；所有 evaluation
+入口按 batch 显示独立进度。数据源可求长度时展示准确总 batch 数，流式 iterable 则展示已完成 batch 与速率。
+
+指标按其自然样本数聚合：语言模型损失按有效 token、DPO 按 pair、PPO policy/critic
+按有效 action、OPD 蒸馏指标按 completion token 加权；标准差通过一二阶矩合并，而不是
+直接平均各 batch 的标准差。PPO/OPD 的 KL 与 entropy 字段带有 `sampled` 时仅表示已采样
+action 上的估计，不代表完整词表分布统计。
+SFT 始终从交叉熵报告 perplexity；`train/token_accuracy` 仅在 PyTRIO 后端返回
+`token_accuracy`/`accuracy` 时透传，因为目标 token logprob 本身不足以判断全词表 argmax。
 
 ```text
 dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
@@ -83,8 +93,8 @@ dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/d
 
 ```python
 # PPO-family / OPD：每行传入一个生成 prompt。
-# 字段名默认是 messages，可分别通过 PPOConfig.prompt_key 和
-# OPDConfig.prompt_key 修改。字段值支持纯文本、token ID 或聊天消息。
+# 字段名默认是 messages，可分别通过 PPOConfig.rollout.prompt_key 和
+# OPDConfig.rollout.prompt_key 修改。字段值支持纯文本、token ID 或聊天消息。
 prompt_rows = [
     {"messages": "Explain why the sky is blue."},
     {"messages": [151644, 8948, 198]},
@@ -187,13 +197,12 @@ trainer = SFTTrainer(
 ```python
 import asyncio
 
-from triotune.trainer import SFTConfig, SFTTrainer
+from triotune.trainer import EvaluationConfig, SFTConfig, SFTTrainer
 
 trainer = SFTTrainer(
     model="Qwen/Qwen3.5-4B",
     args=SFTConfig(
-        eval_steps=50,
-        eval_after_train=False,
+        evaluation=EvaluationConfig(steps=50, after_train=False),
     ),
     train_dataset=train_rows,
     eval_dataset=eval_rows,
@@ -206,12 +215,16 @@ state = asyncio.run(trainer.train())
 ```python
 import asyncio
 
-from triotune.trainer import PPOConfig, PPOTrainer
+from triotune.trainer import PPOConfig, PPORolloutConfig, PPOTrainer, TrainingConfig
 
 trainer = PPOTrainer(
     model="Qwen/Qwen3.5-4B",
     reward_fn=my_reward,
-    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
+    args=PPOConfig.for_algorithm(
+        "grpo",
+        training=TrainingConfig(max_steps=100),
+        rollout=PPORolloutConfig(num_generations=4),
+    ),
     train_dataset=prompt_rows,
 )
 state = asyncio.run(trainer.train())
@@ -224,11 +237,19 @@ uv sync --extra dpo
 ```
 
 ```python
-from triotune.trainer import DPOConfig, DPOTrainer
+from triotune.trainer import (
+    DPOConfig,
+    DPOObjectiveConfig,
+    DPOTrainer,
+    TrainingConfig,
+)
 
 trainer = DPOTrainer(
     model="Qwen/Qwen3.5-4B",
-    args=DPOConfig(beta=0.1, batch_size=1, max_steps=1),
+    args=DPOConfig(
+        training=TrainingConfig(batch_size=1, max_steps=1),
+        objective=DPOObjectiveConfig(beta=0.1),
+    ),
     train_dataset=preference_rows,
 )
 state = trainer.train()
@@ -237,13 +258,13 @@ state = trainer.train()
 ## OPD 训练
 
 ```python
-from triotune.trainer import OPDConfig, OPDTrainer
+from triotune.trainer import OPDConfig, OPDTrainer, TrainingConfig
 
 trainer = OPDTrainer(
     model="student-base-model-id",
     teacher_model="teacher-base-model-id",
     # teacher_model_path="trio://...",  # 可选的教师 LoRA checkpoint。
-    args=OPDConfig(batch_size=4, max_steps=100),
+    args=OPDConfig(training=TrainingConfig(batch_size=4, max_steps=100)),
     train_dataset=prompt_rows,
 )
 state = trainer.train()
@@ -284,7 +305,7 @@ trainer = OPDTrainer(
     model="student-base-model-id",
     teachers=teachers,
     teacher_groups=groups,
-    args=OPDConfig(batch_size=2, max_steps=100),
+    args=OPDConfig(training=TrainingConfig(batch_size=2, max_steps=100)),
     train_dataset=rows,
 )
 ```

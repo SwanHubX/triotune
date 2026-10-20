@@ -10,20 +10,21 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import pytrio as trio
+from tqdm import tqdm
 
 from ..api.cli_args import PPOConfig
 from ..api.client_api import call_async
 from ..utils.checkpoint import save_checkpoint_async
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
-from ..utils.reporting import isolated_metrics as critic_metrics
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
 from .ppo.contracts import PPOState, Trajectory
@@ -43,6 +44,9 @@ class PPOTrainer:
     complete trajectories. PPO creates a separate PyTRIO critic by default;
     callers can still inject an alternative Critic. Initialization is lazy.
     ``max_steps``/``save_every`` count rollout updates, not optimizer minibatches.
+    ``eval_dataset`` must be replayable when periodic evaluation is enabled;
+    evaluation samples the current actor and scores the same task reward without
+    reference/critic scoring or any optimizer update.
     """
 
     # ------------------------------------------------------------------
@@ -51,14 +55,15 @@ class PPOTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         args: PPOConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         reward_fn: Callable | None = None,
         *,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         reference_model: str | None = None,
         critic: Critic | None = None,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
         training_client=None,
         critic_training_client=None,
         tokenizer=None,
@@ -70,6 +75,14 @@ class PPOTrainer:
         Clients are accepted as dependencies for tests and custom workflows;
         missing clients are created during :meth:`initialize`.
         """
+        self.args = args or PPOConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if reference_model is None and self.args.reference is not None:
+            reference_model = self.args.reference.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if reference_model is not None and (
@@ -82,10 +95,9 @@ class PPOTrainer:
             or lora_rank < 1
         ):
             raise ValueError("lora_rank must be a positive integer.")
-        self.model, self.reference_model, self.args = (
+        self.model, self.reference_model = (
             model.strip(),
             reference_model.strip() if reference_model is not None else None,
-            args or PPOConfig(),
         )
         if (
             critic is not None or critic_training_client is not None
@@ -97,8 +109,9 @@ class PPOTrainer:
             )
         if training_client is not None and training_client is critic_training_client:
             raise ValueError("Actor and critic must use independent training clients.")
-        self.train_dataset, self.reward_fn, self.critic = (
+        self.train_dataset, self.eval_dataset, self.reward_fn, self.critic = (
             train_dataset,
+            eval_dataset,
             reward_fn,
             critic,
         )
@@ -113,6 +126,10 @@ class PPOTrainer:
         self._metrics = None
         self._sample_input_tokens = 0
         self._sample_output_tokens = 0
+        self._eval_sample_input_tokens = 0
+        self._eval_sample_output_tokens = 0
+        self._last_eval_step: int | None = None
+        self._rollout_metrics: dict[str, float] = {}
         self.state = PPOState()
 
     # ------------------------------------------------------------------
@@ -172,39 +189,19 @@ class PPOTrainer:
                 )
             self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids)
 
-        # Keep actor and critic metrics in separate runs when the trainer owns
-        # both clients, while preserving one public actor metrics stream.
+        # Actor and critic remain independent training clients, but one PPO
+        # experiment owns one metric run with component-specific namespaces.
         name = self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-ppo-family"
-        actor_args = (
-            replace(self.args, run_name=f"{name}-actor")
-            if self._owns_critic
-            else self.args
-        )
         self._metrics = MetricsAPI.from_config(
-            actor_args,
+            self.args,
             default_name=name,
             metadata={
                 "model": self.model,
                 "lora_rank": self.lora_rank,
-                "role": "actor",
+                "components": ["actor", "critic"] if self._owns_critic else ["actor"],
             },
+            logging_step=self.args.logging_step,
         )
-        if self._owns_critic:
-            self.critic.metrics = await asyncio.to_thread(
-                critic_metrics,
-                self.args,
-                name=f"{name}-critic",
-                metadata={
-                    "role": "critic",
-                    "model": self.model,
-                    "lora_rank": self.args.critic_lora_rank or self.lora_rank,
-                    "learning_rate": self.args.critic_learning_rate
-                    or self.args.learning_rate,
-                    "seed": None if self.args.seed is None else self.args.seed + 1,
-                    "critic_token_ids": list(self.critic.token_ids),
-                    "value_mapping": "scale * (logp_positive - logp_negative) + bias",
-                },
-            )
         self._actor = PPOActor(self._client, self.args)
 
     async def _references(self, trajectories):
@@ -282,10 +279,79 @@ class PPOTrainer:
         )
         train_tokens = total_train_tokens - initial_train_tokens
         rewards = [t.reward for t in trajectories]
+        active_logprobs = [
+            logprob
+            for trajectory in batch.trajectories
+            for logprob, active in zip(
+                trajectory.logprobs, trajectory.loss_mask, strict=True
+            )
+            if active
+        ]
+        active_advantages = [
+            value
+            for row, mask in zip(batch.advantages, batch.masks, strict=True)
+            for value, active in zip(row, mask, strict=True)
+            if active
+        ]
+        active_returns = [
+            value
+            for row, mask in zip(batch.returns, batch.masks, strict=True)
+            for value, active in zip(row, mask, strict=True)
+            if active
+        ]
+        lengths = [len(t.completion_tokens) for t in trajectories]
+        reward_components = {
+            name: [
+                trajectory.reward_components[name]
+                for trajectory in trajectories
+                if name in trajectory.reward_components
+            ]
+            for name in {
+                name
+                for trajectory in trajectories
+                for name in trajectory.reward_components
+            }
+        }
+        reference_differences = [
+            behavior - reference
+            for trajectory in batch.trajectories
+            if trajectory.reference_logprobs is not None
+            for behavior, reference, active in zip(
+                trajectory.logprobs,
+                trajectory.reference_logprobs,
+                trajectory.loss_mask,
+                strict=True,
+            )
+            if active
+        ]
+        overlong_penalties = []
+        if self.args.overlong_tokens:
+            for length in lengths:
+                excess = max(
+                    0,
+                    length - (self.args.max_tokens - self.args.overlong_tokens),
+                )
+                overlong_penalties.append(
+                    min(1.0, excess / self.args.overlong_tokens)
+                    * self.args.overlong_penalty_factor
+                )
         metrics.update(
             {
                 "reward/mean": float(np.mean(rewards)),
                 "reward/std": float(np.std(rewards)),
+                "reward/min": float(np.min(rewards)),
+                "reward/max": float(np.max(rewards)),
+                "policy/entropy_sampled": float(-np.mean(active_logprobs)),
+                "advantage/mean": float(np.mean(active_advantages)),
+                "advantage/std": float(np.std(active_advantages)),
+                "return/mean": float(np.mean(active_returns)),
+                "return/std": float(np.std(active_returns)),
+                "rollout/completion_length_mean": float(np.mean(lengths)),
+                "rollout/completion_length_min": float(np.min(lengths)),
+                "rollout/completion_length_max": float(np.max(lengths)),
+                "rollout/truncated_fraction": float(
+                    np.mean([t.truncated for t in trajectories])
+                ),
                 "train/trajectories": float(len(trajectories)),
                 "train/action_tokens": float(sum(sum(mask) for mask in batch.masks)),
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
@@ -297,7 +363,86 @@ class PPOTrainer:
                 "time/update": time.perf_counter() - prepared_at,
             }
         )
-        self.state.metrics = self._metrics.record(metrics, step=self.state.global_step)
+        if reference_differences:
+            sampled_kl = float(np.mean(reference_differences))
+            estimated_kl = [
+                difference
+                if self.args.kl_estimator == "k1"
+                else 0.5 * difference**2
+                if self.args.kl_estimator == "k2"
+                else math.expm1(min(700.0, -difference)) + difference
+                for difference in reference_differences
+            ]
+            metrics.update(
+                {
+                    "policy/reference_kl_sampled": sampled_kl,
+                    "reward/kl_penalty_mean": float(
+                        np.mean(
+                            [
+                                -self.args.kl_ctl * max(-10.0, min(10.0, value))
+                                for value in estimated_kl
+                            ]
+                        )
+                    ),
+                }
+            )
+        if overlong_penalties:
+            metrics.update(
+                {
+                    "reward/overlong_penalty_mean": float(
+                        np.mean(overlong_penalties)
+                    ),
+                    "rollout/overlong_fraction": float(
+                        np.mean([value > 0 for value in overlong_penalties])
+                    ),
+                }
+            )
+        if set(rewards) <= {0.0, 1.0}:
+            metrics["reward/success_rate"] = float(np.mean(rewards))
+        for name, values in reward_components.items():
+            metrics[f"reward/{name}/mean"] = float(np.mean(values))
+        if "success" in reward_components:
+            metrics["reward/success_rate"] = float(
+                np.mean(reward_components["success"])
+            )
+        metrics.update(self._rollout_metrics)
+        self._rollout_metrics = {}
+        action_weight = metrics["train/action_tokens"]
+        loss_weight = (
+            action_weight
+            if self.args.loss_aggregation == "token_mean"
+            else metrics["train/trajectories"]
+            if self.args.loss_aggregation in {"seq_mean", "constant"}
+            else metrics["train/prompt_groups"]
+        )
+        weights = {
+            name: action_weight
+            for name in metrics
+            if name.startswith(("policy/", "advantage/", "return/"))
+            or (
+                name.startswith("critic/")
+                and name
+                not in {
+                    "critic/grad_norm",
+                    "critic/learning_rate",
+                    "critic/optimizer_steps",
+                }
+            )
+        }
+        weights["train/loss"] = loss_weight
+        weights.update(
+            {
+                name: metrics["train/trajectories"]
+                for name in metrics
+                if name.startswith(("reward/", "rollout/completion_length"))
+                or name == "rollout/truncated_fraction"
+            }
+        )
+        self.state.metrics = self._metrics.record(
+            metrics,
+            step=self.state.global_step,
+            weights=weights,
+        )
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
             await self.save_checkpoint()
         return self.state.metrics
@@ -307,7 +452,7 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     async def save_checkpoint(self) -> str:
-        """Save owned actor and critic runs and return the actor checkpoint."""
+        """Save owned actor and critic states and return the actor checkpoint."""
         await self.initialize()
 
         async def actor_save():
@@ -324,18 +469,26 @@ class PPOTrainer:
         if self._owns_critic:
             jobs.append(critic_save())
         await gather_cancel_on_error(jobs)
+        self._metrics.log_text(
+            key="checkpoint/actor_path",
+            data=self.state.checkpoint_path,
+            step=self.state.global_step,
+        )
+        if self.state.critic_checkpoint_path is not None:
+            self._metrics.log_text(
+                key="checkpoint/critic_path",
+                data=self.state.critic_checkpoint_path,
+                step=self.state.global_step,
+            )
         return self.state.checkpoint_path
 
     async def close(self, *, state="success", error=None) -> None:
-        """Finish owned reporters; injected critics retain lifecycle ownership."""
-        try:
-            if self._owns_critic and self.critic is not None:
-                await asyncio.to_thread(self.critic.finish, state=state, error=error)
-        finally:
-            if self._metrics is not None:
-                # SwanLab restores signal handlers on finish. The actor run was
-                # initialized in this process and must finish on the main thread.
-                self._metrics.finish(state=state, error=error)
+        """Finish the experiment reporter; injected critics retain ownership."""
+
+        if self._metrics is not None:
+            # SwanLab restores signal handlers on finish and therefore remains
+            # on the main thread even though actor/critic updates are concurrent.
+            self._metrics.finish(state=state, error=error)
 
     # ------------------------------------------------------------------
     # Dataset-driven rollout collection and training entry point
@@ -349,6 +502,7 @@ class PPOTrainer:
                 self._client, "save_weights_and_get_sampling_client"
             )
         accepted, empty = [], 0
+        sampled_groups = rejected_groups = refill_count = 0
         group_count = 0
         while group_count < self.args.batch_size:
             # Dynamic sampling may reject entire prompt groups, so keep reading
@@ -366,8 +520,23 @@ class PPOTrainer:
                 sample_usage_callback=self._record_sample_usage,
             )
             self._next_group += len(source)
+            sampled_groups += len(source)
             if self.args.dynamic_sampling:
-                generated = filter_informative_groups(generated)
+                filtered = filter_informative_groups(generated)
+                rejected_groups += len(source) - len(
+                    {trajectory.group_id for trajectory in filtered}
+                )
+                generated = filtered
+                if (
+                    len(
+                        {
+                            trajectory.group_id
+                            for trajectory in accepted + generated
+                        }
+                    )
+                    < self.args.batch_size
+                ):
+                    refill_count += 1
             accepted.extend(generated)
             group_count = len({t.group_id for t in accepted})
             empty = empty + 1 if not generated else 0
@@ -375,6 +544,14 @@ class PPOTrainer:
                 raise RuntimeError(
                     "Dynamic sampling found too many consecutive uninformative batches."
                 )
+        if self.args.dynamic_sampling:
+            self._rollout_metrics = {
+                "rollout/degenerate_group_fraction": (
+                    rejected_groups / sampled_groups if sampled_groups else 0.0
+                ),
+                "rollout/rejected_groups": float(rejected_groups),
+                "rollout/refill_count": float(refill_count),
+            }
         return accepted
 
     def _record_sample_usage(self, usage: SampleTokens) -> None:
@@ -383,14 +560,164 @@ class PPOTrainer:
         self._sample_input_tokens += usage.input_tokens
         self._sample_output_tokens += usage.output_tokens
 
+    # ------------------------------------------------------------------
+    # Reward evaluation shared by every PPO-family preset
+    # ------------------------------------------------------------------
+
+    def _evaluation_batches(
+        self, dataset: Iterable[Mapping[str, Any]]
+    ) -> Iterable[list[Mapping[str, Any]]]:
+        """Yield validation prompts under the shared evaluation limits."""
+
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        yield from iter_batches(
+            dataset,
+            batch_size,
+            max_batches=self.args.eval_max_batches,
+        )
+
+    def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Store validation metrics without advancing any training counter."""
+
+        values = {str(name): float(value) for name, value in metrics.items()}
+        self._last_eval_step = self.state.global_step
+        self.state.metrics.update(values)
+        self._metrics.publish(values, step=self.state.global_step)
+        return values
+
+    async def evaluate(
+        self,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, float]:
+        """Sample the current actor and aggregate task reward without updates.
+
+        The method is algorithm-agnostic: PPO, GRPO, CISPO and every other
+        preset share the same prompt rendering, rollout and reward contract.
+        Evaluation deliberately skips reference scoring, critic values,
+        advantage construction, backward and optimizer calls.
+        """
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("eval_dataset is required for evaluate().")
+        if not callable(self.reward_fn):
+            raise ValueError("evaluate() requires reward_fn.")
+        await self.initialize()
+        sampler = await call_async(
+            self._client, "save_weights_and_get_sampling_client"
+        )
+        started = time.perf_counter()
+        trajectories: list[Trajectory] = []
+        prompt_count = 0
+        batch_count = 0
+        sample_input_tokens = 0
+        sample_output_tokens = 0
+
+        def record_usage(usage: SampleTokens) -> None:
+            nonlocal sample_input_tokens, sample_output_tokens
+            sample_input_tokens += usage.input_tokens
+            sample_output_tokens += usage.output_tokens
+
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="PPO eval",
+            unit="batch",
+        ):
+            batch = await generate_rollouts(
+                sampler,
+                self._tokenizer,
+                rows,
+                self.reward_fn,
+                self.args,
+                first_group=prompt_count,
+                sample_usage_callback=record_usage,
+            )
+            trajectories.extend(batch)
+            prompt_count += len(rows)
+            batch_count += 1
+        if not trajectories:
+            raise ValueError("eval_dataset must contain at least one prompt.")
+
+        rewards = np.asarray([item.reward for item in trajectories], dtype=np.float64)
+        lengths = np.asarray(
+            [len(item.completion_tokens) for item in trajectories],
+            dtype=np.float64,
+        )
+        self._eval_sample_input_tokens += sample_input_tokens
+        self._eval_sample_output_tokens += sample_output_tokens
+        metrics = {
+            "eval/reward_mean": float(np.mean(rewards)),
+            "eval/reward_std": float(np.std(rewards)),
+            "eval/reward_min": float(np.min(rewards)),
+            "eval/reward_max": float(np.max(rewards)),
+            "eval/prompts": float(prompt_count),
+            "eval/trajectories": float(len(trajectories)),
+            "eval/batches": float(batch_count),
+            "eval/completion_tokens": float(np.sum(lengths)),
+            "eval/completion_length_mean": float(np.mean(lengths)),
+            "eval/completion_length_min": float(np.min(lengths)),
+            "eval/completion_length_max": float(np.max(lengths)),
+            "eval/truncated_fraction": float(
+                np.mean([item.truncated for item in trajectories])
+            ),
+            "usage/eval_sample_input_tokens": float(sample_input_tokens),
+            "usage/eval_sample_output_tokens": float(sample_output_tokens),
+            "usage/eval_sample_input_tokens_total": float(
+                self._eval_sample_input_tokens
+            ),
+            "usage/eval_sample_output_tokens_total": float(
+                self._eval_sample_output_tokens
+            ),
+            "time/eval": time.perf_counter() - started,
+        }
+        components = {
+            name: [
+                trajectory.reward_components[name]
+                for trajectory in trajectories
+                if name in trajectory.reward_components
+            ]
+            for name in {
+                name
+                for trajectory in trajectories
+                for name in trajectory.reward_components
+            }
+        }
+        if set(rewards.tolist()) <= {0.0, 1.0}:
+            metrics["eval/success_rate"] = float(np.mean(rewards))
+        for name, values in components.items():
+            metrics[f"eval/reward_{name}_mean"] = float(np.mean(values))
+        if "success" in components:
+            metrics["eval/success_rate"] = float(np.mean(components["success"]))
+        return self._publish_evaluation(metrics)
+
     async def train(self) -> PPOState:
         """Collect rollout batches until ``max_steps`` and return final state."""
         if self.train_dataset is None or not callable(self.reward_fn):
             raise ValueError(
                 "train() requires train_dataset and reward_fn; use step() for custom trajectories."
             )
+        started = time.perf_counter()
+        initial_step = self.state.global_step
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=initial_step,
+            desc="PPO train",
+            unit="step",
+        )
         try:
             await self.initialize()
+            if (
+                self.eval_dataset is not None
+                and self.args.eval_before_train
+                and self._last_eval_step is None
+            ):
+                await self.evaluate()
             rows = iter(self.train_dataset)
             while (
                 self.args.max_steps is None
@@ -424,6 +751,21 @@ class PPOTrainer:
                         step=self.state.global_step,
                     )
                 )
+                progress.set_postfix(
+                    {
+                        label: f"{self.state.metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("reward", "reward/mean"),
+                            ("critic_loss", "critic/loss"),
+                            ("grad_norm", "train/grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in self.state.metrics
+                    },
+                    refresh=False,
+                )
+                progress.update(1)
                 self.state.metrics.update(
                     self._metrics.publish(
                         {
@@ -433,6 +775,13 @@ class PPOTrainer:
                         step=self.state.global_step,
                     )
                 )
+                if (
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and self.state.global_step % self.args.eval_steps == 0
+                    and self._last_eval_step != self.state.global_step
+                ):
+                    await self.evaluate()
             if not self.state.global_step:
                 raise ValueError("No trainable rollout batch was collected.")
             if (
@@ -440,9 +789,28 @@ class PPOTrainer:
                 or self.state.global_step % self.args.save_every
             ):
                 await self.save_checkpoint()
-            self._metrics.log_text(
-                key="checkpoint/path",
-                data=self.state.checkpoint_path,
+            if (
+                self.eval_dataset is not None
+                and self.args.eval_after_train
+                and self._last_eval_step != self.state.global_step
+            ):
+                await self.evaluate()
+            elapsed = time.perf_counter() - started
+            summary = {
+                "time/train_runtime": elapsed,
+                "time/train_steps_per_second": (
+                    self.state.global_step - initial_step
+                )
+                / elapsed,
+                "usage/train_tokens_total": self.state.metrics.get(
+                    "usage/train_tokens_total", 0.0
+                ),
+                "usage/sample_input_tokens_total": float(self._sample_input_tokens),
+                "usage/sample_output_tokens_total": float(self._sample_output_tokens),
+            }
+            self.state.metrics.update(summary)
+            self._metrics.publish(
+                summary,
                 step=self.state.global_step,
             )
             await self.close()
@@ -452,6 +820,8 @@ class PPOTrainer:
             except Exception as cleanup_error:
                 error.add_note(f"Reporter cleanup also failed: {cleanup_error}")
             raise
+        finally:
+            progress.close()
         return self.state
 
 

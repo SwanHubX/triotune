@@ -11,7 +11,13 @@ import sys
 
 from .actor import PPOActor
 from .advantages import normalize, prepare_advantages
-from ...api.cli_args import NormConfig, PPOConfig
+from ...api.cli_args import (
+    NormConfig,
+    PPOActorConfig,
+    PPOConfig,
+    PPOCriticConfig,
+    PPORolloutConfig,
+)
 from .contracts import PPOState, PreparedBatch, Trajectory
 from .critic import Critic, PyTRIOCritic, value_loss
 from .gae import compute_gae, compute_token_level_gae, compute_turn_level_gae
@@ -62,11 +68,14 @@ __all__ = [
     "Critic",
     "NormConfig",
     "PPOActor",
+    "PPOActorConfig",
     "PPOConfig",
+    "PPOCriticConfig",
     "PPOState",
     "PPOTrainer",
     "PyTRIOCritic",
     "PreparedBatch",
+    "PPORolloutConfig",
     "Trajectory",
     "compute_gae",
     "compute_token_level_gae",

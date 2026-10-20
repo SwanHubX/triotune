@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from numbers import Real
 
 
 @dataclass(slots=True)
@@ -25,6 +27,7 @@ class Trajectory:
     values: list[float] | None = None
     token_rewards: list[float] | None = None
     turn_ids: list[int] | None = None
+    reward_components: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.prompt_tokens or not self.completion_tokens:
@@ -57,6 +60,21 @@ class Trajectory:
             )
         if not math.isfinite(self.reward):
             raise ValueError("reward must be finite.")
+        if not isinstance(self.reward_components, Mapping):
+            raise TypeError("reward_components must be a mapping of finite scalars.")
+        components = {}
+        for name, value in self.reward_components.items():
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(
+                    "reward_components must be a mapping of finite scalars."
+                )
+            components[name.strip()] = float(value)
+        self.reward_components = components
         for name in ("logprobs", "reference_logprobs", "values", "token_rewards"):
             values = getattr(self, name)
             if values is not None and (

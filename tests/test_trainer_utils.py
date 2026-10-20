@@ -1,6 +1,9 @@
 """Cross-cutting trainer utilities preserve metrics and checkpoint behavior."""
 
 import asyncio
+import json
+import math
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -11,7 +14,7 @@ from triotune.utils.checkpoint import (
     save_checkpoint,
     save_checkpoint_async,
 )
-from triotune.utils.dataloader import iter_batches
+from triotune.utils.dataloader import iter_batches, num_batches
 from triotune.utils.datums import causal_datum, materialize_datum
 from triotune.utils.metrics import (
     MetricsAPI,
@@ -53,7 +56,10 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(init.call_args.kwargs["name"], "custom")
         self.assertEqual(init.call_args.kwargs["workspace"], "team")
         self.assertEqual(init.call_args.kwargs["config"]["model"], "test")
-        self.assertEqual(init.call_args.kwargs["config"]["num_generations"], args.num_generations)
+        self.assertEqual(
+            init.call_args.kwargs["config"]["rollout"]["num_generations"],
+            args.rollout.num_generations,
+        )
         self.assertEqual(init.call_args.kwargs["tags"], ["grpo"])
 
     def test_finish_disabled_and_failed_runs(self):
@@ -91,6 +97,24 @@ class LoggingTests(unittest.TestCase):
             step=2,
         )
 
+    def test_metrics_api_uses_weights_and_pools_standard_deviations(self):
+        run = Mock()
+        api = MetricsAPI(run, logging_step=2)
+        api.record(
+            {"reward/mean": 0.0, "reward/std": 0.0, "reward/min": -1.0},
+            weights={"reward/mean": 1, "reward/std": 1},
+            step=1,
+        )
+        api.record(
+            {"reward/mean": 2.0, "reward/std": 0.0, "reward/min": 1.0},
+            weights={"reward/mean": 3, "reward/std": 3},
+            step=2,
+        )
+        payload = run.log.call_args.args[0]
+        self.assertEqual(payload["reward/mean"], 1.5)
+        self.assertAlmostEqual(payload["reward/std"], math.sqrt(0.75))
+        self.assertEqual(payload["reward/min"], -1.0)
+
     def test_metrics_api_publishes_eval_and_finishes_once(self):
         run = Mock()
         api = MetricsAPI(run)
@@ -113,6 +137,43 @@ class LoggingTests(unittest.TestCase):
             step=3,
         )
         run.finish.assert_called_once_with(state="success", error=None)
+
+    def test_finish_flushes_a_partial_logging_window(self):
+        run = Mock()
+        api = MetricsAPI(run, logging_step=3)
+        api.record({"train/loss": 1.0}, step=1)
+        api.finish()
+        run.log.assert_called_once_with(
+            {"train/loss": 1.0, "train/step": 1.0},
+            step=1,
+        )
+
+    def test_metrics_api_writes_step_checkpoint_and_final_jsonl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api = MetricsAPI(log_dir=folder)
+            path = api.history_path
+
+            api.record({"train/loss": 0.5, "usage/train_tokens": 4}, step=1)
+            api.publish({"eval/loss": 0.25}, step=1)
+            api.log_text(
+                key="checkpoint/actor_path",
+                data="trio://saved",
+                step=1,
+            )
+            api.finish()
+            api.finish()
+
+            self.assertIsNotNone(path)
+            with open(path, encoding="utf-8") as stream:
+                rows = [json.loads(line) for line in stream]
+        self.assertEqual(
+            [row["event"] for row in rows],
+            ["metrics", "metrics", "checkpoint", "finish"],
+        )
+        self.assertEqual(rows[0]["metrics"]["train/loss"], 0.5)
+        self.assertEqual(rows[2]["path"], "trio://saved")
+        self.assertEqual(rows[-1]["state"], "success")
+        self.assertEqual(rows[-1]["metrics"]["eval/loss"], 0.25)
 
     def test_normalize_metrics_supports_algorithm_namespaces(self):
         self.assertEqual(
@@ -144,6 +205,13 @@ class LoggingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "batch_size"):
             list(iter_batches([], 0))
+
+    def test_num_batches_reports_known_totals_without_consuming_streams(self):
+        self.assertEqual(num_batches(range(5), 2), 3)
+        self.assertEqual(num_batches(range(5), 2, max_batches=2), 2)
+        rows = (index for index in range(5))
+        self.assertIsNone(num_batches(rows, 2, max_batches=2))
+        self.assertEqual(list(rows), list(range(5)))
 
     def test_generic_datum_helpers_preserve_algorithm_loss_inputs(self):
         calls = []

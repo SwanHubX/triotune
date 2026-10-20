@@ -58,7 +58,7 @@ loss_mean = loss_sum / token_count
 
 例如 A 首步 `loss_sum=295.894634`、`token_count=2023`，得到 `loss_mean=0.146265`。数百量级的是损失总和，不是平均损失。B 每步生成量是 A 的 4 倍，因此 `loss_sum` 也更大，不能直接据此判断训练效果。
 
-A 的 `distill/reverse_kl_sampled` 与 B 的 `opd/reverse_kl_mean` 都表示采样 token 的 `log p_student − log p_teacher` 均值；A 的 `distill/advantage_mean` 在每步都等于其负值。B 另记录了 token 信号标准差 `opd/reverse_kl_std`，逐步均值为 0.635680；A 没有同口径的标准差字段。
+A 的 `distill/reverse_kl_sampled` 与 B 的 `opd/reverse_kl_mean` 都表示采样 token 的 `log p_student − log p_teacher` 均值；A 的 `distill/advantage_mean` 在每步都等于其负值。历史运行中 B 另记录了 token 信号标准差 `opd/reverse_kl_std`，逐步均值为 0.635680；当前框架已补充同口径的 `distill/reverse_kl_sampled_std`，但该历史 A 运行尚无此字段。
 
 `loss_mean` 是策略更新的代理损失，sampled reverse KL 是采样估计，均不是完整词表 KL。两边的后端 `token_count` 都小于生成 token 数，因此平均损失与 sampled reverse KL 也不是数值完全相同的指标。日志没有说明后端具体排除了哪些 token，不能仅凭计数差推断原因。
 

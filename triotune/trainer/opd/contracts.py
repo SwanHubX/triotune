@@ -144,6 +144,7 @@ class OPDRollout:
     sample_index: int
     behavior_policy_version: int
     teacher_group: str = "default"
+    truncated: bool = False
 
     def __post_init__(self) -> None:
         # Copy caller-owned sequences at the phase boundary. Downstream phases
@@ -166,6 +167,8 @@ class OPDRollout:
         if not isinstance(self.teacher_group, str) or not self.teacher_group.strip():
             raise ValueError("teacher_group must be a non-empty string.")
         self.teacher_group = self.teacher_group.strip()
+        if not isinstance(self.truncated, bool):
+            raise TypeError("truncated must be boolean.")
 
 
 @dataclass(slots=True)

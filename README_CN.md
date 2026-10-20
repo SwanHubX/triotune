@@ -49,43 +49,48 @@ SwanLab 指标记录。
 
 ## 📰 近期动态
 
+- **2026-10-19：** Triotune 0.1.1 统一了数据集预处理格式，并将发行包和源码
+  目录重命名为 `triotune`，同时新增模块化 PPO、在策略蒸馏流程及基于 YAML 的
+  训练配方配置。
 - **2026-10-12：** Triotune 0.1.0（`pytrio-cookbook`）首次发布到
   [PyPI](https://pypi.org/project/pytrio-cookbook/)。
 
-## 📦 安装
+## 🚀 开始使用
 
-### ✅ 环境要求
+### 📦 安装
 
 - Python 3.12（当前包声明 `>=3.12,<3.13`）
 - 可用的 PyTRIO 训练服务，以及该案例所使用模型的访问权限
 
-推荐使用 [uv](https://docs.astral.sh/uv/)，仓库中的 `uv.lock` 会锁定环境依赖：
+在 macOS 或 Linux 上安装 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-uv sync
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+在 Windows PowerShell 中运行官方安装命令：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+然后克隆仓库并创建由锁文件约束的完整环境：
+
+```bash
+git clone https://github.com/SwanHubX/triotune.git
+cd triotune
+uv python install 3.12
+uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-使用 DPO 时安装可选的 PyTorch 依赖：
+### 📚 快速开始
+
+通过 YAML 配置运行 GSM8K PPO 示例：
 
 ```bash
-uv sync --extra dpo
+uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
 ```
-
-也可以直接安装已发布的包：
-
-```bash
-pip install triotune==0.1.2
-```
-
-从源码目录使用 pip 安装：
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-发行包名称和 Python 导入名称均为 `triotune`。
 
 ## 🔧 支持矩阵
 
@@ -145,27 +150,22 @@ cached-input 或 uncached-prefill 计数。因此 Triotune 不猜测这两个数
 
 ## 🐍 Python API
 
-公开入口按算法组织：
+最简 GRPO 训练流程会使用默认配置，为每个 prompt 采样 4 个回复：
 
 ```python
 import asyncio
 
 from triotune.trainer import PPOConfig, PPOTrainer
 
-rows = [
-    {
-        "messages": [{"role": "user", "content": "What is 2 + 2?"}],
-        "answer": "4",
-    },
-]
 
-trainer = PPOTrainer(
-    model="your-pytrio-model-id",
-    reward_fn=your_reward_function,
-    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
-    train_dataset=rows,
+asyncio.run(
+    PPOTrainer(
+        model="your-pytrio-model-id",
+        args=PPOConfig.for_algorithm("grpo"),
+        reward_fn=lambda row, completion, **_: float(row["answer"] in completion),
+        train_dataset=[{"messages": "What is 2 + 2?", "answer": "4"}],
+    ).train()
 )
-asyncio.run(trainer.train())
 ```
 
 ## 🗃️ 仓库结构

@@ -53,44 +53,48 @@ token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
 ## 📰 News
 
+- **2026-10-19:** Triotune 0.1.1 standardized dataset preprocessing and renamed
+  the distribution and source layout to `triotune`, while adding modular PPO
+  and on-policy distillation pipelines plus YAML-based recipe configuration.
 - **2026-10-12:** Triotune 0.1.0 (`pytrio-cookbook`) was published to [PyPI](https://pypi.org/project/pytrio-cookbook/).
 
-## 📦 Installation
+## 🚀 Get Started
 
-### ✅ Requirements
+### 📦 Installation
 
 - Python 3.12 (the package currently declares `>=3.12,<3.13`)
 - Access to a PyTRIO-compatible training service and the models used by your
   recipe
 
-Using [uv](https://docs.astral.sh/uv/) is recommended because `uv.lock` pins
-the repository environment:
+Install [uv](https://docs.astral.sh/uv/) on macOS or Linux:
 
 ```bash
-uv sync
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On Windows, run the official installer in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then clone the repository and create the complete locked environment:
+
+```bash
+git clone https://github.com/SwanHubX/triotune.git
+cd triotune
+uv python install 3.12
+uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-Install the optional PyTorch dependency when using DPO:
+### 📚 Quick Start
+
+Run the GSM8K PPO example with its YAML configuration:
 
 ```bash
-uv sync --extra dpo
+uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
 ```
-
-The published package can also be installed directly:
-
-```bash
-pip install triotune==0.1.2
-```
-
-For a source checkout with pip:
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-The distribution name and Python import name are both `triotune`.
 
 ## 🔧 Support Matrix
 
@@ -154,27 +158,22 @@ calculate a monetary cost from a hard-coded model price table.
 
 ## 🐍 Python API
 
-The public imports are grouped by algorithm:
+The minimal GRPO training loop uses the default four generations per prompt:
 
 ```python
 import asyncio
 
 from triotune.trainer import PPOConfig, PPOTrainer
 
-rows = [
-    {
-        "messages": [{"role": "user", "content": "What is 2 + 2?"}],
-        "answer": "4",
-    },
-]
 
-trainer = PPOTrainer(
-    model="your-pytrio-model-id",
-    reward_fn=your_reward_function,
-    args=PPOConfig.for_algorithm("grpo", num_generations=4, max_steps=100),
-    train_dataset=rows,
+asyncio.run(
+    PPOTrainer(
+        model="your-pytrio-model-id",
+        args=PPOConfig.for_algorithm("grpo"),
+        reward_fn=lambda row, completion, **_: float(row["answer"] in completion),
+        train_dataset=[{"messages": "What is 2 + 2?", "answer": "4"}],
+    ).train()
 )
-asyncio.run(trainer.train())
 ```
 
 ## 🗃️ Repository layout

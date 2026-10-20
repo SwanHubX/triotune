@@ -62,6 +62,9 @@ def dpo_evaluation_metrics(
         "eval/reward_margin": sum(margins) / count,
         "eval/reward_chosen": sum(chosen_rewards) / count,
         "eval/reward_rejected": sum(rejected_rewards) / count,
+        "eval/logratio_margin": sum(margins) / (count * float(beta)),
+        "eval/reference_logp_chosen": sum(reference[::2]) / count,
+        "eval/reference_logp_rejected": sum(reference[1::2]) / count,
         "eval/pairs": float(count),
     }
 
@@ -102,6 +105,9 @@ def make_loss_fn(reference: Sequence[float], beta: float):
             "reward/accuracy": (margins.detach() > 0).float().mean().item(),
             "train/logp_chosen": policy_chosen.detach().mean().item(),
             "train/logp_rejected": policy_rejected.detach().mean().item(),
+            "train/reference_logp_chosen": reference_chosen.mean().item(),
+            "train/reference_logp_rejected": reference_rejected.mean().item(),
+            "train/logratio_margin": (margins.detach() / beta).mean().item(),
         }
         return objective, metrics
 

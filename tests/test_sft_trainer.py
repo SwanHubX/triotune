@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -77,7 +79,9 @@ class _Client:
         assert kwargs == {"loss_fn": "cross_entropy", "auto_shift": False}
         if self.fail_forward:
             raise RuntimeError("forward failed")
-        return SimpleNamespace(metrics={"loss_mean": 0.5, "token_count": 2})
+        return SimpleNamespace(
+            metrics={"loss_mean": 0.5, "token_count": 2, "token_accuracy": 0.75}
+        )
 
     def forward(self, datums: list[object], **kwargs: object) -> object:
         self.events.append("evaluate")
@@ -150,6 +154,10 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     def trainer(self, **kwargs: object) -> SFTTrainer:
         return SFTTrainer("test-model", args=SFTConfig(**kwargs))
 
+    def test_reporting_uses_configured_logging_interval(self) -> None:
+        trainer = self.trainer(logging_step=3)
+        self.assertEqual(trainer._metrics_api._logging_step, 3)
+
     async def test_optimizer_submitted_before_forward_result(self) -> None:
         trainer = self.trainer()
         submitted, release = asyncio.Event(), asyncio.Event()
@@ -208,9 +216,9 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 state = await asyncio.wait_for(task, 1)
                 self.assertEqual(state.global_step, 3)
-                self.assertEqual([step for _, step in self.run.logs], [1, 2, 3])
+                self.assertEqual([step for _, step in self.run.logs], [1, 2, 3, 3])
                 self.assertEqual(state.checkpoint_path, "checkpoint://sft-step-00000003")
-                total = sum(values["time/step"] for values, _ in self.run.logs)
+                total = sum(values["time/step"] for values, _ in self.run.logs[:3])
                 self.assertAlmostEqual(total, state.metrics["time/train"])
             finally:
                 release.set()
@@ -221,13 +229,22 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     async def test_validation_uses_forward_without_optimizer_or_state_step(self) -> None:
         trainer = self.trainer()
 
-        metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
+        with patch(
+            "triotune.trainer.sft_trainer.tqdm",
+            side_effect=lambda rows, **kwargs: rows,
+        ) as progress:
+            metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
 
         self.assertEqual(metrics["eval/loss"], 0.25)
+        self.assertAlmostEqual(metrics["eval/perplexity"], math.exp(0.25))
         self.assertEqual(metrics["eval/examples"], 2.0)
         self.assertEqual(self.client.eval_calls, 2)
         self.assertEqual(self.client.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 2, "desc": "SFT eval", "unit": "batch"},
+        )
 
     async def test_train_schedules_initial_and_periodic_validation_once(self) -> None:
         trainer = self.trainer(
@@ -388,15 +405,19 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(defaults[key])
             self.assertEqual(defaults["name"], "test-model-sft")
 
-            self.trainer(
-                report_to="swanlab", workspace="team", tags=["sft", "huanhuan"],
-                run_name="custom-run", log_dir="/tmp/sft-logs",
-            )
-            custom = init.call_args.kwargs
-            self.assertEqual(custom["workspace"], "team")
-            self.assertEqual(custom["tags"], ["sft", "huanhuan"])
-            self.assertEqual(custom["name"], "custom-run")
-            self.assertEqual(custom["log_dir"], "/tmp/sft-logs")
+            with tempfile.TemporaryDirectory() as folder:
+                self.trainer(
+                    report_to="swanlab",
+                    workspace="team",
+                    tags=["sft", "huanhuan"],
+                    run_name="custom-run",
+                    log_dir=folder,
+                )
+                custom = init.call_args.kwargs
+                self.assertEqual(custom["workspace"], "team")
+                self.assertEqual(custom["tags"], ["sft", "huanhuan"])
+                self.assertEqual(custom["name"], "custom-run")
+                self.assertEqual(custom["log_dir"], folder)
 
     async def test_text_and_completion_labels_are_shifted(self) -> None:
         trainer = self.trainer()
@@ -409,6 +430,8 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["usage/train_tokens"], 4)
         self.assertEqual(metrics["usage/train_tokens_total"], 4)
         self.assertEqual(metrics["train/loss"], 0.5)
+        self.assertAlmostEqual(metrics["train/perplexity"], math.exp(0.5))
+        self.assertEqual(metrics["train/token_accuracy"], 0.75)
         self.assertEqual(self.client.optim_calls, 1)
 
     async def test_assistant_mask_and_pretokenized_labels(self) -> None:
@@ -460,7 +483,9 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.global_step, 3)
         self.assertEqual(self.client.saved, ["sft-step-00000002", "sft-step-00000003"])
         self.assertEqual(self.run.text, ("checkpoint/path", state.checkpoint_path, 3))
-        self.assertEqual(len(self.run.logs), 3)
+        self.assertEqual(len(self.run.logs), 4)
+        self.assertGreater(state.metrics["time/train_runtime"], 0)
+        self.assertGreater(state.metrics["time/train_tokens_per_second"], 0)
         self.assertTrue(self.run.finished)
 
         self.client.saved.clear()

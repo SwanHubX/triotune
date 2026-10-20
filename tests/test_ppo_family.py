@@ -1,10 +1,13 @@
 """PPO-family numerical, SDK-gradient and asynchronous integration contracts."""
 
 import asyncio
+import json
 import math
+import tempfile
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -187,7 +190,6 @@ class AdvantageTests(unittest.TestCase):
         for kwargs in (
             {"temperature": 0.7},
             {"top_p": 0.9},
-            {"eval_after_train": True},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(NotImplementedError):
                 raw_config(**kwargs)
@@ -248,6 +250,20 @@ class PolicyLossTests(unittest.TestCase):
         )
         self.assertAlmostEqual(loss, (-1.4 + 0.8 - 0.5 + 2) / 4)
         self.assertEqual(grad[0][-1], 0)
+
+    def test_policy_drift_metrics_cover_ratio_and_approximate_kl(self):
+        ratios = (0.5, 1.0, 2.0)
+        _, _, metrics = objective(
+            raw_config(),
+            [trajectory(n=3)],
+            [[-1 + math.log(value) for value in ratios]],
+            [[1, 1, 1]],
+        )
+        self.assertAlmostEqual(metrics["policy/ratio"], sum(ratios) / 3)
+        self.assertEqual(metrics["policy/ratio_max"], 2.0)
+        self.assertAlmostEqual(metrics["policy/clip_fraction_low"], 1 / 3)
+        self.assertAlmostEqual(metrics["policy/clip_fraction_high"], 1 / 3)
+        self.assertGreater(metrics["policy/update_approx_kl"], 0)
 
     def test_gspo_uses_geometric_ratio_and_mean_advantage(self):
         t = trajectory()
@@ -452,7 +468,7 @@ class TrainingClient:
     async def optim_step_async(self, params):
         self.trace.append("submit:optim")
         self.version += 1
-        return Future(SimpleNamespace(metrics={}), self.trace, "optim")
+        return Future(SimpleNamespace(metrics={"grad_norm": 0.2}), self.trace, "optim")
 
     async def save_weights_and_get_sampling_client_async(self):
         sampler = Sampler(self.trace, self.version)
@@ -465,6 +481,146 @@ class TrainingClient:
 
 
 class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reporting_uses_configured_logging_interval(self):
+        trainer = PPOTrainer(
+            "fake",
+            raw_config(logging_step=3),
+            training_client=TrainingClient(),
+        )
+        await trainer.initialize()
+        self.assertEqual(trainer._metrics._logging_step, 3)
+
+    async def test_train_reports_progress_and_writes_local_metric_history(self):
+        client = TrainingClient()
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "triotune.trainer.ppo.trainer.tqdm"
+        ) as progress:
+            trainer = PPOTrainer(
+                "fake",
+                PPOConfig.for_algorithm(
+                    "grpo",
+                    batch_size=1,
+                    num_generations=2,
+                    max_steps=1,
+                    log_dir=folder,
+                ),
+                [{"messages": "train"}],
+                lambda **kwargs: {
+                    "reward": float(kwargs["completion"]),
+                    "correct": bool(float(kwargs["completion"])),
+                },
+                training_client=client,
+            )
+
+            state = await trainer.train()
+            path = trainer._metrics.history_path
+            with open(path, encoding="utf-8") as stream:
+                rows = [json.loads(line) for line in stream]
+
+        progress.return_value.update.assert_called_once_with(1)
+        postfix = progress.return_value.set_postfix.call_args.args[0]
+        self.assertEqual(set(postfix), {"loss", "reward", "grad_norm", "tokens"})
+        self.assertEqual(rows[0]["event"], "run")
+        self.assertEqual(rows[-1]["event"], "finish")
+        self.assertEqual(rows[-1]["metrics"]["reward/mean"], 0.5)
+        self.assertEqual(rows[-1]["metrics"]["reward/correct/mean"], 0.5)
+        self.assertEqual(rows[-1]["metrics"]["reward/success_rate"], 0.5)
+        self.assertIn("policy/entropy_sampled", rows[-1]["metrics"])
+        self.assertIn("advantage/std", rows[-1]["metrics"])
+        self.assertEqual(rows[-1]["metrics"]["rollout/completion_length_mean"], 2)
+        self.assertIn("train/loss", rows[-1]["metrics"])
+        self.assertEqual(rows[-1]["metrics"]["usage/train_tokens_total"], 6.0)
+
+    async def test_evaluate_samples_rewards_without_optimizer_updates(self):
+        client = TrainingClient()
+        config = PPOConfig.for_algorithm(
+            "cispo",
+            batch_size=2,
+            num_generations=2,
+            eval_batch_size=1,
+            eval_max_batches=2,
+            seed=7,
+        )
+        trainer = PPOTrainer(
+            "fake",
+            config,
+            reward_fn=lambda **kwargs: float(kwargs["completion"]),
+            eval_dataset=[{"messages": "a"}, {"messages": "b"}, {"messages": "c"}],
+            training_client=client,
+        )
+
+        with patch(
+            "triotune.trainer.ppo.trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as progress:
+            metrics = await trainer.evaluate()
+
+        self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(trainer.state.optimizer_steps, 0)
+        self.assertEqual(trainer._last_eval_step, 0)
+        self.assertEqual(metrics["eval/reward_mean"], 0.5)
+        self.assertEqual(metrics["eval/reward_std"], 0.5)
+        self.assertEqual(metrics["eval/prompts"], 2.0)
+        self.assertEqual(metrics["eval/trajectories"], 4.0)
+        self.assertEqual(metrics["eval/batches"], 2.0)
+        self.assertEqual(metrics["eval/completion_tokens"], 8.0)
+        self.assertEqual(metrics["eval/completion_length_mean"], 2.0)
+        self.assertEqual(metrics["eval/truncated_fraction"], 0.0)
+        self.assertEqual(metrics["usage/eval_sample_input_tokens"], 4.0)
+        self.assertEqual(metrics["usage/eval_sample_output_tokens"], 8.0)
+        self.assertFalse(any("optim" in event for event in client.trace))
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 2, "desc": "PPO eval", "unit": "batch"},
+        )
+
+    async def test_train_schedules_before_periodic_and_final_evaluation(self):
+        client = TrainingClient()
+        config = PPOConfig.for_algorithm(
+            "grpo",
+            batch_size=1,
+            num_generations=2,
+            max_steps=3,
+            eval_steps=2,
+            eval_before_train=True,
+            eval_after_train=True,
+        )
+        trainer = PPOTrainer(
+            "fake",
+            config,
+            [{"messages": "train"}] * 3,
+            lambda **kwargs: float(kwargs["completion"]),
+            eval_dataset=[{"messages": "eval"}],
+            training_client=client,
+        )
+        evaluated_at = []
+        evaluate = trainer.evaluate
+
+        async def track_evaluation(*args, **kwargs):
+            evaluated_at.append(trainer.state.global_step)
+            return await evaluate(*args, **kwargs)
+
+        trainer.evaluate = track_evaluation
+        state = await trainer.train()
+
+        self.assertEqual(evaluated_at, [0, 2, 3])
+        self.assertEqual(state.global_step, 3)
+        self.assertEqual(state.optimizer_steps, 3)
+        self.assertEqual(state.metrics["eval/prompts"], 1.0)
+
+    async def test_evaluation_requires_reward_and_nonempty_data(self):
+        trainer = PPOTrainer(
+            "fake",
+            raw_config(),
+            eval_dataset=[],
+            training_client=TrainingClient(),
+        )
+        with self.assertRaisesRegex(ValueError, "reward_fn"):
+            await trainer.evaluate()
+        trainer.reward_fn = lambda **kwargs: 1.0
+        with self.assertRaisesRegex(ValueError, "at least one prompt"):
+            await trainer.evaluate()
+
     async def test_end_to_end_rollouts_policy_refresh_seeds_and_checkpoints(self):
         client = TrainingClient()
         c = PPOConfig.for_algorithm(
@@ -492,6 +648,7 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metrics["usage/sample_output_tokens"], 8)
         self.assertEqual(result.metrics["usage/sample_input_tokens_total"], 8)
         self.assertEqual(result.metrics["usage/sample_output_tokens_total"], 16)
+        self.assertEqual(result.metrics["train/grad_norm"], 0.2)
         sequence = [
             event for event in client.trace if "custom" in event or "optim" in event
         ]
@@ -573,6 +730,8 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         )
         metrics = await trainer.step([trajectory()])
         self.assertEqual(metrics["critic/loss"], 0.25)
+        self.assertEqual(metrics["policy/reference_kl_sampled"], 1.0)
+        self.assertEqual(metrics["reward/kl_penalty_mean"], -0.1)
         np.testing.assert_allclose(critic.returns, [[0.8, 0.9]])
 
     async def test_dynamic_sampling_refill_and_bounded_failure(self):
@@ -586,6 +745,9 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         trainer = PPOTrainer("fake", c, rows, reward, training_client=TrainingClient())
         state = await trainer.train()
         self.assertEqual(state.metrics["train/prompt_groups"], 2)
+        self.assertEqual(state.metrics["rollout/rejected_groups"], 1)
+        self.assertEqual(state.metrics["rollout/refill_count"], 1)
+        self.assertAlmostEqual(state.metrics["rollout/degenerate_group_fraction"], 1 / 3)
         self.assertEqual(trainer._next_group, 3)
         c = replace(c, max_empty_batches=1)
         trainer = PPOTrainer(

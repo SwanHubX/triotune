@@ -15,7 +15,7 @@ from ..api.cli_args import SFTConfig
 from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
 from ..api.loss_api import BuiltinPyTrioObjective, LossSpec, SupervisedLossInput
 from ..dataset import SupervisedExample, prepare_sft
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
 from .sft.state import SFTState
@@ -38,19 +38,24 @@ class SFTTrainer:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         args: SFTConfig | None = None,
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         *,
-        lora_rank: int = 32,
+        lora_rank: int | None = None,
     ) -> None:
         """Create the remote training client and local pipeline state."""
 
+        self.args = args or SFTConfig()
+        configured_model = self.args.model
+        if model is None and configured_model is not None:
+            model = configured_model.name
+        if lora_rank is None:
+            lora_rank = configured_model.lora_rank if configured_model is not None else 32
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         self.model = model.strip()
-        self.args = args or SFTConfig()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self._client = trio.ServiceClient().create_lora_training_client(
@@ -65,6 +70,7 @@ class SFTTrainer:
             self.args,
             default_name=f"{self.model.rsplit('/', 1)[-1]}-sft",
             metadata={"model": self.model, "lora_rank": lora_rank},
+            logging_step=self.args.logging_step,
         )
 
     # ------------------------------------------------------------------
@@ -135,7 +141,17 @@ class SFTTrainer:
         token_count = 0
         example_count = 0
         batch_count = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="SFT eval",
+            unit="batch",
+        ):
             examples, datums = self._prepare_datums(rows)
             response = await self._objective.forward_async(self._client, datums)
             raw = getattr(response, "metrics", {})
@@ -160,6 +176,7 @@ class SFTTrainer:
             raise ValueError("eval_dataset must contain at least one row.")
         metrics = {
             "eval/loss": loss_sum / token_count,
+            "eval/perplexity": math.exp(min(700.0, loss_sum / token_count)),
             "eval/tokens": float(token_count),
             "eval/examples": float(example_count),
             "eval/batches": float(batch_count),
@@ -233,6 +250,13 @@ class SFTTrainer:
             }
             if "loss_mean" in metrics:
                 metrics["train/loss"] = metrics["loss_mean"]
+                metrics["train/perplexity"] = math.exp(
+                    min(700.0, metrics["loss_mean"])
+                )
+            for name in ("token_accuracy", "accuracy"):
+                if name in metrics:
+                    metrics["train/token_accuracy"] = metrics.pop(name)
+                    break
             now = time.perf_counter()
             metrics.update(
                 {
@@ -252,7 +276,19 @@ class SFTTrainer:
                 self.state.checkpoint_path = (await wait_async(save_future)).path
             self.state.global_step = step
             self.state.metrics = metrics
-            self._metrics_api.record(metrics, step=step)
+            self._metrics_api.record(
+                metrics,
+                step=step,
+                weights={
+                    name: float(token_count)
+                    for name in (
+                        "train/loss",
+                        "train/perplexity",
+                        "train/token_accuracy",
+                    )
+                    if name in metrics
+                },
+            )
             return metrics
 
         return asyncio.create_task(collect())
@@ -277,17 +313,35 @@ class SFTTrainer:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="SFT train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="SFT train",
+            unit="step",
+        )
         pending: list[asyncio.Task[dict[str, float]]] = []
         previous = None
         submitted = self.state.global_step
+        initial_step, initial_tokens = self.state.global_step, self._train_tokens
         clock = [time.perf_counter()] * 2
 
         def report(task: asyncio.Task[dict[str, float]]) -> None:
             """Advance terminal progress after a successful batch task."""
 
             if not task.cancelled() and task.exception() is None:
-                progress.set_postfix({"loss": task.result().get("train/loss")}, refresh=False)
+                metrics = task.result()
+                progress.set_postfix(
+                    {
+                        label: f"{metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("grad_norm", "grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in metrics
+                    },
+                    refresh=False,
+                )
                 progress.update(1)
 
         try:
@@ -331,6 +385,22 @@ class SFTTrainer:
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate()
+            if self.state.global_step > initial_step:
+                elapsed = time.perf_counter() - clock[0]
+                summary = {
+                    "time/train_runtime": elapsed,
+                    "time/train_steps_per_second": (
+                        self.state.global_step - initial_step
+                    )
+                    / elapsed,
+                    "time/train_tokens_per_second": (
+                        self._train_tokens - initial_tokens
+                    )
+                    / elapsed,
+                    "usage/train_tokens_total": float(self._train_tokens),
+                }
+                self.state.metrics.update(summary)
+                self._metrics_api.publish(summary, step=self.state.global_step)
             if self.state.checkpoint_path is not None:
                 self._metrics_api.log_text(
                     key="checkpoint/path",

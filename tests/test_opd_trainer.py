@@ -135,7 +135,22 @@ class _Training:
         if self.block_forward:
             self.service.forward_started.set()
             await asyncio.Event().wait()
-        return _Future(SimpleNamespace(metrics={"loss_mean": 0.3}),
+        outputs = [
+            {
+                "logprobs": SimpleNamespace(
+                    data=[
+                        float(old) + (math.log(2) if label != -100 else 0.0)
+                        for old, label in zip(
+                            datum.loss_fn_inputs["logprobs"].data,
+                            datum.loss_fn_inputs["target_tokens"].data,
+                            strict=True,
+                        )
+                    ]
+                )
+            }
+            for datum in datums
+        ]
+        return _Future(SimpleNamespace(metrics={"loss_mean": 0.3}, loss_fn_outputs=outputs),
                        error=RuntimeError("forward failed") if self.fail_forward else None)
 
     async def optim_step_async(self, params):
@@ -329,6 +344,11 @@ class OPDTrainerTests(unittest.TestCase):
         self.assertEqual(result.behavior_policy_version, 0)
         self.assertEqual(trainer.state.behavior_policy_version, 1)
         self.assertEqual(result.metrics["distill/reverse_kl_sampled"], -0.25)
+        self.assertEqual(result.metrics["distill/reverse_kl_sampled_std"], 0.75)
+        self.assertAlmostEqual(result.metrics["policy/importance_ratio_mean"], 2.0)
+        self.assertEqual(result.metrics["policy/cap_fraction"], 0.0)
+        self.assertEqual(result.metrics["rollout/completion_length_mean"], 2.0)
+        self.assertEqual(result.metrics["rollout/truncated_fraction"], 0.0)
         self.assertEqual(result.metrics["train/loss"], 0.3)
         self.assertEqual(result.metrics["train/loss"], result.metrics["loss_mean"])
         self.assertEqual(result.metrics["policy/importance_ratio_cap"], 5.0)
@@ -363,13 +383,21 @@ class OPDTrainerTests(unittest.TestCase):
     def test_validation_scores_student_and_teacher_without_optimizer(self):
         trainer = self.trainer()
 
-        metrics = trainer.evaluate([{"messages": "PQ"}])
+        with patch(
+            "triotune.trainer.opd_trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as progress:
+            metrics = trainer.evaluate([{"messages": "PQ"}])
 
         self.assertEqual(metrics["eval/prompts"], 1.0)
         self.assertEqual(metrics["eval/completions"], 1.0)
         self.assertAlmostEqual(metrics["eval/reverse_kl_sampled"], -0.25)
         self.assertEqual(self.service.training.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 1, "desc": "OPD eval", "unit": "batch"},
+        )
 
     def test_identical_teacher_student_keeps_zero_signal_without_group_filtering(self):
         self.service.student_values = [-1, -1]
