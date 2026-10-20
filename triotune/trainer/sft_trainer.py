@@ -15,7 +15,7 @@ from ..api.cli_args import SFTConfig
 from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
 from ..api.loss_api import BuiltinPyTrioObjective, LossSpec, SupervisedLossInput
 from ..dataset import SupervisedExample, prepare_sft
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
 from .sft.state import SFTState
@@ -140,7 +140,17 @@ class SFTTrainer:
         token_count = 0
         example_count = 0
         batch_count = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="SFT eval",
+            unit="batch",
+        ):
             examples, datums = self._prepare_datums(rows)
             response = await self._objective.forward_async(self._client, datums)
             raw = getattr(response, "metrics", {})

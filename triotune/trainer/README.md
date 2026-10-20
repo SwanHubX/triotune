@@ -69,6 +69,9 @@ triotune/
 | [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
 | [OPD contracts](./opd/contracts.py) | 隔离 SDK response 并校验阶段间数据；OPD trainer 以 completion token 为分母归约蒸馏指标，验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
 
+SFT、DPO、OPD 和 PPO-family 的完整训练入口均显示 train step 进度；所有 evaluation
+入口按 batch 显示独立进度。数据源可求长度时展示准确总 batch 数，流式 iterable 则展示已完成 batch 与速率。
+
 ```text
 dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
 ```

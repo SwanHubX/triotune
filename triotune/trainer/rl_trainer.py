@@ -22,7 +22,7 @@ from tqdm import tqdm
 from ..api.cli_args import PPOConfig
 from ..api.client_api import call_async
 from ..utils.checkpoint import save_checkpoint_async
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
@@ -443,7 +443,17 @@ class PPOTrainer:
             sample_input_tokens += usage.input_tokens
             sample_output_tokens += usage.output_tokens
 
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="PPO eval",
+            unit="batch",
+        ):
             batch = await generate_rollouts(
                 sampler,
                 self._tokenizer,

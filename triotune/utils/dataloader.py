@@ -29,6 +29,28 @@ def _validate_batch_size(batch_size: int) -> int:
     return int(batch_size)
 
 
+def num_batches(
+    rows: Iterable[RowT],
+    batch_size: int,
+    *,
+    max_batches: int | None = None,
+) -> int | None:
+    """Return the visible batch total when an iterable exposes its length."""
+
+    size = _validate_batch_size(batch_size)
+    if max_batches is not None and (
+        isinstance(max_batches, bool)
+        or not isinstance(max_batches, Integral)
+        or max_batches < 0
+    ):
+        raise ValueError("max_batches must be a nonnegative integer or None.")
+    try:
+        total = (len(rows) + size - 1) // size  # type: ignore[arg-type]
+    except TypeError:
+        return None
+    return min(total, int(max_batches)) if max_batches is not None else total
+
+
 def iter_batches(
     rows: Iterable[RowT],
     batch_size: int,

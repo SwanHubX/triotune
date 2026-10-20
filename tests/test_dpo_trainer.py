@@ -235,13 +235,31 @@ class DPOTrainerTests(unittest.TestCase):
         trainer = self.trainer()
         rows = [{"messages": "P", "chosen": "A", "rejected": "B"}]
 
-        metrics = trainer.evaluate(rows)
+        with patch(
+            "triotune.trainer.dpo_trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as progress:
+            metrics = trainer.evaluate(rows)
 
         self.assertAlmostEqual(metrics["eval/loss"], math.log(2), places=3)
         self.assertEqual(metrics["eval/pairs"], 1.0)
         self.assertEqual(self.service.training.sampling_client_calls, 1)
         self.assertEqual(self.service.training.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 1, "desc": "DPO eval", "unit": "batch"},
+        )
+
+        with patch(
+            "triotune.trainer.dpo_trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as async_progress:
+            asyncio.run(trainer.evaluate_async(rows))
+        self.assertEqual(
+            async_progress.call_args.kwargs,
+            {"total": 1, "desc": "DPO eval", "unit": "batch"},
+        )
 
     def test_eval_dataset_schedule_in_sync_and_async_training(self) -> None:
         rows = [{"messages": "P", "chosen": "A", "rejected": "B"}]

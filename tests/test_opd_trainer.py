@@ -363,13 +363,21 @@ class OPDTrainerTests(unittest.TestCase):
     def test_validation_scores_student_and_teacher_without_optimizer(self):
         trainer = self.trainer()
 
-        metrics = trainer.evaluate([{"messages": "PQ"}])
+        with patch(
+            "triotune.trainer.opd_trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as progress:
+            metrics = trainer.evaluate([{"messages": "PQ"}])
 
         self.assertEqual(metrics["eval/prompts"], 1.0)
         self.assertEqual(metrics["eval/completions"], 1.0)
         self.assertAlmostEqual(metrics["eval/reverse_kl_sampled"], -0.25)
         self.assertEqual(self.service.training.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 1, "desc": "OPD eval", "unit": "batch"},
+        )
 
     def test_identical_teacher_student_keeps_zero_signal_without_group_filtering(self):
         self.service.student_values = [-1, -1]

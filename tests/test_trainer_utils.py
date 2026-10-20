@@ -13,7 +13,7 @@ from triotune.utils.checkpoint import (
     save_checkpoint,
     save_checkpoint_async,
 )
-from triotune.utils.dataloader import iter_batches
+from triotune.utils.dataloader import iter_batches, num_batches
 from triotune.utils.datums import causal_datum, materialize_datum
 from triotune.utils.metrics import (
     MetricsAPI,
@@ -176,6 +176,13 @@ class LoggingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "batch_size"):
             list(iter_batches([], 0))
+
+    def test_num_batches_reports_known_totals_without_consuming_streams(self):
+        self.assertEqual(num_batches(range(5), 2), 3)
+        self.assertEqual(num_batches(range(5), 2, max_batches=2), 2)
+        rows = (index for index in range(5))
+        self.assertIsNone(num_batches(rows, 2, max_batches=2))
+        self.assertEqual(list(rows), list(range(5)))
 
     def test_generic_datum_helpers_preserve_algorithm_loss_inputs(self):
         calls = []

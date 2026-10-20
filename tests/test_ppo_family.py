@@ -518,7 +518,11 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
             training_client=client,
         )
 
-        metrics = await trainer.evaluate()
+        with patch(
+            "triotune.trainer.ppo.trainer.tqdm",
+            side_effect=lambda batches, **kwargs: batches,
+        ) as progress:
+            metrics = await trainer.evaluate()
 
         self.assertEqual(trainer.state.global_step, 0)
         self.assertEqual(trainer.state.optimizer_steps, 0)
@@ -534,6 +538,10 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["usage/eval_sample_input_tokens"], 4.0)
         self.assertEqual(metrics["usage/eval_sample_output_tokens"], 8.0)
         self.assertFalse(any("optim" in event for event in client.trace))
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 2, "desc": "PPO eval", "unit": "batch"},
+        )
 
     async def test_train_schedules_before_periodic_and_final_evaluation(self):
         client = TrainingClient()

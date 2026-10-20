@@ -20,7 +20,7 @@ from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
 from ..dataset import prepare_prompt
 from ..utils.checkpoint import save_checkpoint_async
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
 from ..utils.updates import run_update_async
@@ -608,7 +608,17 @@ class OPDTrainer:
             self._training_client, "save_weights_and_get_sampling_client"
         )
         totals = _OPDMetricTotals()
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="OPD eval",
+            unit="batch",
+        ):
             prompts = await asyncio.to_thread(self._prompts, rows)
             scored = await self._rollout_and_score(prompts, sampler)
             totals.add(scored, prompt_count=len(prompts))

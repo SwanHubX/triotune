@@ -26,7 +26,7 @@ from ..dataset import (
     prepare_prompt,
 )
 from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
-from ..utils.dataloader import iter_batches
+from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.scoring import (
     score_completion,
@@ -257,7 +257,17 @@ class DPOTrainer:
         )
         totals: dict[str, float] = {}
         pairs_total = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="DPO eval",
+            unit="batch",
+        ):
             pairs = self._preferences(rows)
             metrics = self._evaluation_metrics(
                 self._scores(policy_client, pairs), self._reference_scores(pairs)
@@ -289,7 +299,17 @@ class DPOTrainer:
         )
         totals: dict[str, float] = {}
         pairs_total = 0
-        for rows in self._evaluation_batches(dataset):
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        for rows in tqdm(
+            self._evaluation_batches(dataset),
+            total=num_batches(
+                dataset,
+                batch_size,
+                max_batches=self.args.eval_max_batches,
+            ),
+            desc="DPO eval",
+            unit="batch",
+        ):
             pairs = self._preferences(rows)
             policy, reference = await asyncio.gather(
                 self._scores_async(policy_client, pairs),

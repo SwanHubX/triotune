@@ -222,13 +222,21 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
     async def test_validation_uses_forward_without_optimizer_or_state_step(self) -> None:
         trainer = self.trainer()
 
-        metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
+        with patch(
+            "triotune.trainer.sft_trainer.tqdm",
+            side_effect=lambda rows, **kwargs: rows,
+        ) as progress:
+            metrics = await trainer.evaluate([{"text": "ab"}, {"text": "cd"}])
 
         self.assertEqual(metrics["eval/loss"], 0.25)
         self.assertEqual(metrics["eval/examples"], 2.0)
         self.assertEqual(self.client.eval_calls, 2)
         self.assertEqual(self.client.optim_calls, 0)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(
+            progress.call_args.kwargs,
+            {"total": 2, "desc": "SFT eval", "unit": "batch"},
+        )
 
     async def test_train_schedules_initial_and_periodic_validation_once(self) -> None:
         trainer = self.trainer(

@@ -408,7 +408,7 @@ value 和 group 边界，分别比较 reward 处理、advantage/return、最终 
 | 项目 | 当前证据 |
 | --- | --- |
 | PPO 专项自动测试 | 当前 49 项通过；命令见第 5.1 节 |
-| 仓库回归测试 | 当前 198 项通过；命令见第 5.1 节 |
+| 仓库回归测试 | 当前 199 项通过；命令见第 5.1 节 |
 | AReaL 原始函数差分 | 实现阶段手工检查 15 组 loss/梯度组合通过，不在自动测试中 |
 | 静态检查和打包 | 实现阶段 Ruff、格式、diff whitespace 检查通过，wheel 包含全部 14 个 PPO Python 模块 |
 | 真实 PyTRIO 模型训练 | 2026-10-16，Qwen/Qwen3.5-4B 双 LoRA：两轮 rollout，actor/critic 各两次更新，全部指标有限，双 checkpoint 保存成功 |
@@ -464,6 +464,8 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 ## 7. 日志如何验收和解释
 
 `report_to="swanlab"` 启用云端图表，不启用时仍有终端进度和 `state.metrics`。
+训练使用 `PPO train` step 进度条，评估使用独立的 `PPO eval` batch 进度条；
+可求长度的数据展示准确总 batch 数，流式 iterable 展示已完成 batch 与速率。
 只要配置 `log_dir`，`MetricsAPI` 就会另外创建唯一的 `metrics-<UTC时间>-<ID>.jsonl`：
 逐步保存规范化指标，保存 checkpoint URI，并在结束事件中写入最终指标和成功/失败状态。
 该文件不包含模型权重；actor/critic checkpoint 仍是 PyTRIO 云端 URI。
