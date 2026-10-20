@@ -53,18 +53,26 @@ def main() -> None:
 
     settings = load_yaml_config(args.config)
     config = PPOConfig(**settings)
-    train_dataset = load_dataset(
-        "json",
-        data_files=str(resolve_path(config.train_dataset.path)),
-        split=config.train_dataset.split,
-    )
-    limit = config.train_dataset.max_examples
-    if limit is not None:
-        train_dataset = train_dataset.select(range(min(limit, len(train_dataset))))
+    train_source = config.train_dataset
+    train_dataset = load_dataset("json", data_files={train_source.split: str(resolve_path(train_source.path))}, split=train_source.split)
+
+    valid_dataset = None
+    if config.valid_dataset is not None:
+        valid_source = config.valid_dataset
+        valid_dataset = load_dataset(
+            "json",
+            data_files={valid_source.split: str(resolve_path(valid_source.path))},
+            split=valid_source.split,
+        )
+        if valid_source.max_examples is not None:
+            valid_dataset = valid_dataset.select(
+                range(min(valid_source.max_examples, len(valid_dataset)))
+            )
 
     trainer = PPOTrainer(
         args=config,
         train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
         reward_fn=gsm8k_reward,
     )
     asyncio.run(trainer.train())

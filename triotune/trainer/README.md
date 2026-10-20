@@ -21,9 +21,9 @@ triotune/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
 │   ├── dataloader.py    # 流式数据集的 batch 迭代
 │   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
-│   ├── reporting.py     # 进程隔离的 SwanLab secondary-run reporter
+│   ├── reporting.py     # 兼容旧调用的进程隔离 secondary-run reporter
 │   ├── scoring.py       # 固定 completion 的 logprob 评分与对齐
-│   └── metrics.py       # 指标规范化、窗口聚合与 SwanLab 提交
+│   └── metrics.py       # 指标规范化、JSONL 历史、窗口聚合与 SwanLab 提交
 └── trainer/
     ├── __init__.py      # 公开导出与历史模块路径兼容
     ├── dpo_trainer.py   # DPO 训练编排
@@ -56,7 +56,7 @@ triotune/
 | [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
 | [训练样本](../dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
 | [SWE 轨迹](../dataset/swe_sft/) | 将包含工具调用、工具结果和多轮决策的软件工程智能体轨迹转换为 PyTRIO SFT 数据。 |
-| [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、窗口聚合、SwanLab 提交、文本记录和 run 结束。 |
+| [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、`log_dir` JSONL 历史、窗口聚合、SwanLab 提交、checkpoint URI 记录和 run 结束。 |
 | [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
 | [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
 | [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |

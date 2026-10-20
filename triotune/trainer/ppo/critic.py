@@ -270,19 +270,23 @@ class PyTRIOCritic:
                     self.client, "forward_backward_custom", data, loss_fn=loss_fn
                 )
                 self.train_tokens += compute_train_tokens(data)
-                await call_async(
+                optimizer = await call_async(
                     self.client, "optim_step", optimizer_params(self._optimizer_config)
                 )
                 self.optimizer_steps += 1
-                rows.append(
-                    {
-                        key: float(value)
-                        for key, value in result.metrics.items()
-                        if key.startswith("critic/")
-                        and isinstance(value, (int, float))
-                        and np.isfinite(value)
-                    }
-                )
+                row = {
+                    key: float(value)
+                    for key, value in result.metrics.items()
+                    if key.startswith("critic/")
+                    and isinstance(value, (int, float))
+                    and np.isfinite(value)
+                }
+                for name in ("grad_norm", "gradient_norm", "optim/grad_norm"):
+                    value = getattr(optimizer, "metrics", {}).get(name)
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                        row["critic/grad_norm"] = float(value)
+                        break
+                rows.append(row)
         self.global_step += 1
         metrics = {
             key: float(np.mean([row[key] for row in rows if key in row]))

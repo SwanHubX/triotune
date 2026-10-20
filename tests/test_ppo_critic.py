@@ -1,4 +1,4 @@
-"""Two-run PyTRIO PPO: causal value readout, real SDK bridge and lifecycle."""
+"""PyTRIO PPO: causal value readout, independent clients and one metric run."""
 
 import asyncio
 import math
@@ -94,7 +94,7 @@ class CriticClient(TrainingClient):
             self.parameter -= params.learning_rate * self.parameter.grad
             self.parameter.grad = None
         self.version += 1
-        return Future(SimpleNamespace(metrics={}), self.trace, "optim")
+        return Future(SimpleNamespace(metrics={"grad_norm": 0.3}), self.trace, "optim")
 
 
 class Service:
@@ -191,7 +191,7 @@ class CriticLossTests(unittest.TestCase):
             fn(list(reversed(critic_datums([t], (1, 0)))), [])
 
 
-class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
+class PPOCriticTests(unittest.IsolatedAsyncioTestCase):
     async def test_actor_reporter_finishes_on_main_thread(self):
         run = Mock()
 
@@ -206,7 +206,7 @@ class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
         await trainer.close()
         run.finish.assert_called_once()
 
-    async def test_default_ppo_creates_two_independent_runs_and_saves_both(self):
+    async def test_default_ppo_creates_two_independent_clients_and_saves_both(self):
         service = Service()
         config = PPOConfig(
             batch_size=1,
@@ -246,6 +246,7 @@ class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(service.critic.parameter.item(), 0.2)
         self.assertEqual(service.actor.version, 1)
         self.assertIn("critic/loss", state.metrics)
+        self.assertEqual(state.metrics["critic/grad_norm"], 0.3)
         self.assertNotEqual(state.metrics["train/loss"], 999)
 
     async def test_causal_values_cannot_see_future_actions(self):
@@ -325,8 +326,8 @@ class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
         await trainer.step([trajectory()])
         await trainer.close()
 
-    async def test_separate_reporters_and_both_finish_on_error(self):
-        actor_run, critic_run = Mock(), Mock()
+    async def test_actor_and_critic_share_one_reporter_and_finish_on_error(self):
+        run = Mock()
         service = Service()
         config = PPOConfig(report_to="swanlab", run_name="pair")
         trainer = PPOTrainer(
@@ -341,25 +342,20 @@ class TwoRunPPOTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("critic backend failed")
 
         service.critic.forward_backward_custom_async = failed
-        with (
-            patch(
-                "triotune.trainer.ppo.trainer.MetricsAPI.from_config",
-                return_value=MetricsAPI(actor_run),
-            ) as actor_factory,
-            patch(
-                "triotune.trainer.ppo.trainer.critic_metrics",
-                return_value=MetricsAPI(critic_run),
-            ) as critic_factory,
-        ):
+        with patch(
+            "triotune.trainer.ppo.trainer.MetricsAPI.from_config",
+            return_value=MetricsAPI(run),
+        ) as factory:
             with self.assertRaisesRegex(RuntimeError, "critic backend"):
                 await trainer.train()
-        self.assertEqual(actor_factory.call_args.args[0].run_name, "pair-actor")
-        self.assertEqual(critic_factory.call_args.kwargs["name"], "pair-critic")
-        self.assertEqual(critic_factory.call_args.kwargs["metadata"]["role"], "critic")
-        actor_run.finish.assert_called_once()
-        critic_run.finish.assert_called_once()
-        self.assertEqual(actor_run.finish.call_args.kwargs["state"], "crashed")
-        self.assertEqual(critic_run.finish.call_args.kwargs["state"], "crashed")
+        self.assertEqual(factory.call_args.args[0].run_name, "pair")
+        self.assertEqual(
+            factory.call_args.kwargs["metadata"]["components"],
+            ["actor", "critic"],
+        )
+        self.assertIsNone(trainer.critic.metrics)
+        run.finish.assert_called_once()
+        self.assertEqual(run.finish.call_args.kwargs["state"], "crashed")
 
     async def test_critic_failure_tracks_partial_updates_and_shared_client_rejected(
         self,

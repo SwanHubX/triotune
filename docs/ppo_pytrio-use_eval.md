@@ -42,7 +42,7 @@ flowchart TD
     G --> H[固定目标，按完整 prompt group 切 minibatch]
     H --> I[actor：策略损失、backward、Adam]
     H --> J[critic：clipped value regression、backward、独立 Adam]
-    I --> K[两个 run 的日志和 checkpoint，下一轮刷新 actor sampling client]
+    I --> K[同一 run 的命名指标和双 checkpoint，下一轮刷新 actor sampling client]
     J --> K
 ```
 
@@ -58,7 +58,7 @@ flowchart TD
 | [actor.py](../triotune/trainer/ppo/actor.py) | proximal 重算、目标冻结、minibatch 和重复更新 |
 | [critic.py](../triotune/trainer/ppo/critic.py) | `PyTRIOCritic` 评分、更新、保存；保留外部 `Critic` 协议 |
 | [critic.py](../triotune/trainer/ppo/critic.py) | marker targets、无界 value 读出、clipped value regression 和 critic 更新 |
-| [reporting.py](../triotune/utils/reporting.py) | 进程隔离的第二个 SwanLab run reporter（公共 utility） |
+| [metrics.py](../triotune/utils/metrics.py) | 单 run SwanLab 提交、指标规范化及 `log_dir` JSONL 历史 |
 | [rl_trainer.py](../triotune/trainer/rl_trainer.py) | 训练编排、日志、actor/critic checkpoint 保存 |
 
 初始化是惰性的；创建 `PPOTrainer` 本身不会立即创建远端训练客户端。
@@ -75,11 +75,12 @@ flowchart TD
 | --- | --- | --- |
 | `PPOConfig.for_algorithm(name, **overrides)` | 算法名、覆盖参数 → `PPOConfig` | 预设只改变配置，不创建另一种 trainer；显式参数优先 |
 | `PPOTrainer(model, args, train_dataset, reward_fn, ...)` | 服务端模型 ID、配置、可迭代数据和奖励函数 | 可注入 `training_client`、`critic_training_client`、`tokenizer`、`reference_client`、`service_client`、`critic`；默认 LoRA rank 32 |
-| `await trainer.initialize()` | 无 → `None` | 创建独立 actor/critic client、获取 tokenizer、初始化两个 reporter；已完成时直接返回 |
-| `await trainer.train()` | 使用构造时的数据与 reward → `PPOState` | 单遍读取数据，采样后训练；正常结束保存最终 actor/内置 critic checkpoint，并结束两个日志 run |
+| `await trainer.initialize()` | 无 → `None` | 创建独立 actor/critic client、获取 tokenizer、初始化一个实验 reporter；已完成时直接返回 |
+| `await trainer.train()` | 使用构造时的数据与 reward → `PPOState` | 单遍读取数据，采样后训练；终端逐步显示 loss/reward/tokens，正常结束保存最终 actor/内置 critic checkpoint 并结束一个日志 run |
+| `await trainer.evaluate(eval_dataset=None)` | 验证 prompt 与 reward → 标量指标字典 | 当前 actor 采样并汇总 reward、长度、截断和 token 用量；不调用 reference/critic、backward 或 optimizer，也不推进 global step |
 | `await trainer.step(trajectories)` | 已生成的轨迹列表 → 标量指标字典 | 跳过内置采样及动态补采，执行 reference/value、冻结 GAE，再并发更新 actor/critic；不能在同一个 trainer 上并发调用 |
 | `await trainer.save_checkpoint()` | 无 → 远端路径字符串 | 保存 actor/内置 critic 状态，更新 `state.checkpoint_path`/`state.critic_checkpoint_path`；返回 actor 路径；外部 critic 自管保存 |
-| `await trainer.close(state="success", error=None)` | 无 → `None` | 结束 actor 和内置 critic reporter；外部 critic 生命周期由调用者管理 |
+| `await trainer.close(state="success", error=None)` | 无 → `None` | 结束统一实验 reporter；外部 critic 生命周期由调用者管理 |
 | `await actor.prepare(trajectories)` | 轨迹 → `PreparedBatch` | 验证分组和数组对齐，可重算 proximal，计算并冻结 advantage/return |
 | `await actor.update(prepared_batch)` | 冻结目标 → 指标字典 | 完成配置的 minibatch/epoch 更新，累计 `actor.optimizer_steps`；只操作策略，不负责 critic 或日志生命周期 |
 
@@ -244,7 +245,7 @@ critic 按轨迹切 minibatch，数量不得超过有效轨迹数；每个 epoch
 | 多次更新 | 一轮采样内冻结目标，执行多个 minibatch 和 update epoch；完整 group 不拆开 |
 | 动态补采 | 按原始 reward 过滤组内全部相同的回答组；补采到 batch size 或数据耗尽，连续空批数有上限 |
 | 长度惩罚 | 在 reward bias/scaling/clip、归一化之前施加逐渐增加的超长惩罚 |
-| 保存与日志 | 周期/最终 actor+critic 保存、独立标量和 checkpoint 路径、两个 SwanLab run 正常/异常结束 |
+| 保存与日志 | 周期/最终 actor+critic 保存、同一 SwanLab run 中的命名标量和双 checkpoint URI、`log_dir` JSONL 历史 |
 
 `ppo_n_minibatches` 不能超过当前有效 prompt group 数，包括最后一个不满 batch 的情况。
 native backend 仅接受普通 token-ratio PPO、token mean 和常规 clip；
@@ -262,8 +263,8 @@ uv sync --extra ppo
 uv run --extra ppo python -m unittest discover -s tests -p 'test_ppo*.py' -v
 ```
 
-测试文件为 [test_ppo_family.py](../tests/test_ppo_family.py)（28 项）和
-[test_ppo_critic.py](../tests/test_ppo_critic.py)（15 项），共 43 项。
+核心测试文件为 [test_ppo_family.py](../tests/test_ppo_family.py)（32 项）和
+[test_ppo_critic.py](../tests/test_ppo_critic.py)（15 项），另有 2 项配置文件测试，共 49 项。
 这些测试不需要 PyTRIO 服务凭据，不创建真实远端模型，也不向 SwanLab 上传训练轨迹。
 已有 CPU PyTorch 环境可直接使用 `.venv/bin/python` 执行测试，无需重复安装 GPU 版 PyTorch。
 
@@ -271,7 +272,7 @@ uv run --extra ppo python -m unittest discover -s tests -p 'test_ppo*.py' -v
 | --- | --- |
 | `AdvantageTests` | 可变组和 singleton、RLOO baseline、reward/advantage 归一化、token/turn GAE、turn metadata、工具 mask、KL、超长/截断处理、无效配置 |
 | `PolicyLossTests` | PPO clip 和 dual clip 梯度、GSPO 几何比率、SAPO/CISPO、不同长度的 reduction、过滤分母、因果对齐、value loss、有限差分梯度和溢出失败 |
-| `CriticLossTests`、`TwoRunPPOTests`、`ReporterProcessTests` | marker 因果对齐、无界读出、梯度有限差分、mask/bootstrap、独立优化器与 checkpoint、GAE 目标冻结、实际回归学习、并发更新、双 reporter 和异常清理、真实 SDK 的正负 CE 权重 |
+| `CriticLossTests`、`PPOCriticTests`、`ReporterProcessTests` | marker 因果对齐、无界读出、梯度有限差分、mask/bootstrap、独立优化器与 checkpoint、GAE 目标冻结、实际回归学习、并发更新、统一 reporter 和异常清理、历史隔离 reporter utility、真实 SDK 的正负 CE 权重 |
 | `AsyncTrainerTests` | 两阶段 future 顺序、策略刷新和 seed、各预设共用 actor、native 参数、固定 reference、外部 critic 调用、动态补采、失败状态和 SDK 梯度转换 |
 
 其中 `test_all_presets_use_same_loop_and_native_threshold_contract` 遍历无 critic 预设，
@@ -347,7 +348,8 @@ async def main():
         reporting=ReportingConfig(
             report_to="swanlab",
             project="ppo-family-smoke",
-            run_name="ppo-two-run-smoke",
+            run_name="ppo-single-run-smoke",
+            log_dir="/tmp/ppo-single-run-smoke",
         ),
     )
     state = await PPOTrainer(
@@ -367,7 +369,7 @@ PY
 ```
 
 验收时检查：完成两轮 rollout、actor/critic 各两次 Adam 更新、无非有限指标、两份有效远端路径；
-两个 SwanLab run 正常结束且有训练图表和各自的 checkpoint 文本。
+一个 SwanLab run 正常结束，图表同时包含 `train/*` 与 `critic/*`，并记录两条 checkpoint URI。
 示例使用 Qwen 的聊天模板选项，更换模型时需要确认该模板是否接受 `enable_thinking`。
 如需验证 native 请求链路，可设 `PPO_TEST_BACKEND=native` 后重新执行完整命令；
 两种 backend 的成功都不能单独证明梯度归一化完全相同。
@@ -379,7 +381,7 @@ PY
 ### 5.3 标准 PPO 的 critic 怎么验证
 
 默认 `PPOConfig.for_algorithm("ppo")` 无需传入 `critic=`。
-`test_default_ppo_creates_two_independent_runs_and_saves_both` 验证独立参数/Adam/seed/rank 和双保存；
+`test_default_ppo_creates_two_independent_clients_and_saves_both` 验证独立参数/Adam/seed/rank 和双保存；
 `test_critic_really_learns_return_and_keeps_actor_untouched` 使用可导小型因果 LM 拟合冻结 return，
 验证损失下降且 actor 未被 critic 更新修改；不是只测试固定值接口。
 `test_causal_values_cannot_see_future_actions` 验证未来 action 不会影响之前的状态 value；
@@ -405,13 +407,13 @@ value 和 group 边界，分别比较 reward 处理、advantage/return、最终 
 
 | 项目 | 当前证据 |
 | --- | --- |
-| PPO 专项自动测试 | 当前 39 项通过；命令见第 5.1 节 |
-| 仓库回归测试 | 接入 PR #33 的现有重构后运行 247 项通过；命令见第 5.1 节 |
+| PPO 专项自动测试 | 当前 49 项通过；命令见第 5.1 节 |
+| 仓库回归测试 | 当前 198 项通过；命令见第 5.1 节 |
 | AReaL 原始函数差分 | 实现阶段手工检查 15 组 loss/梯度组合通过，不在自动测试中 |
 | 静态检查和打包 | 实现阶段 Ruff、格式、diff whitespace 检查通过，wheel 包含全部 14 个 PPO Python 模块 |
 | 真实 PyTRIO 模型训练 | 2026-10-16，Qwen/Qwen3.5-4B 双 LoRA：两轮 rollout，actor/critic 各两次更新，全部指标有限，双 checkpoint 保存成功 |
 | 内置 critic 的实际更新 | 同一批状态更新前后 value 的平均绝对变化分别为 2.72917、2.12500；末轮 actor loss=-3.37884、critic loss=12.05609 |
-| SwanLab 双 run | 两个离线 run 正常结束，日志保存在 `/tmp/ppo-two-run-smoke`；本次没有上传云端 |
+| 改动前的 SwanLab 双 run | 2026-10-16 的历史烟测产生两个离线 run；当前实现已改为单 run，需在下一次真实训练中重新验收图表 |
 | 与 AReaL 的 reward 曲线、收敛效果和吞吐量 | 尚未做对照实验，不能给出一致性或加速结论 |
 
 本次真实实验配置为：`batch_size=1`、`num_generations=2`、`max_tokens=16`、两边 LoRA rank=8，
@@ -419,8 +421,8 @@ actor LR=1e-5、critic LR=1e-4、seed=42/43、discount=0.99、lambda=0.95、`adv
 使用两条相同的 `只输出数字：1+1=?` prompt 和包含 `2` 得 1 分的简单链路奖励。
 actor checkpoint：`trio://run_aiow2a1uajlo/weights/ppo-step-00000002`；
 critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`。
-离线日志分别为 `/tmp/ppo-two-run-smoke/run-20261016_175058-51d9r3m3`（actor）和
-`/tmp/ppo-two-run-smoke/run-20261016_175059-p7g162s9`（critic）。
+改动前的离线日志分别为 `/tmp/ppo-two-run-smoke/run-20261016_175058-51d9r3m3`（actor）和
+`/tmp/ppo-two-run-smoke/run-20261016_175059-p7g162s9`（critic）；它们只作为旧实现的历史证据。
 这些 checkpoint 和临时日志依赖当前服务/机器保留状态，并未纳入仓库。
 
 ## 6. 哪些 AReaL 接口和功能没有实现，为什么
@@ -449,7 +451,7 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 | 完整 `RejectionSamplingConfig` | 仅 token ratio 上下界 mask；无 sequence/其他 metric、clamp 等模式 | 当前只实现已验证的一个子集；许多其他模式也可用现有 logprob 计算 |
 | rollout export、logical group、分段轨迹/高级 reward normalization | 一条 `Trajectory` 对应一条 completion，显式 group ID；无完整 exporter metadata | 数据契约有意简化，缺少跨片段关系与逻辑成员计数；部分超长惩罚归一化不保证与这些路径相同 |
 | 跨 group 切分、packing、分布式 microbatch reduction | 完整 prompt group 不拆开；没有客户端 packing 和 engine microbatch weight 协议 | 简化为请求级更新；服务端可能自行 packing，但这不是对 AReaL reduction 调度的复刻 |
-| `_evaluate_before_train()`、`_evaluate()`、独立 eval rollout | 没有 eval dataset/评估方法；开启 `eval_steps`、`eval_before_train`、`eval_after_train` 会报错 | 本轮只接通训练路径；可复用现有采样/评分接口增加评估循环 |
+| `_evaluate_before_train()`、`_evaluate()`、独立 eval rollout | `PPOTrainer.evaluate()` 复用当前 actor 的 rollout/reward 契约，支持训练前、周期和训练后调度 | 当前评估聚合 task reward、生成长度、截断比例和 sampling token 用量；不执行 critic/reference 评分 |
 | `_save_recover_checkpoint()`、`_recover_engines()`、数据迭代器恢复、`_save_hf()` | 分别保存远端 actor/critic 状态；无统一加载恢复、HF 格式导出或原子联合 checkpoint | 恢复还需要保存本地 step/group/数据位置、两种 optimizer/checkpoint 的配对与加载逻辑；SDK 有保存能力不代表 trainer 已实现恢复 |
 | 多 epoch 数据管理、shuffle、学习率 scheduler | 单遍 iterable、固定配置的学习率；`update_epochs` 只重复同一批 rollout | 尚未添加数据 epoch 和调度器状态；调用者可以提供重复/打乱的数据，但框架不负责其恢复 |
 | MOPD teacher、`configure_mopd_loss()`、teacher rollout 与聚合 | PPO 包中没有这些 teacher/controller 接口 | 属于额外的蒸馏和多模型协同能力，本轮聚焦 PPO 算法族；仓库其他 OPD 入口也不等同于 AReaL 的 MOPD 实现 |
@@ -461,7 +463,10 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 
 ## 7. 日志如何验收和解释
 
-`report_to="swanlab"` 启用公共 `MetricsAPI`，不启用时仍可从 `state.metrics` 查看数值。
+`report_to="swanlab"` 启用云端图表，不启用时仍有终端进度和 `state.metrics`。
+只要配置 `log_dir`，`MetricsAPI` 就会另外创建唯一的 `metrics-<UTC时间>-<ID>.jsonl`：
+逐步保存规范化指标，保存 checkpoint URI，并在结束事件中写入最终指标和成功/失败状态。
+该文件不包含模型权重；actor/critic checkpoint 仍是 PyTRIO 云端 URI。
 
 | 指标 | 口径 |
 | --- | --- |
@@ -471,6 +476,7 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 | `train/action_tokens` | 本轮 mask=True 的 completion token 总数；行为过滤保留原分母，因此不扣掉被 rejection 过滤的 token |
 | `train/trajectories`、`train/prompt_groups` | 本轮接受的回答数和 prompt group 数 |
 | `train/optimizer_steps` | 累计成功完成的 Adam update 数 |
+| `train/grad_norm`、`critic/grad_norm` | PyTRIO `optim_step` 返回时记录的 actor/critic 梯度范数；服务端不返回时该指标不存在 |
 | `critic/loss`、`critic/value_mean`、`critic/return_mean`、`critic/clip_fraction` | clipped value MSE、更新前向的 value/冻结 return 均值、裁剪分支实际主导损失的 token 比例；多个 minibatch/epoch 指标取算术平均 |
 | `critic/optimizer_steps`、`critic/learning_rate`、`critic/action_tokens` | critic 累计已完成的 Adam 次数、独立学习率及本轮有效 action 数 |
 | `time/critic_update` | critic 回归更新的墙钟时间，与 actor 更新可重叠 |
@@ -478,13 +484,12 @@ critic checkpoint：`trio://run_r09dy0nbfcwv/weights/ppo-critic-step-00000002`�
 | `time/update` | actor 和 critic 并发更新的客户端墙钟耗时 |
 | `time/rollout` | `train()` 中策略采样 client 准备、采样、reward 和补采时间 |
 | `time/step` | `train()` 一轮的墙钟时间，包含该轮周期保存；最终保存与首次初始化不完整包含在内 |
-| `checkpoint/path` | actor run 在完整 train 正常结束后记录 actor 远端路径；critic run 在保存时记录自己的路径；不是本地权重目录 |
+| `checkpoint/actor_path`、`checkpoint/critic_path` | 同一 run 与 JSONL 中记录的两条远端 URI；不是本地权重目录 |
 
 native backend 的损失指标取决于服务端返回，外部 critic 指标由其 `update()` 提供。
-内置 critic 启用时，SwanLab run 名为 `<run_name>-actor` 和 `<run_name>-critic`，
-两者共享 project/workspace/tags/log_dir。actor run 记录合并后的指标，critic run 记录回归指标。
-SwanLab 0.10.1 每进程仅允许一个活动 run，因此 critic 的日志 writer 使用独立子进程；
-两个 PyTRIO 客户端仍在 trainer 所在进程。actor reporter 的结束操作在主线程执行。
+内置 critic 启用时只创建 `<run_name>` 一个 SwanLab run；策略指标使用 `train/*`、`policy/*`，
+价值模型指标使用 `critic/*`。这与 AReaL 把各组件命名指标汇总给同一个 `StatsLogger` 的方式一致。
+actor 与 critic 仍是两个独立 PyTRIO 客户端，日志合并不改变参数、优化器或 checkpoint 边界。
 更新与保存并非原子事务；发生异常可能有一个模型已更新，状态计数反映已确认完成的更新，
 不能把错误重试当成无副作用操作。外部 critic 的保存和关闭仍由注入方负责。
 直接使用 `step()` 不生成 `time/rollout`、`time/step` 两项。

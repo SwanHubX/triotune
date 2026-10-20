@@ -671,7 +671,16 @@ class OPDTrainer:
                     break
                 result = await self._step_async(rows)
                 progress.set_postfix(
-                    kl=f"{result.metrics['distill/reverse_kl_sampled']:.4f}",
+                    {
+                        label: f"{result.metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("reverse_kl", "distill/reverse_kl_sampled"),
+                            ("grad_norm", "optim/grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in result.metrics
+                    },
                     refresh=False,
                 )
                 progress.update(1)
@@ -685,35 +694,33 @@ class OPDTrainer:
             if self.state.global_step > initial_step:
                 if not self.args.save_every or self.state.global_step % self.args.save_every:
                     await self._save_state_async()
-                if self._metrics_api.enabled:
-                    elapsed = time.perf_counter() - started
-                    self._flush_log()
-                    self._metrics_api.publish(
-                        {
-                            "time/train_runtime": elapsed,
-                            "time/train_steps_per_second": (
-                                self.state.global_step - initial_step
-                            )
-                            / elapsed,
-                            "time/train_tokens_per_second": (
-                                self._total_tokens - initial_tokens
-                            )
-                            / elapsed,
-                            "usage/train_tokens_total": float(self._total_tokens),
-                            "usage/sample_input_tokens_total": float(
-                                self._sample_input_tokens
-                            ),
-                            "usage/sample_output_tokens_total": float(
-                                self._sample_output_tokens
-                            ),
-                        },
-                        step=self.state.global_step,
+                elapsed = time.perf_counter() - started
+                summary = {
+                    "time/train_runtime": elapsed,
+                    "time/train_steps_per_second": (
+                        self.state.global_step - initial_step
                     )
-                    self._metrics_api.log_text(
-                        key="checkpoint/path",
-                        data=self.state.checkpoint_path,
-                        step=self.state.global_step,
+                    / elapsed,
+                    "time/train_tokens_per_second": (
+                        self._total_tokens - initial_tokens
                     )
+                    / elapsed,
+                    "usage/train_tokens_total": float(self._total_tokens),
+                    "usage/sample_input_tokens_total": float(
+                        self._sample_input_tokens
+                    ),
+                    "usage/sample_output_tokens_total": float(
+                        self._sample_output_tokens
+                    ),
+                }
+                self.state.metrics.update(summary)
+                self._flush_log()
+                self._metrics_api.publish(summary, step=self.state.global_step)
+                self._metrics_api.log_text(
+                    key="checkpoint/path",
+                    data=self.state.checkpoint_path,
+                    step=self.state.global_step,
+                )
             if (
                 self.eval_dataset is not None
                 and self.args.eval_after_train

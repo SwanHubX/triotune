@@ -480,13 +480,18 @@ class DPOTrainer:
         """Select compact scalars for the terminal progress bar."""
 
         return {
-            key: f"{value:.4f}"
-            for key, value in result.metrics.items()
-            if key in {"train/loss", "reward/accuracy"}
+            label: f"{result.metrics[name]:.4f}"
+            for label, name in (
+                ("loss", "train/loss"),
+                ("accuracy", "reward/accuracy"),
+                ("grad_norm", "optim/grad_norm"),
+                ("tokens", "usage/train_tokens_total"),
+            )
+            if name in result.metrics
         }
 
     def _log_final_checkpoint(self) -> None:
-        """Publish the final checkpoint URI when reporting is enabled."""
+        """Record the final checkpoint URI in configured metric outputs."""
 
         if self.state.checkpoint_path is not None:
             self._metrics_api.log_text(
@@ -635,7 +640,12 @@ class DPOTrainer:
             raise ValueError("train_dataset is required for train().")
         started = time.perf_counter()
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="DPO train",
+            unit="step",
+        )
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
@@ -689,7 +699,12 @@ class DPOTrainer:
             raise ValueError("train_dataset is required for train_async().")
         started = time.perf_counter()
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="DPO train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="DPO train",
+            unit="step",
+        )
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (

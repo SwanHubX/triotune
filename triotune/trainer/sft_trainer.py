@@ -282,17 +282,35 @@ class SFTTrainer:
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
         batches = iter_batches(self.train_dataset, self.args.batch_size)
-        progress = tqdm(total=self.args.max_steps, desc="SFT train", unit="step")
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=self.state.global_step,
+            desc="SFT train",
+            unit="step",
+        )
         pending: list[asyncio.Task[dict[str, float]]] = []
         previous = None
         submitted = self.state.global_step
+        initial_step, initial_tokens = self.state.global_step, self._train_tokens
         clock = [time.perf_counter()] * 2
 
         def report(task: asyncio.Task[dict[str, float]]) -> None:
             """Advance terminal progress after a successful batch task."""
 
             if not task.cancelled() and task.exception() is None:
-                progress.set_postfix({"loss": task.result().get("train/loss")}, refresh=False)
+                metrics = task.result()
+                progress.set_postfix(
+                    {
+                        label: f"{metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("grad_norm", "grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in metrics
+                    },
+                    refresh=False,
+                )
                 progress.update(1)
 
         try:
@@ -336,6 +354,22 @@ class SFTTrainer:
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate()
+            if self.state.global_step > initial_step:
+                elapsed = time.perf_counter() - clock[0]
+                summary = {
+                    "time/train_runtime": elapsed,
+                    "time/train_steps_per_second": (
+                        self.state.global_step - initial_step
+                    )
+                    / elapsed,
+                    "time/train_tokens_per_second": (
+                        self._train_tokens - initial_tokens
+                    )
+                    / elapsed,
+                    "usage/train_tokens_total": float(self._train_tokens),
+                }
+                self.state.metrics.update(summary)
+                self._metrics_api.publish(summary, step=self.state.global_step)
             if self.state.checkpoint_path is not None:
                 self._metrics_api.log_text(
                     key="checkpoint/path",

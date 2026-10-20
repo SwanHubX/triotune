@@ -13,17 +13,17 @@ import itertools
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import pytrio as trio
+from tqdm import tqdm
 
 from ..api.cli_args import PPOConfig
 from ..api.client_api import call_async
 from ..utils.checkpoint import save_checkpoint_async
+from ..utils.dataloader import iter_batches
 from ..utils.metrics import MetricsAPI
-from ..utils.reporting import isolated_metrics as critic_metrics
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
 from .ppo.contracts import PPOState, Trajectory
@@ -43,6 +43,9 @@ class PPOTrainer:
     complete trajectories. PPO creates a separate PyTRIO critic by default;
     callers can still inject an alternative Critic. Initialization is lazy.
     ``max_steps``/``save_every`` count rollout updates, not optimizer minibatches.
+    ``eval_dataset`` must be replayable when periodic evaluation is enabled;
+    evaluation samples the current actor and scores the same task reward without
+    reference/critic scoring or any optimizer update.
     """
 
     # ------------------------------------------------------------------
@@ -56,6 +59,7 @@ class PPOTrainer:
         train_dataset: Iterable[Mapping[str, Any]] | None = None,
         reward_fn: Callable | None = None,
         *,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
         reference_model: str | None = None,
         critic: Critic | None = None,
         lora_rank: int | None = None,
@@ -104,8 +108,9 @@ class PPOTrainer:
             )
         if training_client is not None and training_client is critic_training_client:
             raise ValueError("Actor and critic must use independent training clients.")
-        self.train_dataset, self.reward_fn, self.critic = (
+        self.train_dataset, self.eval_dataset, self.reward_fn, self.critic = (
             train_dataset,
+            eval_dataset,
             reward_fn,
             critic,
         )
@@ -120,6 +125,9 @@ class PPOTrainer:
         self._metrics = None
         self._sample_input_tokens = 0
         self._sample_output_tokens = 0
+        self._eval_sample_input_tokens = 0
+        self._eval_sample_output_tokens = 0
+        self._last_eval_step: int | None = None
         self.state = PPOState()
 
     # ------------------------------------------------------------------
@@ -179,42 +187,18 @@ class PPOTrainer:
                 )
             self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids)
 
-        # Keep actor and critic metrics in separate runs when the trainer owns
-        # both clients, while preserving one public actor metrics stream.
+        # Actor and critic remain independent training clients, but one PPO
+        # experiment owns one metric run with component-specific namespaces.
         name = self.args.run_name or f"{self.model.rsplit('/', 1)[-1]}-ppo-family"
-        actor_args = (
-            replace(
-                self.args,
-                reporting=replace(self.args.reporting, run_name=f"{name}-actor"),
-            )
-            if self._owns_critic
-            else self.args
-        )
         self._metrics = MetricsAPI.from_config(
-            actor_args,
+            self.args,
             default_name=name,
             metadata={
                 "model": self.model,
                 "lora_rank": self.lora_rank,
-                "role": "actor",
+                "components": ["actor", "critic"] if self._owns_critic else ["actor"],
             },
         )
-        if self._owns_critic:
-            self.critic.metrics = await asyncio.to_thread(
-                critic_metrics,
-                self.args,
-                name=f"{name}-critic",
-                metadata={
-                    "role": "critic",
-                    "model": self.model,
-                    "lora_rank": self.args.critic_lora_rank or self.lora_rank,
-                    "learning_rate": self.args.critic_learning_rate
-                    or self.args.learning_rate,
-                    "seed": None if self.args.seed is None else self.args.seed + 1,
-                    "critic_token_ids": list(self.critic.token_ids),
-                    "value_mapping": "scale * (logp_positive - logp_negative) + bias",
-                },
-            )
         self._actor = PPOActor(self._client, self.args)
 
     async def _references(self, trajectories):
@@ -317,7 +301,7 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     async def save_checkpoint(self) -> str:
-        """Save owned actor and critic runs and return the actor checkpoint."""
+        """Save owned actor and critic states and return the actor checkpoint."""
         await self.initialize()
 
         async def actor_save():
@@ -334,18 +318,26 @@ class PPOTrainer:
         if self._owns_critic:
             jobs.append(critic_save())
         await gather_cancel_on_error(jobs)
+        self._metrics.log_text(
+            key="checkpoint/actor_path",
+            data=self.state.checkpoint_path,
+            step=self.state.global_step,
+        )
+        if self.state.critic_checkpoint_path is not None:
+            self._metrics.log_text(
+                key="checkpoint/critic_path",
+                data=self.state.critic_checkpoint_path,
+                step=self.state.global_step,
+            )
         return self.state.checkpoint_path
 
     async def close(self, *, state="success", error=None) -> None:
-        """Finish owned reporters; injected critics retain lifecycle ownership."""
-        try:
-            if self._owns_critic and self.critic is not None:
-                await asyncio.to_thread(self.critic.finish, state=state, error=error)
-        finally:
-            if self._metrics is not None:
-                # SwanLab restores signal handlers on finish. The actor run was
-                # initialized in this process and must finish on the main thread.
-                self._metrics.finish(state=state, error=error)
+        """Finish the experiment reporter; injected critics retain ownership."""
+
+        if self._metrics is not None:
+            # SwanLab restores signal handlers on finish and therefore remains
+            # on the main thread even though actor/critic updates are concurrent.
+            self._metrics.finish(state=state, error=error)
 
     # ------------------------------------------------------------------
     # Dataset-driven rollout collection and training entry point
@@ -393,14 +385,134 @@ class PPOTrainer:
         self._sample_input_tokens += usage.input_tokens
         self._sample_output_tokens += usage.output_tokens
 
+    # ------------------------------------------------------------------
+    # Reward evaluation shared by every PPO-family preset
+    # ------------------------------------------------------------------
+
+    def _evaluation_batches(
+        self, dataset: Iterable[Mapping[str, Any]]
+    ) -> Iterable[list[Mapping[str, Any]]]:
+        """Yield validation prompts under the shared evaluation limits."""
+
+        batch_size = self.args.eval_batch_size or self.args.batch_size
+        yield from iter_batches(
+            dataset,
+            batch_size,
+            max_batches=self.args.eval_max_batches,
+        )
+
+    def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Store validation metrics without advancing any training counter."""
+
+        values = {str(name): float(value) for name, value in metrics.items()}
+        self._last_eval_step = self.state.global_step
+        self.state.metrics.update(values)
+        self._metrics.publish(values, step=self.state.global_step)
+        return values
+
+    async def evaluate(
+        self,
+        eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, float]:
+        """Sample the current actor and aggregate task reward without updates.
+
+        The method is algorithm-agnostic: PPO, GRPO, CISPO and every other
+        preset share the same prompt rendering, rollout and reward contract.
+        Evaluation deliberately skips reference scoring, critic values,
+        advantage construction, backward and optimizer calls.
+        """
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("eval_dataset is required for evaluate().")
+        if not callable(self.reward_fn):
+            raise ValueError("evaluate() requires reward_fn.")
+        await self.initialize()
+        sampler = await call_async(
+            self._client, "save_weights_and_get_sampling_client"
+        )
+        started = time.perf_counter()
+        trajectories: list[Trajectory] = []
+        prompt_count = 0
+        batch_count = 0
+        sample_input_tokens = 0
+        sample_output_tokens = 0
+
+        def record_usage(usage: SampleTokens) -> None:
+            nonlocal sample_input_tokens, sample_output_tokens
+            sample_input_tokens += usage.input_tokens
+            sample_output_tokens += usage.output_tokens
+
+        for rows in self._evaluation_batches(dataset):
+            batch = await generate_rollouts(
+                sampler,
+                self._tokenizer,
+                rows,
+                self.reward_fn,
+                self.args,
+                first_group=prompt_count,
+                sample_usage_callback=record_usage,
+            )
+            trajectories.extend(batch)
+            prompt_count += len(rows)
+            batch_count += 1
+        if not trajectories:
+            raise ValueError("eval_dataset must contain at least one prompt.")
+
+        rewards = np.asarray([item.reward for item in trajectories], dtype=np.float64)
+        lengths = np.asarray(
+            [len(item.completion_tokens) for item in trajectories],
+            dtype=np.float64,
+        )
+        self._eval_sample_input_tokens += sample_input_tokens
+        self._eval_sample_output_tokens += sample_output_tokens
+        metrics = {
+            "eval/reward_mean": float(np.mean(rewards)),
+            "eval/reward_std": float(np.std(rewards)),
+            "eval/prompts": float(prompt_count),
+            "eval/trajectories": float(len(trajectories)),
+            "eval/batches": float(batch_count),
+            "eval/completion_tokens": float(np.sum(lengths)),
+            "eval/completion_length_mean": float(np.mean(lengths)),
+            "eval/completion_length_min": float(np.min(lengths)),
+            "eval/completion_length_max": float(np.max(lengths)),
+            "eval/truncated_fraction": float(
+                np.mean([item.truncated for item in trajectories])
+            ),
+            "usage/eval_sample_input_tokens": float(sample_input_tokens),
+            "usage/eval_sample_output_tokens": float(sample_output_tokens),
+            "usage/eval_sample_input_tokens_total": float(
+                self._eval_sample_input_tokens
+            ),
+            "usage/eval_sample_output_tokens_total": float(
+                self._eval_sample_output_tokens
+            ),
+            "time/eval": time.perf_counter() - started,
+        }
+        return self._publish_evaluation(metrics)
+
     async def train(self) -> PPOState:
         """Collect rollout batches until ``max_steps`` and return final state."""
         if self.train_dataset is None or not callable(self.reward_fn):
             raise ValueError(
                 "train() requires train_dataset and reward_fn; use step() for custom trajectories."
             )
+        started = time.perf_counter()
+        initial_step = self.state.global_step
+        progress = tqdm(
+            total=self.args.max_steps,
+            initial=initial_step,
+            desc="PPO train",
+            unit="step",
+        )
         try:
             await self.initialize()
+            if (
+                self.eval_dataset is not None
+                and self.args.eval_before_train
+                and self._last_eval_step is None
+            ):
+                await self.evaluate()
             rows = iter(self.train_dataset)
             while (
                 self.args.max_steps is None
@@ -434,6 +546,21 @@ class PPOTrainer:
                         step=self.state.global_step,
                     )
                 )
+                progress.set_postfix(
+                    {
+                        label: f"{self.state.metrics[name]:.4f}"
+                        for label, name in (
+                            ("loss", "train/loss"),
+                            ("reward", "reward/mean"),
+                            ("critic_loss", "critic/loss"),
+                            ("grad_norm", "train/grad_norm"),
+                            ("tokens", "usage/train_tokens_total"),
+                        )
+                        if name in self.state.metrics
+                    },
+                    refresh=False,
+                )
+                progress.update(1)
                 self.state.metrics.update(
                     self._metrics.publish(
                         {
@@ -443,6 +570,13 @@ class PPOTrainer:
                         step=self.state.global_step,
                     )
                 )
+                if (
+                    self.eval_dataset is not None
+                    and self.args.eval_steps > 0
+                    and self.state.global_step % self.args.eval_steps == 0
+                    and self._last_eval_step != self.state.global_step
+                ):
+                    await self.evaluate()
             if not self.state.global_step:
                 raise ValueError("No trainable rollout batch was collected.")
             if (
@@ -450,9 +584,28 @@ class PPOTrainer:
                 or self.state.global_step % self.args.save_every
             ):
                 await self.save_checkpoint()
-            self._metrics.log_text(
-                key="checkpoint/path",
-                data=self.state.checkpoint_path,
+            if (
+                self.eval_dataset is not None
+                and self.args.eval_after_train
+                and self._last_eval_step != self.state.global_step
+            ):
+                await self.evaluate()
+            elapsed = time.perf_counter() - started
+            summary = {
+                "time/train_runtime": elapsed,
+                "time/train_steps_per_second": (
+                    self.state.global_step - initial_step
+                )
+                / elapsed,
+                "usage/train_tokens_total": self.state.metrics.get(
+                    "usage/train_tokens_total", 0.0
+                ),
+                "usage/sample_input_tokens_total": float(self._sample_input_tokens),
+                "usage/sample_output_tokens_total": float(self._sample_output_tokens),
+            }
+            self.state.metrics.update(summary)
+            self._metrics.publish(
+                summary,
                 step=self.state.global_step,
             )
             await self.close()
@@ -462,6 +615,8 @@ class PPOTrainer:
             except Exception as cleanup_error:
                 error.add_note(f"Reporter cleanup also failed: {cleanup_error}")
             raise
+        finally:
+            progress.close()
         return self.state
 
 

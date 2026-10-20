@@ -423,8 +423,8 @@ class EvaluationConfig:
             Evaluate the initial policy before any optimizer update.
         after_train (`bool`, default `True`):
             Evaluate the final policy unless the same step was already
-            evaluated. PPO overrides this to ``False`` because PPO evaluation
-            is not implemented yet.
+            evaluated. Individual algorithm configs may override this default
+            when final evaluation would add expensive generation requests.
         batch_size (`int` or `None`, default `None`):
             Rows per evaluation batch. ``None`` reuses training batch size.
         max_batches (`int` or `None`, default `None`):
@@ -471,7 +471,9 @@ class ReportingConfig:
             Explicit display name. ``None`` lets the trainer derive one from
             the model and algorithm.
         log_dir (`str` or `None`, default `None`):
-            Optional local SwanLab artifact directory.
+            Optional local output directory. Trainers append a unique JSONL
+            history containing step metrics, checkpoint URIs and final status;
+            SwanLab also stores its local artifacts here when enabled.
         logging_step (`int`, default `1`):
             Number of updates accumulated before DPO/OPD metric windows flush.
             Trainers that publish every step ignore this cadence.
@@ -1183,8 +1185,9 @@ class PPOConfig(BaseTrainerConfig):
         training (`TrainingConfig`): Prompt batch size, step limit and seed.
         optimizer (`OptimizerConfig`): AdamW settings for the policy actor.
         checkpoint (`CheckpointConfig`): Periodic actor/critic save cadence.
-        evaluation (`EvaluationConfig`): Reserved evaluation schedule. PPO does
-            not currently implement evaluation, so every trigger must be off.
+        evaluation (`EvaluationConfig`): Reward-evaluation schedule. Evaluation
+            does not change policy state; it samples the current actor on
+            validation prompts and aggregates the configured task reward.
         reporting (`ReportingConfig`): Terminal/SwanLab metric configuration.
         rollout (`PPORolloutConfig`): Prompt rendering and generation requests.
         actor (`PPOActorConfig`): Reward, GAE and clipped policy objective.
@@ -1245,7 +1248,6 @@ class PPOConfig(BaseTrainerConfig):
             model=model,
             train_dataset=train_dataset,
             valid_dataset=valid_dataset,
-            eval_after_train=False,
         )
         # Apply shared legacy overrides before constructing the critic. An
         # omitted critic optimizer inherits the final actor optimizer values,
@@ -1301,10 +1303,6 @@ class PPOConfig(BaseTrainerConfig):
             raise ValueError("overlong_tokens must not exceed rollout.max_tokens.")
         if self.actor.dynamic_sampling and self.rollout.num_generations < 2:
             raise ValueError("Dynamic sampling requires at least two responses per prompt.")
-        if self.evaluation.steps or self.evaluation.before_train or self.evaluation.after_train:
-            raise NotImplementedError(
-                "This PPO package does not implement scheduled evaluation."
-            )
         if self.rollout.temperature != 1.0 or self.rollout.top_p != 1.0:
             raise NotImplementedError(
                 "Use temperature=1 and top_p=1: target-only training logprobs "

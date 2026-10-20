@@ -1,6 +1,8 @@
 """Cross-cutting trainer utilities preserve metrics and checkpoint behavior."""
 
 import asyncio
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -116,6 +118,33 @@ class LoggingTests(unittest.TestCase):
             step=3,
         )
         run.finish.assert_called_once_with(state="success", error=None)
+
+    def test_metrics_api_writes_step_checkpoint_and_final_jsonl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api = MetricsAPI(log_dir=folder)
+            path = api.history_path
+
+            api.record({"train/loss": 0.5, "usage/train_tokens": 4}, step=1)
+            api.publish({"eval/loss": 0.25}, step=1)
+            api.log_text(
+                key="checkpoint/actor_path",
+                data="trio://saved",
+                step=1,
+            )
+            api.finish()
+            api.finish()
+
+            self.assertIsNotNone(path)
+            with open(path, encoding="utf-8") as stream:
+                rows = [json.loads(line) for line in stream]
+        self.assertEqual(
+            [row["event"] for row in rows],
+            ["metrics", "metrics", "checkpoint", "finish"],
+        )
+        self.assertEqual(rows[0]["metrics"]["train/loss"], 0.5)
+        self.assertEqual(rows[2]["path"], "trio://saved")
+        self.assertEqual(rows[-1]["state"], "success")
+        self.assertEqual(rows[-1]["metrics"]["eval/loss"], 0.25)
 
     def test_normalize_metrics_supports_algorithm_namespaces(self):
         self.assertEqual(

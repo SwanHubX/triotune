@@ -63,34 +63,30 @@ token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 - Access to a PyTRIO-compatible training service and the models used by your
   recipe
 
-Using [uv](https://docs.astral.sh/uv/) is recommended because `uv.lock` pins
-the repository environment:
+Install [uv](https://docs.astral.sh/uv/) on macOS or Linux:
 
 ```bash
-uv sync
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On Windows, run the official installer in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then clone the repository and create the complete locked environment:
+
+```bash
+git clone https://github.com/SwanHubX/triotune.git
+cd triotune
+uv python install 3.12
+uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-Install the optional PyTorch dependency when using DPO:
-
-```bash
-uv sync --extra dpo
-```
-
-The published package can also be installed directly:
-
-```bash
-pip install triotune==0.1.2
-```
-
-For a source checkout with pip:
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-The distribution name and Python import name are both `triotune`.
+`uv sync` creates the project-local `.venv`; subsequent commands should be run
+through `uv run` so they use the locked environment.
 
 ## 🔧 Support Matrix
 

@@ -59,33 +59,30 @@ SwanLab 指标记录。
 - Python 3.12（当前包声明 `>=3.12,<3.13`）
 - 可用的 PyTRIO 训练服务，以及该案例所使用模型的访问权限
 
-推荐使用 [uv](https://docs.astral.sh/uv/)，仓库中的 `uv.lock` 会锁定环境依赖：
+在 macOS 或 Linux 上安装 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-uv sync
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+在 Windows PowerShell 中运行官方安装命令：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+然后克隆仓库并创建由锁文件约束的完整环境：
+
+```bash
+git clone https://github.com/SwanHubX/triotune.git
+cd triotune
+uv python install 3.12
+uv sync --locked --all-extras
 uv run python -c "import triotune; print(triotune.__name__)"
 ```
 
-使用 DPO 时安装可选的 PyTorch 依赖：
-
-```bash
-uv sync --extra dpo
-```
-
-也可以直接安装已发布的包：
-
-```bash
-pip install triotune==0.1.2
-```
-
-从源码目录使用 pip 安装：
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-发行包名称和 Python 导入名称均为 `triotune`。
+`uv sync` 会在项目目录创建 `.venv`；后续命令应通过 `uv run` 执行，以确保
+使用锁定后的项目环境。
 
 ## 🔧 支持矩阵
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -208,9 +209,9 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 state = await asyncio.wait_for(task, 1)
                 self.assertEqual(state.global_step, 3)
-                self.assertEqual([step for _, step in self.run.logs], [1, 2, 3])
+                self.assertEqual([step for _, step in self.run.logs], [1, 2, 3, 3])
                 self.assertEqual(state.checkpoint_path, "checkpoint://sft-step-00000003")
-                total = sum(values["time/step"] for values, _ in self.run.logs)
+                total = sum(values["time/step"] for values, _ in self.run.logs[:3])
                 self.assertAlmostEqual(total, state.metrics["time/train"])
             finally:
                 release.set()
@@ -388,15 +389,19 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(defaults[key])
             self.assertEqual(defaults["name"], "test-model-sft")
 
-            self.trainer(
-                report_to="swanlab", workspace="team", tags=["sft", "huanhuan"],
-                run_name="custom-run", log_dir="/tmp/sft-logs",
-            )
-            custom = init.call_args.kwargs
-            self.assertEqual(custom["workspace"], "team")
-            self.assertEqual(custom["tags"], ["sft", "huanhuan"])
-            self.assertEqual(custom["name"], "custom-run")
-            self.assertEqual(custom["log_dir"], "/tmp/sft-logs")
+            with tempfile.TemporaryDirectory() as folder:
+                self.trainer(
+                    report_to="swanlab",
+                    workspace="team",
+                    tags=["sft", "huanhuan"],
+                    run_name="custom-run",
+                    log_dir=folder,
+                )
+                custom = init.call_args.kwargs
+                self.assertEqual(custom["workspace"], "team")
+                self.assertEqual(custom["tags"], ["sft", "huanhuan"])
+                self.assertEqual(custom["name"], "custom-run")
+                self.assertEqual(custom["log_dir"], folder)
 
     async def test_text_and_completion_labels_are_shifted(self) -> None:
         trainer = self.trainer()
@@ -460,7 +465,9 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.global_step, 3)
         self.assertEqual(self.client.saved, ["sft-step-00000002", "sft-step-00000003"])
         self.assertEqual(self.run.text, ("checkpoint/path", state.checkpoint_path, 3))
-        self.assertEqual(len(self.run.logs), 3)
+        self.assertEqual(len(self.run.logs), 4)
+        self.assertGreater(state.metrics["time/train_runtime"], 0)
+        self.assertGreater(state.metrics["time/train_tokens_per_second"], 0)
         self.assertTrue(self.run.finished)
 
         self.client.saved.clear()

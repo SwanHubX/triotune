@@ -23,12 +23,16 @@ train_dataset:
   shuffle: false
   # Dataset-only shuffle seed; null would reuse training.seed if shuffling
   # were added by a custom loader.
-  seed: null
+  seed: 42
   # Reserved loader-specific options; none are needed for local JSONL.
   loader_options: {}
 
-# PPO evaluation is not implemented, so no validation source is configured.
-valid_dataset: null
+# Validation prompts are sampled by the current actor and scored by reward_fn.
+valid_dataset:
+  # Official GSM8K test split; it contains no questions from the train file.
+  path: data/gsm8k_test.jsonl
+  split: test
+  max_examples: 100
 
 reference:
   # Frozen base model used only when actor.kl_ctl > 0. Keeping it explicit
@@ -40,22 +44,22 @@ training:
   # batch_size * rollout.num_generations trajectories.
   batch_size: 4
   # Maximum rollout updates. Training ends earlier if the dataset is exhausted.
-  max_steps: 100
+  max_steps: 500
   # Actor/client seed. The owned critic client derives seed + 1.
   seed: 42
 
 checkpoint:
   # Save actor and critic every N rollout updates. Zero would save only the
   # final checkpoints; 20 also provides intermediate recovery points.
-  save_every: 20
+  save_every: 50
 
 evaluation:
-  # PPOTrainer currently has no evaluation loop, so every trigger must be off.
-  steps: 0
-  before_train: false
-  after_train: false
-  batch_size: null
-  max_batches: null
+  # Evaluate before training, every 50 updates, and once at the final step.
+  steps: 50
+  before_train: true
+  after_train: true
+  batch_size: 8
+  max_batches: 10
 
 optimizer:
   # Independent AdamW settings for the policy actor.
@@ -171,11 +175,12 @@ critic:
 reporting:
   # Null disables SwanLab network reporting while retaining terminal progress.
   # Change to `swanlab` to publish the configured run.
-  report_to: null
+  report_to: swanlab
   project: triotune-tutorials
-  workspace: null
+  workspace: pytrio
   run_name: gsm8k-ppo
-  tags: [ppo, gsm8k, tutorial]
-  log_dir: null
+  tags: [ppo, gsm8k, framework]
+  # SwanLab artifacts plus a portable JSONL history of metrics/checkpoint URIs.
+  log_dir: ../output/gsm8k-ppo
   # DPO/OPD use this metric-window cadence; PPO currently publishes each step.
   logging_step: 1

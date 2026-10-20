@@ -138,9 +138,16 @@ class PPOActor:
                 self.train_tokens += compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
-                await call_async(self.client, "optim_step", optimizer_params(config))
+                optimizer = await call_async(
+                    self.client, "optim_step", optimizer_params(config)
+                )
                 self.optimizer_steps += 1
                 row = dict(result.metrics)
+                for name in ("grad_norm", "gradient_norm", "optim/grad_norm"):
+                    value = getattr(optimizer, "metrics", {}).get(name)
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                        row["optim/grad_norm"] = float(value)
+                        break
                 if "train/loss" in row:
                     # The SDK may also return the CE surrogate's raw `loss`.
                     # MetricsAPI maps that name to train/loss, so exclude it
