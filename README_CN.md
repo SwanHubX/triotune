@@ -49,6 +49,9 @@ SwanLab 指标记录。
 
 ## 📰 近期动态
 
+- **2026-10-19：** Triotune 0.1.1 统一了数据集预处理格式，并将发行包和源码
+  目录重命名为 `triotune`，同时新增模块化 PPO、在策略蒸馏流程及基于 YAML 的
+  训练配方配置。
 - **2026-10-12：** Triotune 0.1.0（`pytrio-cookbook`）首次发布到
   [PyPI](https://pypi.org/project/pytrio-cookbook/)。
 

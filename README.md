@@ -53,6 +53,9 @@ token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
 ## 📰 News
 
+- **2026-10-19:** Triotune 0.1.1 standardized dataset preprocessing and renamed
+  the distribution and source layout to `triotune`, while adding modular PPO
+  and on-policy distillation pipelines plus YAML-based recipe configuration.
 - **2026-10-12:** Triotune 0.1.0 (`pytrio-cookbook`) was published to [PyPI](https://pypi.org/project/pytrio-cookbook/).
 
 ## 📦 Installation
