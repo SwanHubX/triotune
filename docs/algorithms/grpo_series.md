@@ -328,6 +328,5 @@ No dynamic-lambda callable interface is implemented.
 - **Scope:** PyTRIO owns model placement and distributed execution. AReaL's cluster
   backends, workflow API, and Hydra configuration are not Triotune interfaces.
 
-See the [implementation and testing report](../ppo_pytrio-use_eval.md),
-[configuration source](../../triotune/api/cli_args.py), and
+See the [configuration source](../../triotune/api/cli_args.py) and
 [trainer modules](../../triotune/trainer/ppo/) for further details.

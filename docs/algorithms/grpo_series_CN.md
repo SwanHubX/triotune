@@ -310,5 +310,4 @@ prompt 支持文本、token ID 列表或聊天消息列表。
 - **边界：**模型部署和分布式计算由 PyTRIO 管理；AReaL 的集群后端、workflow API、
   Hydra 配置不是 Triotune 的接口。
 
-更多细节见[实现与测试报告](../ppo_pytrio-use_eval.md)、
-[配置源码](../../triotune/api/cli_args.py)和[算法组件](../../triotune/trainer/ppo/)。
+更多细节见[配置源码](../../triotune/api/cli_args.py)和[算法组件](../../triotune/trainer/ppo/)。
