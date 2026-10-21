@@ -175,10 +175,10 @@ reporting:
   # Null disables SwanLab network reporting while retaining terminal progress.
   # Change to `swanlab` to publish the configured run.
   report_to: swanlab
-  project: triotune-tutorials
-  workspace: pytrio
+  project: triotune-ppo
+  workspace: null
   run_name: gsm8k-ppo
-  tags: [ppo, gsm8k, framework]
+  tags: [ppo, gsm8k, pytrio]
   # SwanLab artifacts plus a portable JSONL history of metrics/checkpoint URIs.
   log_dir: ../output/gsm8k-ppo
   # DPO/OPD use this metric-window cadence; PPO currently publishes each step.
