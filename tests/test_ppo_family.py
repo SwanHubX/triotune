@@ -529,7 +529,11 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("advantage/std", rows[-1]["metrics"])
         self.assertEqual(rows[-1]["metrics"]["rollout/completion_length_mean"], 2)
         self.assertIn("train/loss", rows[-1]["metrics"])
-        self.assertEqual(rows[-1]["metrics"]["usage/train_tokens_total"], 6.0)
+        self.assertEqual(rows[-1]["metrics"]["usage/train_tokens_total"], 12.0)
+        self.assertEqual(rows[-1]["metrics"]["usage/actor_train_tokens"], 12.0)
+        self.assertEqual(rows[-1]["metrics"]["usage/actor_train_tokens_total"], 12.0)
+        self.assertEqual(rows[-1]["metrics"]["usage/critic_train_tokens"], 0.0)
+        self.assertEqual(rows[-1]["metrics"]["usage/critic_train_tokens_total"], 0.0)
 
     async def test_evaluate_samples_rewards_without_optimizer_updates(self):
         client = TrainingClient()
@@ -568,6 +572,7 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["eval/truncated_fraction"], 0.0)
         self.assertEqual(metrics["usage/eval_sample_input_tokens"], 4.0)
         self.assertEqual(metrics["usage/eval_sample_output_tokens"], 8.0)
+        self.assertEqual(trainer._actor.train_tokens, 0)
         self.assertFalse(any("optim" in event for event in client.trace))
         self.assertEqual(
             progress.call_args.kwargs,
@@ -642,8 +647,12 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metrics["reward/mean"], 0.5)
         self.assertNotEqual(result.metrics["train/loss"], 999.0)
         self.assertEqual(result.metrics["train/action_tokens"], 8)
-        self.assertEqual(result.metrics["usage/train_tokens"], 12)
-        self.assertEqual(result.metrics["usage/train_tokens_total"], 24)
+        self.assertEqual(result.metrics["usage/train_tokens"], 24)
+        self.assertEqual(result.metrics["usage/train_tokens_total"], 48)
+        self.assertEqual(result.metrics["usage/actor_train_tokens"], 24)
+        self.assertEqual(result.metrics["usage/actor_train_tokens_total"], 48)
+        self.assertEqual(result.metrics["usage/critic_train_tokens"], 0)
+        self.assertEqual(result.metrics["usage/critic_train_tokens_total"], 0)
         self.assertEqual(result.metrics["usage/sample_input_tokens"], 4)
         self.assertEqual(result.metrics["usage/sample_output_tokens"], 8)
         self.assertEqual(result.metrics["usage/sample_input_tokens_total"], 8)
@@ -673,15 +682,21 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 client = TrainingClient()
                 c = PPOConfig.for_algorithm(name, ppo_n_minibatches=2, update_epochs=2)
-                actor = PPOActor(client, c)
+                trainer = PPOTrainer("fake", c, training_client=client)
                 ts = [
                     trajectory(0, "a"),
                     trajectory(1, "a"),
                     trajectory(0, "b"),
                     trajectory(1, "b"),
                 ]
-                await actor.update(await actor.prepare(ts))
-                self.assertEqual(actor.optimizer_steps, 4)
+                metrics = await trainer.step(ts)
+                self.assertEqual(trainer._actor.optimizer_steps, 4)
+                self.assertEqual(metrics["usage/actor_train_tokens"], 48)
+                self.assertEqual(metrics["usage/actor_train_tokens_total"], 48)
+                self.assertEqual(metrics["usage/critic_train_tokens"], 0)
+                self.assertEqual(metrics["usage/critic_train_tokens_total"], 0)
+                self.assertEqual(metrics["usage/train_tokens_total"], 48)
+                await trainer.close()
         client = TrainingClient()
         actor = PPOActor(
             client, raw_config(loss_backend="native", eps_clip=0.1, eps_clip_higher=0.3)
@@ -695,6 +710,7 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(kwargs["auto_shift"])
         self.assertIn("logprobs", data[0].loss_fn_inputs)
+        self.assertEqual(actor.train_tokens, 3)
 
     async def test_decoupled_vs_ordinary_recomputation_freezes_correct_policy(self):
         for decoupled in (False, True):
@@ -703,6 +719,7 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
             )
             actor = PPOActor(TrainingClient(), c)
             batch = await actor.prepare([trajectory(0, reference_logprobs=[-2, -2])])
+            self.assertEqual(actor.train_tokens, 3)
             self.assertEqual(batch.proximal_logprobs, [[-1.2, -1.2]])
             self.assertEqual(
                 batch.trajectories[0].logprobs, [-1, -1] if decoupled else [-1.2, -1.2]
@@ -781,6 +798,7 @@ class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
             await trainer.step([trajectory()])
         self.assertEqual(trainer.state.optimizer_steps, 1)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(trainer._actor.train_tokens, 6)
 
     async def test_real_sdk_custom_bridge_sends_negative_local_gradient(self):
         # Exercise the installed SDK implementation itself, replacing only

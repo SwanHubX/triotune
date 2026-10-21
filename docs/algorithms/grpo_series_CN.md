@@ -300,6 +300,10 @@ prompt 支持文本、token ID 列表或聊天消息列表。
   指标位于 `reward/*`、`train/*`、`policy/*`、`critic/*`、`eval/*`、`time/*`、`usage/*`。
   部分指标需要启用对应组件或选项。`reporting.log_dir` 还会写入独立 JSONL 历史；
   PPO 每步发布指标，不受 `reporting.logging_step` 控制。
+- **Token 用量：**`usage/actor_train_tokens` 和 `usage/critic_train_tokens`
+  分别统计每步各组件处理的输入 token，`usage/train_tokens` 为两者之和；
+  `_total` 后缀表示跨 step 累计。统计包含重复 epoch 和准备 logprob/value 的前向计算。
+  custom loss 的 forward 和 forward-backward 分别计数，native actor loss 计一次。
 - **保存：**`checkpoint.save_every` 按 rollout 更新计数，0 表示只在结束时保存。
   URI 记录为 `checkpoint/actor_path` 和 `checkpoint/critic_path`。
   trainer 当前没有内置的 resume/load 入口。

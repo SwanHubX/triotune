@@ -250,6 +250,57 @@ class PPOCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("critic/loss", state.metrics)
         self.assertEqual(state.metrics["critic/grad_norm"], 0.3)
         self.assertNotEqual(state.metrics["train/loss"], 999)
+        self.assertEqual(state.metrics["usage/actor_train_tokens"], 12)
+        self.assertEqual(state.metrics["usage/actor_train_tokens_total"], 12)
+        self.assertEqual(state.metrics["usage/critic_train_tokens"], 48)
+        self.assertEqual(state.metrics["usage/critic_train_tokens_total"], 48)
+        self.assertEqual(state.metrics["usage/train_tokens"], 60)
+        self.assertEqual(state.metrics["usage/train_tokens_total"], 60)
+
+    async def test_token_usage_accumulates_passes_epochs_and_minibatches(self):
+        for backend in ("custom", "native"):
+            with self.subTest(backend=backend):
+                config = PPOConfig(
+                    loss_backend=backend,
+                    recompute_logprob=True,
+                    update_epochs=2,
+                    ppo_n_minibatches=2,
+                    critic_update_epochs=2,
+                    critic_n_minibatches=2,
+                    adv_norm=None,
+                )
+                trainer = PPOTrainer("test-model", config, service_client=Service())
+                total_actor, total_critic = 0, 0
+                for n in (1, 2):
+                    ts = [trajectory(n=n, group="a"), trajectory(n=n + 2, group="b")]
+                    actor_inputs = sum(
+                        len(t.prompt_tokens + t.completion_tokens) - 1 for t in ts
+                    )
+                    critic_inputs = 2 * sum(
+                        len(t.prompt_tokens + t.completion_tokens) for t in ts
+                    )
+                    actor_step = actor_inputs * (
+                        1 + 2 * (2 if backend == "custom" else 1)
+                    )
+                    critic_step = critic_inputs * (1 + 2 * 2)
+                    total_actor += actor_step
+                    total_critic += critic_step
+                    metrics = await trainer.step(ts)
+                    self.assertEqual(metrics["usage/actor_train_tokens"], actor_step)
+                    self.assertEqual(metrics["usage/critic_train_tokens"], critic_step)
+                    self.assertEqual(
+                        metrics["usage/actor_train_tokens_total"], total_actor
+                    )
+                    self.assertEqual(
+                        metrics["usage/critic_train_tokens_total"], total_critic
+                    )
+                    self.assertEqual(
+                        metrics["usage/train_tokens"], actor_step + critic_step
+                    )
+                    self.assertEqual(
+                        metrics["usage/train_tokens_total"], total_actor + total_critic
+                    )
+                await trainer.close()
 
     async def test_causal_values_cannot_see_future_actions(self):
         critic = PyTRIOCritic(CriticClient(), PPOConfig(), (1, 0))
@@ -393,6 +444,8 @@ class PPOCriticTests(unittest.IsolatedAsyncioTestCase):
             await trainer.step([trajectory()])
         self.assertEqual(trainer.state.critic_optimizer_steps, 1)
         self.assertEqual(trainer.state.global_step, 0)
+        self.assertEqual(trainer._actor.train_tokens, 6)
+        self.assertEqual(trainer.critic.train_tokens, 24)
         await trainer.close(state="crashed")
 
     async def test_real_sdk_bridge_transmits_both_value_gradients(self):

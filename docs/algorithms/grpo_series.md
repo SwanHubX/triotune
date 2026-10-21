@@ -317,6 +317,11 @@ No dynamic-lambda callable interface is implemented.
   `eval/*`, `time/*`, and `usage/*` namespaces. Some metrics require the corresponding
   component or option. `reporting.log_dir` also writes a unique JSONL history;
   PPO publishes each step regardless of `reporting.logging_step`.
+- **Token usage:** `usage/actor_train_tokens` and `usage/critic_train_tokens`
+  count input tokens processed by each component per step; `usage/train_tokens`
+  is their sum, and `_total` variants accumulate across steps. Counts include
+  repeated epochs and logprob/value preparation forwards. Custom loss counts
+  both its forward and forward-backward passes; native actor loss counts one pass.
 - **Checkpoints:** `checkpoint.save_every` counts rollout updates; 0 saves only
   at the end. URIs are recorded as `checkpoint/actor_path` and
   `checkpoint/critic_path`. The trainer has no built-in resume/load entry point.
