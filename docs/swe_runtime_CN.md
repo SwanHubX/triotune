@@ -48,7 +48,7 @@ python -m tswe playground/Triotune-SWEAgent/examples/task.yaml --output output/s
 
 本功能不改变现有 SFT/PPO 默认行为，训练本身不会自动启动 agent。详细配置与训练示例见执行项目 README；环境后端和保护规则见环境项目 README。
 
-## 本次验证记录
+## 基础功能验证记录
 
 以下命令已在当前工作区实际执行：
 
@@ -75,3 +75,49 @@ PYTHONPATH=playground/Triotune-Environment/src:playground/Triotune-SWEAgent/src 
 真实 PyTRIO `Qwen/Qwen3.5-4B` 的演示在 4 轮完成查看代码、修改、运行测试和提交；基线退出码 1，独立评测退出码 0，最终 `resolved`、`reward=1`。这是小型算术回归的端到端验证，不代表大型 SWE-bench 的修复率。
 
 未执行真实远程 SFT 或 PPO 优化；训练桥接通过测试客户端验证，真实 tokenizer 的 assistant mask 仍取决于所选模板。
+
+## 后续扩展：重试、上下文与标准评测
+
+在基础 SWE 功能上，本次扩展补充：
+
+- 模型请求、环境启动、评分与完整任务的分层重试；普通模型错误和测试失败不触发任务重启，全部尝试共享 episode 步数/时间预算。
+- 受身份校验保护的持久资源登记和 `python -m tenv.maintenance` 残留清理命令，默认 dry run。
+- 可配置任务/系统/反思提示词、环境变量占位符、较早 reasoning 移除及完整轮次滑动窗口。
+- 可选提交前反思，以及 `events.jsonl`、`metrics.json`、错误类型、完整尝试历史。
+- 无模型的空补丁/gold patch 验证；可选官方 SWE-bench harness 与实例报告解析。
+
+配置例子位于执行项目的 `examples/task.yaml` 和 `examples/swebench.yaml`。官方 harness 需要单独准备依赖、数据与镜像；报告契约测试不代表真实 SWE-bench 全量评测。
+
+上下文压缩保留实际逐轮 token 记录，但压缩结果不导出为一条连续 PPO 轨迹。当前 PPO 示例继续使用 `context.strategy: none`，不会把每个 turn 当作一次独立 GRPO 尝试。
+
+框架侧扩展并入基础 SWE PR；执行层与环境层仍在独立仓库维护，部署时需要使用三个仓库的兼容版本。
+
+## 扩展功能验证记录
+
+以下测试命令已实际执行，最后一次结果均通过：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_swe*.py' -v
+
+TENV_DOCKER_IMAGE=swebench-sandbox-local:latest \
+  PYTHONPATH=playground/Triotune-Environment/src \
+  .venv/bin/python -m unittest discover -s playground/Triotune-Environment/tests -v
+
+TENV_DOCKER_IMAGE=swebench-sandbox-local:latest \
+  PYTHONPATH=playground/Triotune-Environment/src:playground/Triotune-SWEAgent/src \
+  .venv/bin/python -m unittest discover -s playground/Triotune-SWEAgent/tests -v
+```
+
+共 56 项：框架 17 项、环境 18 项、agent 21 项。覆盖瞬时/永久错误、重试预算、取消、任务重启、反思、上下文完整性、模板、gold patch、官方报告、活跃进程/PID 复用保护、Docker 所有权校验和残留清理。
+
+真实模型验证命令：
+
+```bash
+PYTHONPATH=playground/Triotune-Environment/src:playground/Triotune-SWEAgent/src \
+  .venv/bin/python playground/Triotune-SWEAgent/examples/demo.py \
+  --model Qwen/Qwen3.5-4B --image swebench-sandbox-local:latest \
+  --reflect-before-submit --context-strategy keep_last_turns --keep-last-turns 2 \
+  --output output/swe-reliability-live
+```
+
+结果为 `resolved`、`reward=1`、5 轮、1 次反思、2 次上下文压缩；已记录 5842 个输入 token、293 个输出 token。标准 SWE-bench 接入通过报告契约测试验证，未执行真实 SWE-bench 实例或全量评测。

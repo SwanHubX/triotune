@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +13,11 @@ import pytrio as trio
 from ..api.client_api import call_async
 from ..dataset.prompt import _token_list
 from .contracts import SampledTurn
+from .retry import RetryConfig, retry_call
+
+
+class ContextBudgetError(ValueError):
+    """The rendered context cannot fit the configured sampling budget."""
 
 
 @dataclass(slots=True)
@@ -24,8 +30,13 @@ class SWESamplingConfig:
     top_p: float = 1.0
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    retry: RetryConfig = field(default_factory=RetryConfig)
 
     def __post_init__(self):
+        if isinstance(self.retry, dict):
+            self.retry = RetryConfig(**self.retry)
+        if not isinstance(self.retry, RetryConfig):
+            raise TypeError("retry must be a RetryConfig or mapping.")
         for name in ("max_tokens", "max_context_tokens"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
@@ -113,20 +124,24 @@ class PyTRIOSWEModel:
         if any(t < 0 for t in prompt):
             raise ValueError("The SWE template returned negative token IDs.")
         if len(prompt) + config.max_tokens > config.max_context_tokens:
-            raise ValueError(
+            raise ContextBudgetError(
                 "SWE context budget exceeded; history is never silently truncated."
             )
-        response = await call_async(
-            self.client,
-            "sample",
-            prompt=trio.ModelInput.from_ints(prompt),
-            num_samples=1,
-            sampling_params=trio.SamplingParams(
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                seed=config.seed,
+        started = time.monotonic()
+        response, retries = await retry_call(
+            lambda: call_async(
+                self.client,
+                "sample",
+                prompt=trio.ModelInput.from_ints(prompt),
+                num_samples=1,
+                sampling_params=trio.SamplingParams(
+                    max_tokens=config.max_tokens,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    seed=config.seed,
+                ),
             ),
+            config.retry,
         )
         if len(response.sequences) != 1:
             raise ValueError("SWE sampling requires exactly one response.")
@@ -153,6 +168,8 @@ class PyTRIOSWEModel:
             text,
             self.policy_version,
             truncated,
+            retries,
+            time.monotonic() - started,
         )
 
     @property

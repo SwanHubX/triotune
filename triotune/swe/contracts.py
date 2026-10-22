@@ -23,8 +23,14 @@ class SampledTurn:
     raw_text: str
     policy_version: str
     truncated: bool = False
+    request_retries: int = 0
+    sampling_seconds: float = 0.0
 
     def __post_init__(self):
+        if type(self.request_retries) is not int or self.request_retries < 0:
+            raise ValueError("request_retries must be a nonnegative integer.")
+        if not math.isfinite(self.sampling_seconds) or self.sampling_seconds < 0:
+            raise ValueError("sampling_seconds must be finite and nonnegative.")
         for tokens in (self.prompt_tokens, self.completion_tokens):
             if not tokens or any(type(t) is not int or t < 0 for t in tokens):
                 raise ValueError(

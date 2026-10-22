@@ -5,10 +5,13 @@ this module creates no model clients, processes, or environments.
 """
 
 from .contracts import SampledTurn, trajectory_from_turns
-from .model import PyTRIOSWEModel, SWESamplingConfig
+from .model import ContextBudgetError, PyTRIOSWEModel, SWESamplingConfig
+from .retry import RetryConfig
 
 __all__ = [
+    "ContextBudgetError",
     "PyTRIOSWEModel",
+    "RetryConfig",
     "SWESamplingConfig",
     "SampledTurn",
     "trajectory_from_turns",
