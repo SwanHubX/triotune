@@ -456,6 +456,20 @@ class SFTTrainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(labels[-2:], [ord("A"), ord(";")])
         self.assertTrue(all(token == -100 for token in labels[:-2]))
 
+    async def test_swe_preprocessing_uses_public_trainer_tokenizer(self) -> None:
+        from triotune.dataset.swe_sft import SWESFTConfig, prepare_swe_sft_dataset
+
+        trainer = self.trainer(max_length=128)
+        dataset = prepare_swe_sft_dataset(
+            {"messages": [{"role": "user", "content": "Fix"},
+                          {"role": "assistant", "content": "Fixed"}]},
+            trainer.get_tokenizer(), SWESFTConfig(max_length=128),
+        )
+        await trainer.step([dataset[0]])
+        labels = self.client.datums[0].loss_fn_inputs["target_tokens"].data
+        self.assertEqual([t for t in labels if t != -100],
+                         [ord(c) for c in "assistant:Fixed;"])
+
     async def test_invalid_masks_truncation_and_forward_failure(self) -> None:
         trainer = self.trainer(max_length=2)
         with self.assertRaisesRegex(ValueError, "no next-token labels"):

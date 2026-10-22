@@ -77,6 +77,15 @@ class SFTTrainer:
     # Dataset conversion
     # ------------------------------------------------------------------
 
+    def get_tokenizer(self) -> Any:
+        """Return this training client's tokenizer for external preprocessing.
+
+        SWE datasets can build labels with the exact tokenizer owned by the
+        trainer without reaching into private client state. No remote client
+        is created or refreshed by this accessor.
+        """
+        return self._tokenizer
+
     def _prepare_example(self, row: Mapping[str, Any]) -> SupervisedExample:
         """Convert one supported input row through the shared dataset contract."""
 
