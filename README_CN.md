@@ -99,7 +99,7 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 | 算法 | 文档 | 案例 |论文 |
 | --- | --- | --- | --- |
 | **GRPO** | [📖 文档](./docs/algorithms/grpo_series.md) | [🔧 案例](./examples/grpo) | [📄 论文](https://arxiv.org/abs/2402.03300) |
-| **PPO** | - | - | [📄 论文](https://arxiv.org/abs/1707.06347) |
+| **PPO** | [📖 文档](./docs/algorithms/ppo_series_CN.md) | [🔧 案例](./examples/ppo) | [📄 论文](https://arxiv.org/abs/1707.06347) |
 | **DPO** | - | - | [📄 论文](https://arxiv.org/abs/2305.18290) |
 | **OPD** | - | - | [📄 论文](https://arxiv.org/abs/2601.18734) |
 | **SFT** | - | - |  |

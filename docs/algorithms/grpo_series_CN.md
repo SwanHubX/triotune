@@ -35,9 +35,9 @@ uv run python examples/grpo/gsm8k_grpo.py --config examples/grpo/gsm8k_grpo_args
 
 | 接口 | 用途 |
 | --- | --- |
-| `PPOConfig.for_algorithm("grpo", **modules)` | 先应用算法预设，再应用显式覆盖 |
-| `PPOConfig.from_modules(settings)` | 读取模块化配置字典，支持 algorithm 选择器 |
-| `PPOConfig(**settings)` | 直接读取完整、显式的配置 |
+| PPOConfig.for_algorithm("grpo", **modules) | 先应用算法预设，再应用显式覆盖 |
+| PPOConfig.from_modules(settings) | 读取模块化配置字典，支持 algorithm 选择器 |
+| PPOConfig(**settings) | 直接读取完整、显式的配置 |
 
 
 显式配置优先于预设：若保留 PPO 文件中的 critic.enabled: true 或
