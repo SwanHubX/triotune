@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from collections.abc import Mapping
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
-from .contracts import (
+from pytrio import PyTrioError
+
+from ..config import RetryPolicy
+from ..contracts import (
     SYSTEM_STATUSES,
     ActionParseError,
     ActionParser,
@@ -26,13 +31,14 @@ from .contracts import (
     EpisodeResult,
     EpisodeScorer,
     ObservationFormatter,
+    RetryEvent,
     ToolExecutor,
     ToolSystemError,
     TrajectoryExporter,
     validate_tokens,
 )
+from ..rollout.trajectory import EpisodeTrajectoryBuilder
 from .sampling import SamplingSnapshot
-from .trajectory_builder import EpisodeTrajectoryBuilder
 
 
 class EpisodeRunner:
@@ -56,6 +62,7 @@ class EpisodeRunner:
         limits: EpisodeLimits | None = None,
         prompt_key: str = "messages",
         trajectory_builder: TrajectoryExporter | None = None,
+        retry: RetryPolicy | None = None,
     ):
         """Compose execution adapters and optional model-specific serialization.
 
@@ -68,6 +75,34 @@ class EpisodeRunner:
         self.observations, self.renderer = observations, renderer
         self.limits, self.prompt_key = limits or EpisodeLimits(), prompt_key
         self.trajectory_builder = trajectory_builder or EpisodeTrajectoryBuilder()
+        self.retry = retry or RetryPolicy()
+
+    async def _operation(
+        self, episode, stage, turn, factory, *, timeout=None, retry_safe=True
+    ):
+        """Retry transient transport errors within the existing episode deadline."""
+        for attempt in range(1, self.retry.max_attempts + 1):
+            try:
+                if timeout is None:
+                    return await factory()
+                return await asyncio.wait_for(factory(), timeout)
+            except Exception as exc:
+                transient = (
+                    exc.retryable
+                    if isinstance(exc, (ToolSystemError, PyTrioError))
+                    else isinstance(exc, (ConnectionError, TimeoutError, OSError))
+                )
+                if not transient:
+                    raise
+                again = retry_safe and attempt < self.retry.max_attempts
+                episode.retries.append(
+                    RetryEvent(
+                        stage, turn, attempt, type(exc).__name__, str(exc), again
+                    )
+                )
+                if not again:
+                    raise
+                await asyncio.sleep(self.retry.delay(attempt))
 
     async def run(
         self,
@@ -94,6 +129,8 @@ class EpisodeRunner:
         from .conversation import ChatTemplateRenderer
 
         episode = EpisodeResult(uuid4().hex, group_id, snapshot.snapshot_id, is_eval)
+        episode.task_id = str(row["task_id"]) if "task_id" in row else None
+        started = time.perf_counter()
         try:
             async with asyncio.timeout(self.limits.episode_timeout):
                 # Each attempt gets its own conversation. Tool observations
@@ -116,7 +153,12 @@ class EpisodeRunner:
                     # Invalid actions and budget exits can still carry useful
                     # negative task signals. Infrastructure failures cannot.
                     try:
-                        episode.score = await self.scorer.score(row, episode)
+                        episode.score = await self._operation(
+                            episode,
+                            "scoring",
+                            len(episode.turns) - 1,
+                            lambda: self.scorer.score(row, episode),
+                        )
                         # Validate the scorer boundary even if it returns a custom object.
                         episode.score.__post_init__()
                         if episode.status != "completed" and episode.score.success:
@@ -141,6 +183,8 @@ class EpisodeRunner:
                 "contract_error",
                 f"{type(exc).__name__}: {exc}",
             )
+        finally:
+            episode.elapsed_seconds = time.perf_counter() - started
         return episode
 
     async def _execute(self, episode, messages, snapshot, renderer, seed) -> None:
@@ -154,9 +198,14 @@ class EpisodeRunner:
         generated_tokens = 0
         for index in range(limits.max_turns):
             # Tokenization and user renderers can be synchronous CPU work.
-            prompt_tokens = await asyncio.to_thread(
-                renderer.render, messages, self.tools.schemas
-            )
+            if episode.turns and hasattr(renderer, "render_continuation"):
+                prompt_tokens = await asyncio.to_thread(
+                    renderer.render_continuation, episode, messages, self.tools.schemas
+                )
+            else:
+                prompt_tokens = await asyncio.to_thread(
+                    renderer.render, messages, self.tools.schemas
+                )
             validate_tokens(prompt_tokens, name="rendered prompt")
             self.trajectory_builder.validate_prefix(episode, prompt_tokens)
             # Context capacity includes rendered history and observations,
@@ -171,8 +220,12 @@ class EpisodeRunner:
                 return
             budget = min(limits.max_tokens_per_turn, remaining, context_budget)
             try:
-                generation = await asyncio.wait_for(
-                    snapshot.sampler.generate(
+                generation = await self._operation(
+                    episode,
+                    "sampling",
+                    index,
+                    partial(
+                        snapshot.sampler.generate,
                         prompt_tokens,
                         max_tokens=budget,
                         seed=None if seed is None else seed + index,
@@ -211,8 +264,16 @@ class EpisodeRunner:
                 # Preserve call order within a turn. Cross-episode concurrency
                 # is managed by the collector, not by parallelizing tool side
                 # effects inside a single agent decision.
-                result = await asyncio.wait_for(
-                    self.tools.execute(call), limits.tool_timeout
+                result = await self._operation(
+                    episode,
+                    "tool",
+                    index,
+                    partial(self.tools.execute, call),
+                    timeout=limits.tool_timeout,
+                    retry_safe=self.retry.retry_tools
+                    and bool(
+                        getattr(self.tools, "is_retry_safe", lambda call: False)(call)
+                    ),
                 )
                 result.__post_init__()
                 if result.call_id != call.call_id or result.name != call.name:

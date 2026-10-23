@@ -15,9 +15,9 @@ from typing import Any
 
 import pytrio as trio
 
-from ..api.client_api import call_async
-from ..utils.token_usage import compute_sample_tokens
-from .contracts import AgentContractError, AgentSampler, Generation, validate_tokens
+from ...api.client_api import call_async
+from ...utils.token_usage import compute_sample_tokens
+from ..contracts import AgentContractError, AgentSampler, Generation, validate_tokens
 
 
 class PyTRIOAgentSampler:

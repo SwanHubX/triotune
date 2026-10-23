@@ -4,10 +4,11 @@ PPO 算法族的组件位于 [`ppo/`](./ppo/)：上一级的 `rl_trainer.py` 负
 PPO、GRPO、RLOO、Dr.GRPO、LitePPO、GSPO、SAPO、CISPO 和 DAPO。
 其算法配置及模块实现保存在该目录；标准 PPO 默认创建独立的 PyTRIO actor/critic 训练客户端，详见接口能力说明。
 
-多轮工具智能体使用 [`triotune.agent`](../agent/__init__.py) 中的 `AgentTrainingLoop`，
+多轮工具智能体使用 [`triotune.agentrl`](../agentrl/__init__.py) 中的 `AgentTrainingLoop`，
 通过公开的 `PPOTrainer.create_sampling_snapshot()`、`step()` 和 `publish_metrics()`
 接入相同训练核心。执行、动作解析、工具、评分与轨迹导出接口均由
-`triotune.agent` 子包公开。
+`triotune.agentrl` 子包公开。
+本地应用和接口说明见 `output/agentrl/` 中的计算器与 Agent RL 文档。
 
 ## 目录与职责
 

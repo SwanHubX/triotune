@@ -38,7 +38,7 @@ from .ppo.rollout import (
 )
 
 if TYPE_CHECKING:
-    from ..agent.sampling import SamplingSnapshot
+    from ..agentrl.runtime.sampling import SamplingSnapshot
 
 
 class PPOTrainer:
@@ -233,7 +233,7 @@ class PPOTrainer:
         Finish using this snapshot before calling step(). The returned ID is
         provenance, not permission to overlap sampling with optimizer updates.
         """
-        from ..agent.sampling import PyTRIOAgentSampler, SamplingSnapshot
+        from ..agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 
         await self.initialize()
         self._sampling = await call_async(
@@ -354,7 +354,7 @@ class PPOTrainer:
         ]
         overlong_penalties = []
         if self.args.overlong_tokens:
-            for length in lengths:
+            for length in (sum(t.loss_mask) for t in trajectories):
                 excess = max(
                     0,
                     length - (self.args.max_tokens - self.args.overlong_tokens),

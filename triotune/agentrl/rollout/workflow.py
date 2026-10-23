@@ -16,16 +16,17 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from ..trainer.ppo.contracts import Trajectory
-from ..trainer.ppo.rollout import gather_cancel_on_error
-from .contracts import (
+from ...trainer.ppo.contracts import Trajectory
+from ...trainer.ppo.rollout import gather_cancel_on_error
+from ..contracts import (
     SYSTEM_STATUSES,
     AgentContractError,
     EpisodeExecutor,
     EpisodeLogger,
     EpisodeResult,
 )
-from .sampling import SamplingSnapshot
+from ..runtime.sampling import SamplingSnapshot
+from ..training.evaluation import evaluation_metrics
 
 
 @dataclass(slots=True)
@@ -39,6 +40,8 @@ class AgentRolloutBatch:
 
     episodes: list[EpisodeResult]
     trajectories: list[Trajectory]
+    dropped_groups: int = 0
+    refill_batches: int = 0
 
     def metrics(self, *, prefix: str = "agent") -> dict[str, float]:
         """Aggregate execution metrics with explicit, task-relevant denominators.
@@ -57,6 +60,15 @@ class AgentRolloutBatch:
         metrics = {
             f"{prefix}/episodes": float(count),
             f"{prefix}/valid_episodes": float(len(valid)),
+            f"{prefix}/accepted_trajectories": float(len(self.trajectories)),
+            f"{prefix}/dropped_groups": float(self.dropped_groups),
+            f"{prefix}/refill_batches": float(self.refill_batches),
+            f"{prefix}/retry_count": float(
+                sum(event.retried for e in episodes for event in e.retries)
+            ),
+            f"{prefix}/transient_failures": float(
+                sum(len(e.retries) for e in episodes)
+            ),
             # Include system failures in the denominator; expose them separately.
             f"{prefix}/success_rate": sum(e.score.success for e in valid)
             / max(1, count),
@@ -78,10 +90,33 @@ class AgentRolloutBatch:
                 sum(t.generation.output_tokens for t in turns)
             ),
         }
-        for status in {e.status for e in episodes}:
+        for stage in ("sampling", "tool", "scoring"):
+            metrics[f"{prefix}/retries/{stage}"] = float(
+                sum(
+                    event.retried and event.stage == stage
+                    for e in episodes
+                    for event in e.retries
+                )
+            )
+        for status in (
+            "completed",
+            "invalid_action",
+            "max_turns",
+            "token_limit",
+            "context_limit",
+            "sampling_failure",
+            "tool_failure",
+            "scoring_failure",
+            "contract_error",
+            "timeout",
+        ):
             metrics[f"{prefix}/status/{status}"] = float(
                 sum(e.status == status for e in episodes)
             )
+            metrics[f"{prefix}/status_rate/{status}"] = metrics[
+                f"{prefix}/status/{status}"
+            ] / max(1, count)
+        metrics.update(evaluation_metrics(episodes, prefix=prefix))
         return metrics
 
 
@@ -167,6 +202,9 @@ class AgentRolloutWorkflow:
                     * self.runner.limits.max_turns,
                     is_eval=is_eval,
                 )
+                episode.sample_index = sample_index
+                if episode.task_id is None:
+                    episode.task_id = f"row-{row_index}"
                 trajectory = None
                 if episode.trainable:
                     try:
@@ -198,6 +236,7 @@ class AgentRolloutWorkflow:
                 for e, t in results
                 if t is not None and e.group_id not in rejected_groups
             ],
+            dropped_groups=len(rejected_groups),
         )
         if strict and rejected_groups:
             raise EpisodeCollectionError(batch)

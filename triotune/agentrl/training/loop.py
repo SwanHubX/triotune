@@ -15,14 +15,32 @@ from typing import TYPE_CHECKING, Any
 
 from tqdm import tqdm
 
-from ..trainer.ppo.rollout import filter_informative_groups
-from ..utils.dataloader import iter_batches, num_batches
-from .rollout_workflow import AgentRolloutBatch, AgentRolloutWorkflow
-from .sampling import SamplingSnapshot
+from ...trainer.ppo.rollout import filter_informative_groups
+from ...utils.dataloader import iter_batches, num_batches
+from ..config import AgentConfig
+from ..rollout.workflow import AgentRolloutBatch, AgentRolloutWorkflow
+from ..runtime.sampling import SamplingSnapshot
+from .evaluation import evaluation_metrics, paired_task_metrics
+
+
+def filter_agent_groups(trajectories):
+    """Keep groups with outcome variance or any explicit process signal.
+
+    Equal terminal rewards do not make a process-reward episode uninformative.
+    Process rewards are consumed independently of scalar reward normalization.
+    """
+    informative = {t.group_id for t in filter_informative_groups(trajectories)}
+    informative.update(
+        t.group_id
+        for t in trajectories
+        if t.token_rewards is not None and any(t.token_rewards)
+    )
+    return [t for t in trajectories if t.group_id in informative]
+
 
 if TYPE_CHECKING:
-    from ..trainer.ppo.contracts import PPOState
-    from ..trainer.rl_trainer import PPOTrainer
+    from ...trainer.ppo.contracts import PPOState
+    from ...trainer.rl_trainer import PPOTrainer
 
 
 class AgentTrainingLoop:
@@ -38,6 +56,7 @@ class AgentTrainingLoop:
         workflow: AgentRolloutWorkflow,
         *,
         snapshot_factory: Callable[[], Awaitable[SamplingSnapshot]] | None = None,
+        config: AgentConfig | None = None,
     ):
         """Bind the trainer, execution workflow, and optional snapshot provider.
 
@@ -47,9 +66,18 @@ class AgentTrainingLoop:
         Calls that share this trainer's optimizer state must be serialized.
         """
         self.trainer, self.workflow = trainer, workflow
-        self.snapshot_factory = snapshot_factory or trainer.create_sampling_snapshot
+        self.config = config or AgentConfig()
+        self.snapshot_factory = snapshot_factory or self._snapshot
         self._last_eval_step: int | None = None
         self._seed_offset = 0
+        self.last_eval_batch: AgentRolloutBatch | None = None
+        self._baseline_episodes = None
+        self.update_history: list[dict[str, Any]] = []
+        self.last_train_batch: AgentRolloutBatch | None = None
+        self.last_train_snapshot: SamplingSnapshot | None = None
+
+    async def _snapshot(self):
+        return await self.trainer.create_sampling_snapshot(stop=self.config.stop)
 
     async def evaluate(
         self, dataset: Iterable[Mapping[str, Any]] | None = None
@@ -66,10 +94,15 @@ class AgentTrainingLoop:
         dataset = trainer.eval_dataset if dataset is None else dataset
         if dataset is None:
             raise ValueError("Agent evaluation requires an eval dataset.")
+        n_samples = self.config.evaluation.num_generations or config.num_generations
+        if max(self.config.evaluation.pass_ks) > n_samples:
+            raise ValueError("Evaluation pass_k must not exceed num_generations.")
         snapshot = await self.snapshot_factory()
         # Hold one policy fixed across all evaluation batches so the aggregate
         # describes a single model state, even when the dataset is streamed.
         episodes, trajectories = [], []
+        row_offset, dropped = 0, 0
+        task_ids = set()
         batch_size = config.eval_batch_size or config.batch_size
         batches = iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
         with tqdm(
@@ -79,20 +112,40 @@ class AgentTrainingLoop:
             leave=False,
         ) as progress:
             for batch_rows in batches:
+                # Stable identities survive batching and policy refresh. Reject
+                # duplicate explicit IDs rather than merging unrelated tasks.
+                batch_rows = [dict(row) for row in batch_rows]
+                for index, row in enumerate(batch_rows):
+                    row.setdefault("task_id", f"eval-row-{row_offset + index}")
+                    identity = str(row["task_id"])
+                    if identity in task_ids:
+                        raise ValueError("Evaluation task_id values must be unique.")
+                    task_ids.add(identity)
                 batch = await self.workflow.collect(
                     batch_rows,
                     snapshot,
-                    n_samples=config.num_generations,
-                    seed=self._seed(len(batch_rows)),
+                    n_samples=n_samples,
+                    seed=self.config.evaluation.seed
+                    + row_offset * n_samples * self.workflow.runner.limits.max_turns,
                     is_eval=True,
                     strict=False,
                 )
                 episodes.extend(batch.episodes)
                 trajectories.extend(batch.trajectories)
+                dropped += batch.dropped_groups
+                row_offset += len(batch_rows)
                 progress.update(1)
         if not episodes:
             raise ValueError("Agent evaluation dataset is empty.")
-        metrics = AgentRolloutBatch(episodes, trajectories).metrics(prefix="eval/agent")
+        self.last_eval_batch = AgentRolloutBatch(episodes, trajectories, dropped)
+        metrics = self.last_eval_batch.metrics(prefix="eval/agent")
+        metrics.update(
+            evaluation_metrics(episodes, pass_ks=self.config.evaluation.pass_ks)
+        )
+        if self._baseline_episodes is None:
+            self._baseline_episodes = list(episodes)
+        else:
+            metrics.update(paired_task_metrics(self._baseline_episodes, episodes))
         await trainer.publish_metrics(metrics)
         self._last_eval_step = trainer.state.global_step
         return metrics
@@ -116,28 +169,39 @@ class AgentTrainingLoop:
         """Collect prompt groups and optionally refill uninformative groups.
 
         The source iterator is consumed once. Dynamic sampling reuses the
-        existing raw-reward group filter and keeps a single policy snapshot
+        outcome/process group filter and keeps a single policy snapshot
         during all refill requests. Episode diagnostics include rejected groups
         even though their trajectories do not enter the optimizer batch.
         """
         config = self.trainer.args
         snapshot = await self.snapshot_factory()
         episodes, accepted = [], []
-        group_count, empty_batches = 0, 0
+        self.last_train_snapshot = snapshot
+        group_count, empty_batches, dropped, refills = 0, 0, 0, 0
+        collection_count = 0
         while group_count < config.batch_size:
             batch_rows = list(itertools.islice(rows, config.batch_size - group_count))
             if not batch_rows:
                 break
+            if collection_count:
+                if refills >= self.config.max_refill_batches:
+                    raise RuntimeError(
+                        "Agent collection exceeded max_refill_batches before filling a batch."
+                    )
+                refills += 1
+            collection_count += 1
             batch = await self.workflow.collect(
                 batch_rows,
                 snapshot,
                 n_samples=config.num_generations,
                 seed=self._seed(len(batch_rows)),
+                strict=self.config.on_system_failure == "raise",
             )
             episodes.extend(batch.episodes)
             generated = batch.trajectories
+            dropped += batch.dropped_groups
             if config.dynamic_sampling:
-                generated = filter_informative_groups(generated)
+                generated = filter_agent_groups(generated)
             accepted.extend(generated)
             group_count += len({t.group_id for t in generated})
             empty_batches = 0 if generated else empty_batches + 1
@@ -145,7 +209,7 @@ class AgentTrainingLoop:
                 raise RuntimeError(
                     "Agent dynamic sampling found too many uninformative groups."
                 )
-        return AgentRolloutBatch(episodes, accepted)
+        return AgentRolloutBatch(episodes, accepted, dropped, refills)
 
     async def train(self) -> PPOState:
         """Run collection, updates, configured evaluations, and final saving.
@@ -185,10 +249,32 @@ class AgentTrainingLoop:
                 ):
                     batch = await self._collect(rows)
                     if not batch.trajectories:
+                        if batch.episodes:
+                            await trainer.publish_metrics(batch.metrics())
                         break
                     # All model/tool interactions finish before parameters can
                     # change. The next _collect call obtains a new snapshot.
-                    await trainer.step(batch.trajectories)
+                    previous_optimizer_steps = trainer.state.optimizer_steps
+                    metrics = await trainer.step(batch.trajectories)
+                    self.last_train_batch = batch
+                    self.update_history.append(
+                        {
+                            "step": trainer.state.global_step,
+                            "snapshot_ids": sorted(
+                                {e.snapshot_id for e in batch.episodes}
+                            ),
+                            "optimizer_steps": trainer.state.optimizer_steps
+                            - previous_optimizer_steps,
+                            "action_tokens": sum(
+                                sum(t.loss_mask) for t in batch.trajectories
+                            ),
+                            "context_tokens": sum(
+                                len(t.loss_mask) - sum(t.loss_mask)
+                                for t in batch.trajectories
+                            ),
+                            "metrics": dict(metrics),
+                        }
+                    )
                     await trainer.publish_metrics(batch.metrics())
                     progress.update(1)
                     if (

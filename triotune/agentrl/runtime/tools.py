@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import ToolActionError, ToolCall, ToolResult, ToolSystemError
+from ..contracts import ToolActionError, ToolCall, ToolResult, ToolSystemError
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,12 +31,15 @@ class FunctionTool:
     description: str
     parameters: dict[str, Any]
     function: Callable[..., Any]
+    retry_safe: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not callable(self.function):
             raise ValueError("A tool needs a nonempty name and callable function.")
         if self.parameters.get("type") != "object":
             raise ValueError("Tool parameters must declare an object schema.")
+        if type(self.retry_safe) is not bool:
+            raise ValueError("retry_safe must be a boolean.")
 
 
 class FunctionToolExecutor:
@@ -56,6 +59,11 @@ class FunctionToolExecutor:
         self._tools = {tool.name: tool for tool in tools}
         if len(self._tools) != len(tools):
             raise ValueError("Tool names must be unique.")
+
+    def is_retry_safe(self, call: ToolCall) -> bool:
+        """Only explicitly idempotent tools may repeat after a transient error."""
+        tool = self._tools.get(call.name)
+        return tool is not None and tool.retry_safe
 
     @property
     def schemas(self) -> list[Mapping[str, Any]]:
@@ -112,5 +120,10 @@ class FunctionToolExecutor:
             # Feeding a structured error back to the model preserves an
             # opportunity to recover within the remaining episode budget.
             return ToolResult(call.call_id, call.name, str(exc), is_error=True)
+        except ToolSystemError:
+            raise
         except Exception as exc:
-            raise ToolSystemError(f"Tool {call.name} failed: {exc}") from exc
+            raise ToolSystemError(
+                f"Tool {call.name} failed: {exc}",
+                retryable=isinstance(exc, (ConnectionError, TimeoutError, OSError)),
+            ) from exc

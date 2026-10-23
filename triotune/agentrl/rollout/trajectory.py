@@ -8,8 +8,8 @@ markers remain visible as context but are excluded from policy optimization.
 
 from __future__ import annotations
 
-from ..trainer.ppo.contracts import Trajectory
-from .contracts import AgentContractError, EpisodeResult
+from ...trainer.ppo.contracts import Trajectory
+from ..contracts import AgentContractError, EpisodeResult
 
 
 class EpisodeTrajectoryBuilder:

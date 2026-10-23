@@ -13,7 +13,7 @@ from recipes.calculator_agent import (
     calculator_workflow,
 )
 
-from triotune.agent import (
+from triotune.agentrl import (
     EpisodeCollectionError,
     EpisodeLimits,
     FunctionTool,
@@ -146,7 +146,7 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         policy, _ = snapshot()
-        from triotune.agent import ChatTemplateRenderer
+        from triotune.agentrl import ChatTemplateRenderer
 
         class RewritingRenderer(ChatTemplateRenderer):
             def render(self, messages, tools):

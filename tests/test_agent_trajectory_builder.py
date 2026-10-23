@@ -2,7 +2,7 @@
 
 import unittest
 
-from triotune.agent import (
+from triotune.agentrl import (
     AgentContractError,
     AgentTurn,
     EpisodeResult,

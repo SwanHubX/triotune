@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from ..trainer.ppo.contracts import Trajectory
-    from .sampling import SamplingSnapshot
+    from .runtime.sampling import SamplingSnapshot
 
 
 class AgentContractError(ValueError):
@@ -55,6 +55,10 @@ class ToolSystemError(RuntimeError):
     This failure category keeps infrastructure availability separate from the
     quality of the model's decision and prevents accidental zero-reward labels.
     """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def validate_tokens(tokens: Sequence[int], *, name: str) -> None:
@@ -199,6 +203,18 @@ class AgentTurn:
     tool_results: list[ToolResult] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class RetryEvent:
+    """One transient failed operation, including the exhausted final attempt."""
+
+    stage: str
+    turn: int
+    attempt: int
+    error_type: str
+    error: str
+    retried: bool
+
+
 # Completion does not imply success: a valid final answer can still be wrong.
 # Budget exits and invalid actions are model-side outcomes, while the system
 # statuses below prevent infrastructure failures from entering policy updates.
@@ -279,6 +295,10 @@ class EpisodeResult:
     final_text: str | None = None
     score: EpisodeScore | None = None
     error: str | None = None
+    task_id: str | None = None
+    sample_index: int = 0
+    retries: list[RetryEvent] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
     @property
     def trainable(self) -> bool:
@@ -347,6 +367,9 @@ class ConversationRenderer(Protocol):
 
     Rendering is synchronous and may run in a worker thread. Successive inputs
     must preserve previously sampled tokens for the default concat exporter.
+    A renderer may additionally define render_continuation(episode, messages,
+    tools); the runner uses it after the first generation to append context
+    without re-encoding existing output IDs.
     """
 
     def render(

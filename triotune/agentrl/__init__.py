@@ -12,6 +12,7 @@ The package provides orchestration and client adapters, while model execution
 and optimization remain behind the existing PyTRIO/trainer boundaries.
 """
 
+from .config import AgentConfig, AgentEvaluationConfig, RetryPolicy
 from .contracts import (
     ActionParseError,
     ActionParser,
@@ -29,6 +30,7 @@ from .contracts import (
     EpisodeStatus,
     Generation,
     ObservationFormatter,
+    RetryEvent,
     ToolActionError,
     ToolCall,
     ToolExecutor,
@@ -36,22 +38,32 @@ from .contracts import (
     ToolSystemError,
     TrajectoryExporter,
 )
-from .conversation import (
-    ChatTemplateRenderer,
-    JsonActionParser,
-    JsonObservationFormatter,
-)
-from .episode_logging import JsonlEpisodeLogger
-from .episode_runner import EpisodeRunner
-from .rollout_workflow import (
+from .diagnostics.logging import JsonlEpisodeLogger
+from .diagnostics.validation import probe_tokenizer
+from .rollout.trajectory import EpisodeTrajectoryBuilder
+from .rollout.workflow import (
     AgentRolloutBatch,
     AgentRolloutWorkflow,
     EpisodeCollectionError,
 )
-from .sampling import PyTRIOAgentSampler, SamplingSnapshot
-from .tool_executor import FunctionTool, FunctionToolExecutor
-from .training_loop import AgentTrainingLoop
-from .trajectory_builder import EpisodeTrajectoryBuilder
+from .runtime.conversation import (
+    ChatTemplateRenderer,
+    JsonActionParser,
+    JsonObservationFormatter,
+    TokenAppendRenderer,
+)
+from .runtime.runner import EpisodeRunner
+from .runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
+from .runtime.tools import FunctionTool, FunctionToolExecutor
+from .training.evaluation import evaluation_metrics, paired_task_metrics
+from .training.loop import AgentTrainingLoop
+from .training.rewards import (
+    CompositeScorer,
+    CostConfig,
+    RewardTerm,
+    ToolCostScorer,
+    TurnRewardScorer,
+)
 
 # Keep adapter contracts and their default implementations available through
 # one stable import surface. Runtime state remains owned by the objects callers
@@ -60,14 +72,18 @@ __all__ = [
     "ActionParseError",
     "ActionParser",
     "AgentAction",
+    "AgentConfig",
     "AgentContractError",
+    "AgentEvaluationConfig",
     "AgentRolloutBatch",
     "AgentRolloutWorkflow",
     "AgentSampler",
     "AgentTrainingLoop",
     "AgentTurn",
     "ChatTemplateRenderer",
+    "CompositeScorer",
     "ConversationRenderer",
+    "CostConfig",
     "EpisodeCollectionError",
     "EpisodeExecutor",
     "EpisodeLimits",
@@ -86,11 +102,20 @@ __all__ = [
     "JsonlEpisodeLogger",
     "ObservationFormatter",
     "PyTRIOAgentSampler",
+    "RetryEvent",
+    "RetryPolicy",
+    "RewardTerm",
     "SamplingSnapshot",
+    "TokenAppendRenderer",
     "ToolActionError",
     "ToolCall",
+    "ToolCostScorer",
     "ToolExecutor",
     "ToolResult",
     "ToolSystemError",
     "TrajectoryExporter",
+    "TurnRewardScorer",
+    "evaluation_metrics",
+    "paired_task_metrics",
+    "probe_tokenizer",
 ]

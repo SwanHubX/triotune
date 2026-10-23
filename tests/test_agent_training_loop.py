@@ -11,7 +11,7 @@ from agent_test_support import AgentTrainingClient
 from recipes.calculator_agent import calculator_rows, calculator_workflow
 
 from triotune import PPOConfig, PPOTrainer
-from triotune.agent import AgentTrainingLoop, EpisodeCollectionError
+from triotune.agentrl import AgentTrainingLoop, EpisodeCollectionError
 from triotune.trainer.ppo import prepare_advantages
 from triotune.trainer.ppo.datum import batch_datums
 from triotune.trainer.ppo.loss import make_loss_fn
@@ -43,7 +43,7 @@ class AgentTrainingTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         trainer, client = self.trainer()
-        with patch("triotune.agent.training_loop.tqdm"):
+        with patch("triotune.agentrl.training.loop.tqdm"):
             state = await AgentTrainingLoop(trainer, calculator_workflow()).train()
         self.assertEqual(state.global_step, 2)
         self.assertEqual(state.optimizer_steps, 2)
@@ -135,7 +135,7 @@ class AgentTrainingTests(unittest.IsolatedAsyncioTestCase):
             await AgentTrainingLoop(trainer, workflow).train()
         self.assertNotIn("submit:optim", client.trace)
         trainer, client = self.trainer(dynamic_sampling=True)
-        with patch("triotune.agent.training_loop.tqdm"):
+        with patch("triotune.agentrl.training.loop.tqdm"):
             state = await AgentTrainingLoop(trainer, calculator_workflow()).train()
         self.assertEqual(state.global_step, 2)
 
@@ -169,7 +169,7 @@ class AgentTrainingTests(unittest.IsolatedAsyncioTestCase):
         trainer, _ = self.trainer()
         trainer.train_dataset = []
         with (
-            patch("triotune.agent.training_loop.tqdm"),
+            patch("triotune.agentrl.training.loop.tqdm"),
             self.assertRaisesRegex(ValueError, "No trainable"),
         ):
             await AgentTrainingLoop(trainer, calculator_workflow()).train()
