@@ -25,6 +25,7 @@ build-backend = "setuptools.build_meta"
 packages = [
     "triotune",
     "triotune.api",
+    "triotune.agent",
     "triotune.dataset",
     "triotune.trainer",
     "triotune.trainer.dpo",
