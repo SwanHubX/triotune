@@ -1,0 +1,92 @@
+# Complete GSM8K SFT experiment. Run from the repository root:
+# uv run python examples/sft/gsm8k_sft.py --config examples/sft/gsm8k_sft_args.yaml
+# Maps directly to SFTConfig: no algorithm selector or legacy wrapper.
+
+model:
+  # PyTRIO base-model ID and trainable LoRA adapter rank.
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 32
+
+train_dataset:
+  # Prepared local JSONL. Paths resolve from the repository root.
+  path: data/gsm8k_sft_train.jsonl
+  split: train
+  # Official GSM8K train split; null uses all 7,473 prepared rows.
+  max_examples: null
+  shuffle: false
+  # Null falls back to training.seed when shuffle is enabled.
+  seed: 42
+  # Optional datasets JSON-loader kwargs; do not repeat data_files or split.
+  loader_options: {}
+
+valid_dataset:
+  # Official GSM8K test split, in the same algorithm-specific format.
+  # Set this whole section to null to disable validation and its file loading.
+  path: data/gsm8k_sft_test.jsonl
+  split: test
+  max_examples: 100
+  shuffle: false
+  seed: 42
+  loader_options: {}
+
+training:
+  # Supervised sequences per optimizer update; this is not a GPU microbatch.
+  batch_size: 4
+  # One dataset pass, capped at this many completed updates. No implicit cycling.
+  max_steps: 100
+  seed: 42
+
+optimizer:
+  # Student/policy AdamW. No teacher/reference optimizer is created.
+  learning_rate: 0.0001
+  beta1: 0.9
+  beta2: 0.95
+  eps: 0.00000001
+  weight_decay: 0.0
+  # Zero disables remote gradient clipping.
+  grad_clip_norm: 1.0
+
+checkpoint:
+  # Count optimizer updates; zero disables periodic saves, not final saving.
+  save_every: 20
+
+evaluation:
+  # With valid_dataset present: before, every 20 updates, and after training.
+  steps: 20
+  before_train: true
+  after_train: true
+  batch_size: 4
+  # Cap each evaluation pass. Null reads all loaded validation rows.
+  max_batches: 4
+
+data:
+  # Right-truncate prompt + completion. A supervised target must survive.
+  max_length: 1024
+  # Fallback for raw text rows; unused by these prompt/completion rows.
+  dataset_text_field: text
+  # Explicitly mask prompts. Null would auto-enable this for paired rows.
+  completion_only_loss: true
+  # This example uses paired masking and does not require assistant token masks.
+  assistant_only_loss: false
+  # Applies to raw text, not chat pairs (their template owns EOS).
+  add_eos_token: true
+  chat_template_kwargs:
+    enable_thinking: false
+
+execution:
+  # Submit FB -> optimizer in order, collecting results in the background.
+  # Bounds pending batches, not parallel independent optimizer updates.
+  max_in_flight: 32
+
+reporting:
+  # Set null to disable network reporting; terminal progress remains enabled.
+  report_to: swanlab
+  project: triotune-sft
+  # Null uses your account default. Set to a workspace you can write to.
+  workspace: null
+  run_name: gsm8k-sft
+  tags: [sft, gsm8k, pytrio]
+  # Relative to the process working directory; also writes unique JSONL history.
+  log_dir: output/gsm8k-sft
+  # DPO/OPD aggregate this many updates per metric window; SFT reports each step.
+  logging_step: 1

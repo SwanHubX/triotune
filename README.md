@@ -85,9 +85,9 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 | --- | --- | --- | --- |
 | **GRPO** | [📖 Docs](./docs/algorithms/grpo_series.md) | [🔧 Example](./examples/grpo) | [📄 Paper](https://arxiv.org/abs/2402.03300) |
 | **PPO** | [📖 Docs](./docs/algorithms/ppo_series.md) | [🔧 Example](./examples/ppo) | [📄 Paper](https://arxiv.org/abs/1707.06347) |
-| **DPO** | - | - | [📄 Paper](https://arxiv.org/abs/2305.18290) |
-| **OPD** | - | - | [📄 Paper](https://arxiv.org/abs/2601.18734) |
-| **SFT** | - | - |  |
+| **DPO** | [📖 Docs](./docs/algorithms/dpo.md) | [🔧 Example](./examples/dpo) | [📄 Paper](https://arxiv.org/abs/2305.18290) |
+| **OPD** | [📖 Docs](./docs/algorithms/opd.md) | [🔧 Example](./examples/opd) | [📄 Paper](https://arxiv.org/abs/2601.18734) |
+| **SFT** | [📖 Docs](./docs/algorithms/sft.md) | [🔧 Example](./examples/sft) |  |
 
 ### 📖 Models
 
