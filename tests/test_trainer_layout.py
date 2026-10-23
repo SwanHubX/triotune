@@ -52,7 +52,6 @@ class TrainerLayoutTests(unittest.TestCase):
             "triotune.trainer.common.metrics_api": "triotune.utils.metrics",
             "triotune.trainer.common.logging": "triotune.utils.metrics",
             "triotune.trainer.dataset": "triotune.dataset",
-            "triotune.trainer.dataset.swe_sft": "triotune.dataset.swe_sft",
         }
         for old, new in aliases.items():
             with self.subTest(module=old):

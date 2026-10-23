@@ -5,7 +5,6 @@ Module responsibilities:
     prompt: Render text, token IDs, and chat messages into text and tokens.
     prepare: Validate prompt, SFT, and preference rows and derive labels/masks.
     examples: Define the returned data structures, rather than another stage.
-    swe_sft: Split tool-use trajectories into assistant-supervised SFT examples.
 
 ``prepare_rows`` loads a source and collects all prepared examples in memory.
 Trainers can also call ``prepare_*`` on individual rows after batching them.
@@ -16,13 +15,6 @@ from .examples import IGNORE_INDEX, PreferenceExample, PromptExample, Supervised
 from .load import load_rows
 from .prepare import prepare_preference, prepare_prompt, prepare_rows, prepare_sft
 from .prompt import RenderedPrompt, render_prompt
-from .swe_sft import (
-    SWEConversation,
-    SWESFTConfig,
-    SWESFTDataset,
-    SWESFTReport,
-    prepare_swe_sft_dataset,
-)
 
 __all__ = [
     "IGNORE_INDEX",
@@ -31,14 +23,9 @@ __all__ = [
     "PromptExample",
     "RenderedPrompt",
     "SupervisedExample",
-    "SWEConversation",
-    "SWESFTConfig",
-    "SWESFTDataset",
-    "SWESFTReport",
     "prepare_preference",
     "prepare_prompt",
     "prepare_rows",
     "prepare_sft",
-    "prepare_swe_sft_dataset",
     "render_prompt",
 ]

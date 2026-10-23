@@ -43,7 +43,7 @@ def _normalize_messages(messages: Any) -> list[dict[str, Any]]:
     """Copy nonempty chat messages, validating role and text-only content.
 
     Extra message fields are preserved for templates. General prompt handling
-    requires string content; nullable tool-call messages use the SWE path.
+    requires string content.
     """
 
     if not isinstance(messages, (list, tuple)) or not messages:

@@ -26,8 +26,6 @@ packages = [
     "triotune",
     "triotune.api",
     "triotune.dataset",
-    "triotune.dataset.swe_sft",
-    "triotune.swe",
     "triotune.trainer",
     "triotune.trainer.dpo",
     "triotune.trainer.sft",

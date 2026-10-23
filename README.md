@@ -2,7 +2,7 @@
 
 **PyTRIO-native training recipes and trainer building blocks.**
 
-Triotune provides text-training recipes, trainer components, and SWE agent workflows through the public PyTRIO client API. It handles data preparation, reward and advantage calculation, token alignment, and training-loop orchestration. PyTRIO supplies model execution, tokenization, sampling, and optimization.
+Triotune provides text-training recipes and trainer components through the public PyTRIO client API. It handles data preparation, reward and advantage calculation, token alignment, and training-loop orchestration. PyTRIO supplies model execution, tokenization, sampling, and optimization.
 
 <p align="center">
   <a href="README_CN.md">中文文档</a>
@@ -18,7 +18,6 @@ Triotune provides text-training recipes, trainer components, and SWE agent workf
 - [Data contracts](#-data-contracts)
 - [Token usage metrics](#token-usage-metrics)
 - [Python API](#-python-api)
-- [Triotune-SWE](#triotune-swe)
 - [Documentation](#documentation)
 - [Repository layout](#-repository-layout)
 - [Current scope](#-current-scope)
@@ -35,8 +34,6 @@ The current trainers are:
 - **OPD**: on-policy distillation in which a student samples completions and a fixed teacher supplies token-level scores.
 
 PPO, DPO, and OPD include asynchronous training paths where the underlying PyTRIO client supports them. Shared utilities handle text, token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
-
-Triotune-SWE connects model sampling, a coding agent, and disposable task environments. It turns issue descriptions into tested patches and exports repair episodes for supervised fine-tuning or reinforcement learning.
 
 ## 📰 News
 
@@ -141,13 +138,18 @@ asyncio.run(
 )
 ```
 
+## Documentation
+
+- [Trainer guide](triotune/trainer/README.md)
+- [PPO algorithm guide](docs/algorithms/ppo_series.md)
+- [GRPO algorithm guide](docs/algorithms/grpo_series.md)
+
 ## 🗃 Repository layout
 
 ```text
 triotune/
 ├── api/           # Public configuration and client contracts
 ├── dataset/       # Shared validation and tokenization
-├── swe/           # SWE sampling and training trajectory contracts
 ├── trainer/       # Algorithm trainers and components
 └── utils/         # Shared runtime utilities
 ```

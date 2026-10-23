@@ -15,8 +15,7 @@ triotune/
 ├── dataset/
 │   ├── prompt.py        # 文本、token 和聊天输入渲染
 │   ├── prepare.py       # 固定行格式的校验、分词、mask 与长度处理
-│   ├── examples.py      # 各算法共享的标准化训练样本
-│   └── swe_sft/         # 软件工程智能体轨迹的 SFT 数据处理
+│   └── examples.py      # 各算法共享的标准化训练样本
 ├── utils/
 │   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
 │   ├── dataloader.py    # 流式数据集的 batch 迭代
@@ -55,7 +54,6 @@ triotune/
 | [输入渲染](../dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
 | [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
 | [训练样本](../dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
-| [SWE 轨迹](../dataset/swe_sft/) | 将包含工具调用、工具结果和多轮决策的软件工程智能体轨迹转换为 PyTRIO SFT 数据。 |
 | [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、`log_dir` JSONL 历史、窗口聚合、SwanLab 提交、checkpoint URI 记录和 run 结束。 |
 | [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
 | [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
@@ -173,24 +171,6 @@ preference_examples = prepare_rows(
 {"messages":[{"role":"user","content":"What is 3 + 3?"},{"role":"assistant","content":"6"}]}
 ```
 
-
-## 检查数据集配置
-
-```python
-from triotune.trainer import SFTTrainer
-from triotune.dataset import SWESFTConfig, prepare_swe_sft_dataset
-
-dataset = prepare_swe_sft_dataset(
-    "swe-trajectories.jsonl",
-    tokenizer,
-    SWESFTConfig(sample_mode="pair", max_length=8192),
-)
-
-trainer = SFTTrainer(
-    model="Qwen/Qwen3.5-4B",
-    train_dataset=dataset,
-)
-```
 
 ## SFT 训练
 
