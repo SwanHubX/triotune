@@ -35,6 +35,9 @@ The current trainers are:
 
 PPO, DPO, and OPD include asynchronous training paths where the underlying PyTRIO client supports them. Shared utilities handle text, token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
+For multi-turn tool-using agents, `triotune.agent` provides replaceable execution,
+sampling, trajectory export, scoring, and evaluation interfaces over the existing PPO trainer.
+
 ## 📰 News
 
 - **2026-10-19:** Triotune 0.1.1 standardized dataset preprocessing and renamed the distribution and source layout to triotune, while adding modular PPO and on-policy distillation pipelines plus YAML-based recipe configuration.

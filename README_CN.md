@@ -35,6 +35,8 @@ Triotune 为若干基于 PyTRIO 的训练算法提供类似 Trainer 的使用方
 
 在底层 PyTRIO 客户端支持的前提下，PPO、DPO 和 OPD 提供异步训练路径。公共工具统一处理文本、token ID 和聊天消息输入，以及 checkpoint 命名和 SwanLab 指标记录。
 
+`triotune.agent` 提供多轮工具智能体的执行、采样、轨迹导出、评分和评估接口，复用现有 PPO trainer。
+
 ## 📰 近期动态
 
 - **2026-10-19：** Triotune 0.1.1 统一了数据集预处理格式，并将发行包和源码目录重命名为 triotune，同时新增模块化 PPO、在策略蒸馏流程及基于 YAML 的训练配方配置。

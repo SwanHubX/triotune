@@ -95,7 +95,7 @@ def prepare_advantages(
         if config.overlong_tokens:
             excess = max(
                 0,
-                len(trajectory.completion_tokens)
+                sum(trajectory.loss_mask)
                 - (config.max_tokens - config.overlong_tokens),
             )
             reward -= (

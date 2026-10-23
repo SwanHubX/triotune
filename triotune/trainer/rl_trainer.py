@@ -14,7 +14,8 @@ import math
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import numpy as np
 import pytrio as trio
@@ -35,6 +36,9 @@ from .ppo.rollout import (
     generate_rollouts,
     score_reference,
 )
+
+if TYPE_CHECKING:
+    from ..agentrl.runtime.sampling import SamplingSnapshot
 
 
 class PPOTrainer:
@@ -223,6 +227,31 @@ class PPOTrainer:
             )
         await score_reference(self._reference, trajectories)
 
+    async def create_sampling_snapshot(self, *, stop=None) -> SamplingSnapshot:
+        """Export current actor weights for an entire custom agent batch.
+
+        Finish using this snapshot before calling step(). The returned ID is
+        provenance, not permission to overlap sampling with optimizer updates.
+        """
+        from ..agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
+
+        await self.initialize()
+        self._sampling = await call_async(
+            self._client, "save_weights_and_get_sampling_client"
+        )
+        return SamplingSnapshot(
+            f"step-{self.state.global_step}-{uuid4().hex}",
+            PyTRIOAgentSampler(self._sampling, self._tokenizer, stop=stop),
+            self._tokenizer,
+        )
+
+    async def publish_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Publish custom workflow metrics through the trainer-owned reporter."""
+        await self.initialize()
+        payload = self._metrics.publish(metrics, step=self.state.global_step)
+        self.state.metrics.update(payload)
+        return payload
+
     # ------------------------------------------------------------------
     # Rollout-batch preparation and actor/critic optimization
     # ------------------------------------------------------------------
@@ -325,7 +354,7 @@ class PPOTrainer:
         ]
         overlong_penalties = []
         if self.args.overlong_tokens:
-            for length in lengths:
+            for length in (sum(t.loss_mask) for t in trajectories):
                 excess = max(
                     0,
                     length - (self.args.max_tokens - self.args.overlong_tokens),
