@@ -16,8 +16,28 @@ class DistributionMetadataTests(unittest.TestCase):
         project = config["project"]
 
         self.assertEqual(project["name"], "triotune")
-        self.assertEqual(project["version"], "0.1.2")
+        # 发布 workflow 会递增版本，测试不应绑定到某一个已发布版本。
+        self.assertRegex(
+            project["version"],
+            r"\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z",
+        )
         self.assertEqual(project["readme"], "README.md")
+
+    def test_lockfile_matches_project_version(self) -> None:
+        config = tomllib.loads(
+            (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        lock = tomllib.loads(
+            (REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8")
+        )
+        project = config["project"]
+        locked_project = next(
+            package for package in lock["package"]
+            if package["name"] == project["name"]
+        )
+
+        self.assertEqual(locked_project["version"], project["version"])
+        self.assertEqual(locked_project["source"], {"editable": "."})
 
     def test_source_distribution_excludes_repository_only_content(self) -> None:
         manifest = (REPOSITORY_ROOT / "MANIFEST.in").read_text(encoding="utf-8")

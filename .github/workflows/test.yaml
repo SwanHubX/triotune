@@ -1,0 +1,38 @@
+name: test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    name: Python Unit Tests
+    runs-on: ubuntu-latest
+    env:
+      UV_DEFAULT_INDEX: https://pypi.org/simple
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: |
+          uv sync --locked
+          uv pip install 'torch>=2.3' --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run unit tests
+        # 排除 tests/trio_test.py 及 recipes 中需要真实云端服务的手工脚本。
+        run: uv run --no-sync python -m unittest discover -s tests -p 'test_*.py'

@@ -1,0 +1,171 @@
+name: Validate release and create PR
+
+# 本 workflow 仅由 Prepare release 显式调用；expected_sha 是版本 bump 后的不可变测试对象。
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Release branch
+        required: true
+        type: string
+      version:
+        description: Release version
+        required: true
+        type: string
+      expected_sha:
+        description: Version bump commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一 release 分支的重复 dispatch 串行执行，避免并发创建重复 PR。
+  group: validate-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate inputs
+        env:
+          BRANCH: ${{ inputs.branch }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          WORKFLOW_REF: ${{ github.ref_name }}
+        run: |
+          # 同时校验输入、运行 ref 和分支内版本，防止手工 dispatch 绕过 release 约束。
+          if [[ ! "$BRANCH" =~ ^chore/release-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+            echo "Invalid release branch: $BRANCH"
+            exit 1
+          fi
+          if [ "${BASH_REMATCH[1]}" != "$VERSION" ]; then
+            echo "Branch version does not match requested version: $VERSION"
+            exit 1
+          fi
+          if [ "$WORKFLOW_REF" != "$BRANCH" ]; then
+            echo "Workflow ref ($WORKFLOW_REF) does not match release branch ($BRANCH)."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid release commit: $EXPECTED_SHA"
+            exit 1
+          fi
+
+      - name: Checkout version bump commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.expected_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify release commit and package version
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # checkout 必须落在 Prepare release 返回的完整 SHA，而不是可移动的分支 HEAD。
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo "Checked-out commit does not match expected release commit."
+            exit 1
+          fi
+
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$package_version" != "$VERSION" ]; then
+            echo "Package version ($package_version) does not match release version ($VERSION)."
+            exit 1
+          fi
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        env:
+          UV_DEFAULT_INDEX: https://pypi.org/simple
+        run: |
+          uv sync --locked
+          # Loss 单元测试需要 torch；CPU wheel 即可，无需 CUDA 或远端训练服务。
+          uv pip install 'torch>=2.3' --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run unit tests
+        # 只收集 test_*.py，避免执行 tests/trio_test.py 等需要云端凭据的脚本。
+        run: uv run --no-sync python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Build package
+        # PR 只会在测试、构建和包元数据均通过后创建。
+        run: uv build
+
+      - name: Check package metadata
+        run: uv tool run twine check dist/*
+
+      - name: Install and verify package metadata
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # 不安装体积较大的运行时依赖；这里只验证 wheel 中最终发布的项目名和版本。
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -c 'from importlib.metadata import version; import os; assert version("triotune") == os.environ["VERSION"]'
+
+  create-pr:
+    name: Create release PR
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Verify branch still points to validated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.branch }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          # 测试结束后再次读取远端 HEAD，禁止把测试期间新增、未经验证的 commit 带入 PR。
+          branch_sha="$(gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" --jq '.object.sha')"
+          if [ "$branch_sha" != "$EXPECTED_SHA" ]; then
+            echo "Release branch moved during validation: expected $EXPECTED_SHA, found $branch_sha."
+            exit 1
+          fi
+
+      - name: Create or update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.branch }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # PR 合并是正式发布的人工批准点；重复运行时复用已有 PR，不重复创建。
+          existing_pr="$(gh pr list --base main --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          body_file="$(mktemp)"
+          printf '## 背景与目标\n\n发布 triotune v%s。\n\n## 改动与范围\n\n更新 pyproject.toml 和 uv.lock 中的项目版本；不主动升级依赖。\n\n## 验证结果\n\n已通过本地单元测试、uv build、twine check 和 wheel 版本校验。\n\n验证记录：%s\n\n至少获得一名 reviewer approval 后，以 squash merge 合并到 main，随后自动发布到 PyPI 和 GitHub Release。\n' "$VERSION" "$RUN_URL" > "$body_file"
+          if [ -n "$existing_pr" ]; then
+            gh pr edit "$existing_pr" --body-file "$body_file"
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(release): bump version to $VERSION" \
+              --body-file "$body_file"
+          fi
+
+          # 创建或更新后核对 PR，并在日志中列出实际提交与文件供 reviewer 检查。
+          gh pr view "$BRANCH" --json baseRefName,headRefName,headRefOid,commits,files
+          pr_refs="$(gh pr view "$BRANCH" --json baseRefName,headRefName,headRefOid --jq '[.baseRefName, .headRefName, .headRefOid] | @tsv')"
+          IFS=$'\t' read -r pr_base pr_head pr_sha <<< "$pr_refs"
+          if [ "$pr_base" != main ] || [ "$pr_head" != "$BRANCH" ] || [ "$pr_sha" != "$EXPECTED_SHA" ]; then
+            echo "Release PR base/head does not match the validated release: $pr_refs"
+            exit 1
+          fi

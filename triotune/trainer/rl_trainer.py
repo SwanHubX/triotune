@@ -238,9 +238,8 @@ class PPOTrainer:
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
         await self.initialize()
-        initial_train_tokens = self._actor.train_tokens + int(
-            getattr(self.critic, "train_tokens", 0)
-        )
+        initial_actor_tokens = self._actor.train_tokens
+        initial_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
         start = time.perf_counter()
         await self._references(trajectories)
         if self.critic is not None:
@@ -274,10 +273,10 @@ class PPOTrainer:
             )
             self._sampling = None
         self.state.global_step += 1
-        total_train_tokens = self._actor.train_tokens + int(
-            getattr(self.critic, "train_tokens", 0)
-        )
-        train_tokens = total_train_tokens - initial_train_tokens
+        total_actor_tokens = self._actor.train_tokens
+        total_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
+        actor_tokens = total_actor_tokens - initial_actor_tokens
+        critic_tokens = total_critic_tokens - initial_critic_tokens
         rewards = [t.reward for t in trajectories]
         active_logprobs = [
             logprob
@@ -357,8 +356,14 @@ class PPOTrainer:
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
                 "train/learning_rate": self.args.learning_rate,
-                "usage/train_tokens": float(train_tokens),
-                "usage/train_tokens_total": float(total_train_tokens),
+                "usage/actor_train_tokens": float(actor_tokens),
+                "usage/actor_train_tokens_total": float(total_actor_tokens),
+                "usage/critic_train_tokens": float(critic_tokens),
+                "usage/critic_train_tokens_total": float(total_critic_tokens),
+                "usage/train_tokens": float(actor_tokens + critic_tokens),
+                "usage/train_tokens_total": float(
+                    total_actor_tokens + total_critic_tokens
+                ),
                 "time/prepare": prepared_at - start,
                 "time/update": time.perf_counter() - prepared_at,
             }
@@ -804,6 +809,12 @@ class PPOTrainer:
                 / elapsed,
                 "usage/train_tokens_total": self.state.metrics.get(
                     "usage/train_tokens_total", 0.0
+                ),
+                "usage/actor_train_tokens_total": self.state.metrics.get(
+                    "usage/actor_train_tokens_total", 0.0
+                ),
+                "usage/critic_train_tokens_total": self.state.metrics.get(
+                    "usage/critic_train_tokens_total", 0.0
                 ),
                 "usage/sample_input_tokens_total": float(self._sample_input_tokens),
                 "usage/sample_output_tokens_total": float(self._sample_output_tokens),

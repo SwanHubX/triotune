@@ -6,7 +6,7 @@
 ```text
 triotune/
 ├── api/              # 配置参数与 PyTRIO client 公共契约
-├── dataset/          # 算法共享的数据校验、分词、mask 与 SWE 轨迹处理
+├── dataset/          # 算法共享的数据校验、分词与 mask
 ├── trainer/          # 按算法组织的训练实现和稳定导入入口
 │   ├── ppo/          # PPO/GRPO 等共享的采样、优势、损失与更新组件
 │   ├── dpo/          # 偏好数据、成对损失与训练编排

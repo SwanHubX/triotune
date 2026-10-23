@@ -1,0 +1,240 @@
+name: Release
+
+# release PR 的人工合并是唯一发布入口；手工推送 Tag 不再触发发布。
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+# 默认只给只读权限。需要发布的 job 在各自位置单独申请更小范围的权限。
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate merged release PR
+    # pull_request.closed 会覆盖所有 PR；仅接受本仓库中已合并的 chore/release-vX.Y.Z 分支。
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'chore/release-v')
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.release.outputs.branch }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Parse merged release
+        id: release
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          # 分支名是发布版本的权威输入，merge SHA 是所有构建产物的权威源码输入。
+          if [[ ! "$BRANCH" =~ ^chore/release-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+            echo "Invalid release branch: $BRANCH"
+            exit 1
+          fi
+
+          version="${BASH_REMATCH[1]}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout merged release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify merged commit and package version
+        env:
+          MERGE_SHA: ${{ steps.release.outputs.sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          # 确认事件中的 merge SHA 已进入 main，并且合并后的版本文件与分支名一致。
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$MERGE_SHA" origin/main; then
+            echo "Release commit is not on main: $MERGE_SHA"
+            exit 1
+          fi
+
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$package_version" != "$VERSION" ]; then
+            echo "Release branch version ($VERSION) does not match package version ($package_version)."
+            exit 1
+          fi
+
+  build:
+    name: Build distribution
+    needs: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          # pull_request 事件的 cache token 可能只读；只恢复、不保存可避免无害 warning。
+          save-cache: false
+
+      - name: Install test dependencies
+        env:
+          UV_DEFAULT_INDEX: https://pypi.org/simple
+        run: |
+          uv sync --locked
+          uv pip install 'torch>=2.3' --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run unit tests
+        # PR 创建前已测试过 release HEAD；这里重测 merge SHA，覆盖期间 main 新增提交的组合结果。
+        run: uv run --no-sync python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Build package
+        run: uv build
+
+      - name: Check package metadata
+        run: uv tool run twine check dist/*
+
+      - name: Install and verify package metadata
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # 发布前以实际 wheel 的 metadata 为准校验项目名和版本，不依赖源码变量。
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -c 'from importlib.metadata import version; import os; assert version("triotune") == os.environ["VERSION"]'
+
+      - name: Upload distributions
+        # PyPI 和 GitHub Release 复用同一份 artifact，避免两个 job 分别构建出不同文件。
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    environment:
+      # pypi environment 对应 PyPI Trusted Publisher；OIDC 发布不保存长期 token。
+      name: pypi
+      url: https://pypi.org/p/triotune
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout merged release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Create release tag
+        env:
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          # Tag 只在测试和构建完成后创建，并且必须指向本次验证过的 merge SHA。
+          # rerun 可以复用同一 Tag，但同名 Tag 指向其他提交时立即失败。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+            tag_sha="$(git rev-list -n 1 "$TAG")"
+            if [ "$tag_sha" != "$RELEASE_SHA" ]; then
+              echo "$TAG already points to $tag_sha instead of $RELEASE_SHA."
+              exit 1
+            fi
+          else
+            git tag -a "$TAG" "$RELEASE_SHA" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # 精确 Tag 和 artifact 已校验一致；rerun 时跳过 PyPI 中不可变的已有文件。
+          skip-existing: true
+
+  publish-github:
+    name: Create GitHub Release
+    # 仅在 PyPI 成功后创建 GitHub Release，确保 Release 页面不会宣告未完成的版本。
+    needs: [validate, build, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+        run: |
+          # rerun 时覆盖附件而不重复创建 Release；附件仍来自 build job 的同一 artifact。
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --clobber
+          else
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes dist/*
+          fi
+
+  cleanup-release-branch:
+    name: Delete release branch
+    # 清理位于完整发布链末尾；任一发布步骤失败都会保留分支供排查和重试。
+    needs: [validate, publish-github]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Delete release branch if it exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ needs.validate.outputs.branch }}
+        run: |
+          # 用户可能已在合并后手工删除分支，此时清理应幂等成功。
+          if gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH"
+            echo "Deleted release branch: $BRANCH"
+          else
+            echo "Release branch is already absent: $BRANCH"
+          fi

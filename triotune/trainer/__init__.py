@@ -36,15 +36,10 @@ from ..dataset import (
     PromptExample,
     RenderedPrompt,
     SupervisedExample,
-    SWEConversation,
-    SWESFTConfig,
-    SWESFTDataset,
-    SWESFTReport,
     prepare_preference,
     prepare_prompt,
     prepare_rows,
     prepare_sft,
-    prepare_swe_sft_dataset,
     render_prompt,
 )
 from .dpo.datum import build_dpo_datum
@@ -110,10 +105,6 @@ _COMPAT_MODULES = {
     "dataset.examples": "dataset.examples",
     "dataset.prepare": "dataset.prepare",
     "dataset.prompt": "dataset.prompt",
-    "dataset.swe_sft": "dataset.swe_sft",
-    "dataset.swe_sft.prepare": "dataset.swe_sft.prepare",
-    "dataset.swe_sft.schema": "dataset.swe_sft.schema",
-    "dataset.swe_sft.trajectory": "dataset.swe_sft.trajectory",
 }
 for _old_name, _new_name in _COMPAT_MODULES.items():
     _module = import_module(f"..{_new_name}", __name__)
@@ -197,10 +188,6 @@ __all__ = [
     "SFTExecutionConfig",
     "SFTState",
     "SFTTrainer",
-    "SWEConversation",
-    "SWESFTConfig",
-    "SWESFTDataset",
-    "SWESFTReport",
     "SupervisedExample",
     "TeacherConfig",
     "TrainingConfig",
@@ -212,6 +199,5 @@ __all__ = [
     "prepare_prompt",
     "prepare_rows",
     "prepare_sft",
-    "prepare_swe_sft_dataset",
     "render_prompt",
 ]

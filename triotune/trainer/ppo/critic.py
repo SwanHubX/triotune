@@ -282,7 +282,8 @@ class PyTRIOCritic:
                 result = await call_async(
                     self.client, "forward_backward_custom", data, loss_fn=loss_fn
                 )
-                self.train_tokens += compute_train_tokens(data)
+                # Custom loss submits a forward, then a forward_backward.
+                self.train_tokens += 2 * compute_train_tokens(data)
                 optimizer = await call_async(
                     self.client, "optim_step", optimizer_params(self._optimizer_config)
                 )

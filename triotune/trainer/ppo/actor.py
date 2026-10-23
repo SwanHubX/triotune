@@ -191,7 +191,9 @@ class PPOActor:
                         data,
                         loss_fn=make_loss_fn(chunk, config, diagnostics),
                     )
-                self.train_tokens += compute_train_tokens(data)
+                # PyTRIO custom loss submits a forward, then a forward_backward.
+                passes = 1 if config.loss_backend == "native" else 2
+                self.train_tokens += passes * compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
                 optimizer = await call_async(

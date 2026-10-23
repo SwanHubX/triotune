@@ -1,0 +1,133 @@
+name: Prepare release
+
+# 发布入口是从最新 main 创建 chore/release-vX.Y.Z 分支；创建普通分支时 job 会直接跳过。
+on:
+  create:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一时刻只准备一个正式版本，避免两个分支同时读取并更新相同的当前版本。
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  bump-version:
+    name: Bump release version
+    # create 事件不能按分支模式过滤，因此先用前缀筛选，再在步骤中校验完整格式。
+    if: >-
+      github.event.ref_type == 'branch' &&
+      startsWith(github.event.ref, 'chore/release-v')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Parse release branch
+        id: release
+        env:
+          BRANCH: ${{ github.event.ref }}
+        run: |
+          # 分支和 Git Tag 带 v；写入 Python 包元数据的版本不带 v。
+          if [[ ! "$BRANCH" =~ ^chore/release-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+            echo "Release branch must match chore/release-vX.Y.Z (no leading zeros): $BRANCH"
+            exit 1
+          fi
+
+          version="${BASH_REMATCH[1]}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Verify release starting point and version
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          # release 分支必须精确指向当前 main，避免从过期提交发布或漏掉已合并修复。
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "Release branch must be created from the current main branch."
+            exit 1
+          fi
+
+          current_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          # 当前流程只发布稳定 X.Y.Z，并要求每次发布严格递增。
+          if ! CURRENT_VERSION="$current_version" RELEASE_VERSION="$VERSION" python - <<'PY'
+          import os
+
+          current = tuple(int(part) for part in os.environ["CURRENT_VERSION"].split("."))
+          release = tuple(int(part) for part in os.environ["RELEASE_VERSION"].split("."))
+          raise SystemExit(0 if release > current else 1)
+          PY
+          then
+            echo "Release version ($VERSION) must be newer than current version ($current_version)."
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists: $TAG"
+            exit 1
+          fi
+
+      - name: Bump package version
+        env:
+          UV_DEFAULT_INDEX: https://pypi.org/simple
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          # 本项目使用 PEP 621 静态版本，同时更新 lock 中的本地项目版本。
+          uv version "$VERSION" --no-sync
+          uv lock --check
+
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$package_version" != "$VERSION" ]; then
+            echo "Failed to update package version to $VERSION."
+            exit 1
+          fi
+
+      - name: Commit and push version bump
+        id: commit
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          # 只向 release 分支提交版本文件；main 必须通过后续人工合并 PR 更新。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml uv.lock
+          git commit -m "chore(release): bump version to $VERSION"
+          git push origin "HEAD:$BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Start release validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          # GITHUB_TOKEN 推送的 commit 不会触发普通 push workflow，因此显式 dispatch，
+          # 并把刚提交的完整 SHA 传给验证流程，确保后续测试对象不会漂移。
+          gh workflow run release-pr.yml \
+            --ref "$BRANCH" \
+            -f branch="$BRANCH" \
+            -f version="$VERSION" \
+            -f expected_sha="$RELEASE_SHA"
