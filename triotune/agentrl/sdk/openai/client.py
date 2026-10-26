@@ -103,6 +103,23 @@ class OpenAIClient:
             parent_interaction_id=parent_interaction_id,
         )
 
+    def as_async_openai(self, *, session: OpenAISession | None = None, **options: Any):
+        """Return an official AsyncOpenAI bound to this adapter and one session.
+
+        Requests pass through a local ASGI transport, not a listening server.
+        The returned object uses the official SDK's request/response models and
+        automatically supplies the same session identity on every call. Closing
+        it closes only the local transport; the injected backend and its remote
+        client or trainer-owned snapshot remain owned by their original caller.
+        Install the openai-proxy extra for the optional SDK/ASGI dependencies.
+        """
+        from .proxy_server import OpenAIProxyServer
+
+        proxy = OpenAIProxyServer(self)
+        return proxy.create_client(
+            session=session if session is not None else self.session, **options
+        )
+
     async def _create(
         self, endpoint, method, session, payload, *, parent_interaction_id=None
     ):

@@ -19,7 +19,14 @@ from typing import Any
 from uuid import uuid4
 
 from ...training.rewards import RewardAssignment
-from ...types import AgentContractError, AgentEvent, EpisodeScore, ExecutionContext
+from ...types import (
+    AgentContractError,
+    AgentEvent,
+    EpisodeScore,
+    ExecutionContext,
+    ToolResult,
+    ToolResultEvent,
+)
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
@@ -505,6 +512,170 @@ class OpenAISession:
             )
         return parents[0]
 
+    def _tool_result_bindings(
+        self, endpoint, payload, parent_id, *, explicit_parent=False
+    ):
+        """Resolve third-party tool observations without trusting a bare call ID.
+
+        Chat and full-history Responses requests normally echo the ancestor
+        request/output prefix. Only calls at verified output positions can own
+        subsequent observations. An explicit parent or Responses previous ID
+        may instead scope a delta's result IDs to that response; native PyTRIO
+        still enforces full causal history at its own sampling boundary.
+        Unrelated sessions, fabricated assistant calls, repeated
+        results within one payload, and conflicting replays are all rejected.
+
+        This method plans changes only. Every observation is validated before
+        request allocation or tool-result mutation, retaining the existing
+        atomic failure and empty-session capacity rules.
+        """
+        key = "messages" if endpoint == "/v1/chat/completions" else "input"
+        items = self._normalized(payload.get(key, []))
+        if not isinstance(items, list):
+            return []
+
+        def is_result(item):
+            return isinstance(item, dict) and (
+                item.get("role") == "tool"
+                if key == "messages"
+                else item.get("type") == "function_call_output"
+            )
+
+        if not any(is_result(item) for item in items):
+            return []
+        if parent_id is None:
+            raise AgentContractError("Tool results require a verified session parent.")
+        ancestors = []
+        owner = self.get_interaction(parent_id)
+        while owner is not None:
+            ancestors.append(owner)
+            owner = (
+                self.get_interaction(owner.parent_interaction_id)
+                if owner.parent_interaction_id is not None
+                else None
+            )
+        positions = {}
+        for owner in ancestors:
+            prefix = self._normalized(owner.request.get(key, []))
+            if key == "input" and isinstance(prefix, str):
+                prefix = [{"role": "user", "content": prefix}]
+            if not isinstance(prefix, list):
+                continue
+            if key == "messages":
+                choices = owner.response.get("choices", [])
+                output = (
+                    [choices[0]["message"]]
+                    if len(choices) == 1 and choices[0].get("message")
+                    else []
+                )
+            else:
+                # A delta input is not a complete history. Its response can be
+                # referenced explicitly below, but never inferred as a prefix.
+                if owner.request.get("previous_response_id") is not None:
+                    continue
+                output = owner.response.get("output", [])
+            expected = prefix + self._normalized(output)
+            if output and items[: len(expected)] == expected:
+                for offset in range(len(output)):
+                    positions[len(prefix) + offset] = owner
+        pending = {}
+
+        def register_calls(owner, calls):
+            if not isinstance(calls, list):
+                raise AgentContractError("Recorded tool calls must be a list.")
+            for call in calls:
+                if not isinstance(call, dict):
+                    raise AgentContractError("Recorded tool calls must be objects.")
+                identity = call.get("id") if key == "messages" else call.get("call_id")
+                function = call.get("function", {}) if key == "messages" else call
+                if not isinstance(function, dict):
+                    raise AgentContractError(
+                        "Recorded function descriptors must be objects."
+                    )
+                name = function.get("name")
+                if (
+                    not isinstance(identity, str)
+                    or not identity
+                    or not isinstance(name, str)
+                    or not name
+                ):
+                    raise AgentContractError(
+                        "Recorded tools require a call ID and name."
+                    )
+                if identity in pending:
+                    raise AgentContractError(
+                        "Ambiguous tool-call ID in this conversation."
+                    )
+                pending[identity] = (owner, name)
+
+        if (
+            explicit_parent
+            or key == "input"
+            and payload.get("previous_response_id") is not None
+        ) and ancestors[0] not in positions.values():
+            # Explicit references retain the existing external-provider delta
+            # contract. Native PyTRIO still checks complete causal messages in
+            # its backend before sampling; no token prefix is inferred here.
+            register_calls(ancestors[0], ancestors[0].tool_calls)
+        bindings, seen = [], set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            calls = (
+                item.get("tool_calls", [])
+                if key == "messages"
+                else [item]
+                if item.get("type") == "function_call"
+                else []
+            )
+            if calls:
+                owner = positions.get(index)
+                if owner is None:
+                    raise AgentContractError(
+                        "Tool observations cannot follow an unverified assistant call."
+                    )
+                register_calls(owner, calls)
+            if not is_result(item):
+                continue
+            identity = (
+                item.get("tool_call_id") if key == "messages" else item.get("call_id")
+            )
+            if not isinstance(identity, str) or identity not in pending:
+                raise AgentContractError(
+                    "Tool result call ID does not belong to this session history."
+                )
+            owner, name = pending.pop(identity)
+            position = (owner.interaction_id, identity)
+            if position in seen:
+                raise AgentContractError(
+                    "A request cannot contain duplicate tool results."
+                )
+            seen.add(position)
+            content = item.get("content") if key == "messages" else item.get("output")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False, allow_nan=False)
+                except (TypeError, ValueError) as exc:
+                    raise AgentContractError(
+                        "Recorded tool observations must be text or finite JSON."
+                    ) from exc
+            existing = [
+                value
+                for value in owner.tool_results
+                if value.get("call_id") == identity
+            ]
+            if existing:
+                if any(
+                    value.get("content") != content or value.get("name") != name
+                    for value in existing
+                ):
+                    raise AgentContractError(
+                        "Tool result conflicts with recorded observation."
+                    )
+                continue
+            bindings.append((owner, ToolResult(identity, name, content)))
+        return bindings
+
     def start_request(
         self,
         endpoint: str,
@@ -529,6 +700,9 @@ class OpenAISession:
                 "Concurrent requests require separate OpenAI sessions."
             )
         parent = self._parent(endpoint, payload, parent_interaction_id)
+        results = self._tool_result_bindings(
+            endpoint, payload, parent, explicit_parent=parent_interaction_id is not None
+        )
         interaction_id = f"int_{uuid4().hex}"
         interaction = OpenAIInteraction(
             request_id=f"req_{uuid4().hex}",
@@ -554,6 +728,12 @@ class OpenAISession:
                 details={"request_id": interaction.request_id, "endpoint": endpoint},
             )
         )
+        for owner, result in results:
+            # The third-party tool already ran before this request arrived.
+            # Persist its observation before contacting the model, so a later
+            # provider timeout cannot erase completed external side effects.
+            self.record_tool_results(owner, [result])
+            self.events.append(ToolResultEvent(context=owner.context, result=result))
         return interaction
 
     def complete_request(self, interaction: OpenAIInteraction, response: Any) -> None:

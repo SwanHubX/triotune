@@ -9,10 +9,12 @@ allocation remain responsibilities of the host application.
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from ...types import AgentContractError
 from .backend import OpenAIBackend
 from .client import OpenAIClient
 from .session import OpenAISession
@@ -58,6 +60,132 @@ class OpenAIProxyServer:
         self.max_released_session_ids = max_released_session_ids
         self.sessions: dict[str, OpenAISession] = {}
         self._released_session_ids: OrderedDict[str, None] = OrderedDict()
+
+    def create_client(self, *, session: OpenAISession, **options: Any):
+        """Create a genuine AsyncOpenAI whose local transport pins session ID.
+
+        This client is suitable for third-party asynchronous agent functions:
+        they call the standard chat.completions/responses APIs without adding
+        identity headers themselves. Transport-level injection also protects
+        requests made through SDK with_options() copies: conflicting session
+        headers are rejected instead of allocating a second session.
+
+        The ASGI app is embedded in-process and never opens a network socket.
+        Only the SDK client and its local HTTP transport are owned by this
+        factory. The proxy's upstream adapter, tools, snapshots, and session
+        lifecycle remain externally owned. Closing the SDK transport cancels
+        and joins its own in-flight requests before session finalization.
+        Automatic SDK retries are disabled
+        because a failed recorded request terminalizes its session and cannot
+        be replayed as a new candidate under the same identity.
+        """
+        import httpx
+        from openai import AsyncOpenAI
+
+        if not isinstance(session, OpenAISession):
+            raise AgentContractError("A bound SDK client requires OpenAISession.")
+        session.validate_identity()
+        if self.client is None:
+            raise AgentContractError(
+                "A bound SDK client requires a forwarding adapter."
+            )
+        if len(session.session_id) > 128:
+            raise AgentContractError(
+                "Bound session IDs must contain at most 128 characters."
+            )
+        if session.status != "open" or session.released:
+            raise AgentContractError("A bound SDK client requires an open session.")
+        if {"http_client", "base_url"}.intersection(options):
+            raise AgentContractError("The bound SDK factory owns its local connection.")
+        if (
+            type(options.get("max_retries", 0)) is not int
+            or options.get("max_retries", 0) != 0
+        ):
+            raise AgentContractError("Recorded SDK clients require max_retries=0.")
+        raw_headers = options.pop("default_headers", None)
+        raw_headers = {} if raw_headers is None else raw_headers
+        if not isinstance(raw_headers, Mapping) or any(
+            not isinstance(key, str) or not key.strip() or not isinstance(value, str)
+            for key, value in raw_headers.items()
+        ):
+            raise AgentContractError(
+                "SDK default_headers must map nonempty strings to strings."
+            )
+        headers = dict(raw_headers)
+        identity_header = "x-triotune-session-id"
+        if any(
+            key.lower() == identity_header and value != session.session_id
+            for key, value in headers.items()
+        ):
+            raise AgentContractError("SDK headers conflict with the bound session.")
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() != identity_header
+        }
+        headers["X-Triotune-Session-Id"] = session.session_id
+        existing = self.sessions.get(session.session_id)
+        if existing is not None and existing is not session:
+            raise AgentContractError(
+                "Session ID is already bound to another session object."
+            )
+        if session.session_id in self._released_session_ids:
+            raise AgentContractError("A released session ID cannot be rebound.")
+        if existing is None and len(self.sessions) >= self.max_sessions:
+            raise AgentContractError("Session capacity reached.")
+
+        transport = httpx.ASGITransport(app=self.create_app())
+
+        class BoundSessionTransport(httpx.AsyncBaseTransport):
+            """Enforce identity even when per-request SDK headers override defaults."""
+
+            def __init__(self):
+                self.active = set()
+                self.closed = False
+
+            async def handle_async_request(self, request):
+                if self.closed:
+                    raise AgentContractError("The bound SDK transport is closed.")
+                session.validate_identity()
+                supplied = request.headers.get(identity_header)
+                if supplied is not None and supplied != session.session_id:
+                    raise AgentContractError(
+                        "Request attempts to switch its bound session."
+                    )
+                request.headers[identity_header] = session.session_id
+                task = asyncio.current_task()
+                self.active.add(task)
+                try:
+                    return await transport.handle_async_request(request)
+                finally:
+                    self.active.discard(task)
+
+            async def aclose(self):
+                # A third-party callback may fail while child request tasks are
+                # still active. Cancel and join only this transport's work so
+                # session finalization never leaves an orphan running record.
+                # No caller-owned upstream client or unrelated task is closed.
+                self.closed = True
+                pending = [
+                    task for task in self.active if task is not asyncio.current_task()
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                await transport.aclose()
+
+        # Reserve the exact caller-provided session before the first request.
+        # A session factory must not reconstruct its collector ExecutionContext.
+        sdk = AsyncOpenAI(
+            api_key=options.pop("api_key", "triotune-local"),
+            base_url="http://triotune.local/v1",
+            default_headers=headers,
+            http_client=httpx.AsyncClient(transport=BoundSessionTransport()),
+            **{"max_retries": 0, **options},
+        )
+        self.sessions[session.session_id] = session
+        return sdk
 
     def _session(self, session_id):
         """Resolve or allocate one session while enforcing capacity and tombstones."""

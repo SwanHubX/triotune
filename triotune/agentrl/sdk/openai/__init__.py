@@ -23,7 +23,7 @@ from .native import (
 )
 from .proxy_server import OpenAIProxyServer
 from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport
-from .workflow import OpenAIWorkflow
+from .workflow import OpenAIWorkflow, SDKRunResult
 
 __all__ = [
     "Agent",
@@ -43,5 +43,6 @@ __all__ = [
     "OpenAIWorkflow",
     "PyTRIOBackend",
     "Qwen35ToolParser",
+    "SDKRunResult",
     "function_tool",
 ]

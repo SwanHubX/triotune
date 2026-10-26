@@ -493,6 +493,34 @@ class PyTRIOBackend:
             elif "tool_call_id" in item:
                 raise AgentContractError("Only tool messages can carry tool_call_id.")
             canonical.append(message)
+        # Third-party frameworks may submit parallel tool results in completion
+        # order. OpenAI identifies them by call ID, whereas Qwen's template
+        # renders positional tool_response blocks without IDs. Canonicalize
+        # only observation order to the model's original call order; sampled
+        # assistant tokens are still copied verbatim by the continuation renderer.
+        index = 0
+        while index < len(canonical):
+            calls = canonical[index].get("tool_calls", [])
+            end = index + 1
+            if calls:
+                while end < len(canonical) and canonical[end]["role"] == "tool":
+                    end += 1
+                order = {call["id"]: position for position, call in enumerate(calls)}
+                values = canonical[index + 1 : end]
+                identities = [value["tool_call_id"] for value in values]
+                if (
+                    len(order) != len(calls)
+                    or len(set(identities)) != len(identities)
+                    or any(identity not in order for identity in identities)
+                ):
+                    raise AgentContractError(
+                        "Native observations require unique matching call IDs."
+                    )
+                canonical[index + 1 : end] = sorted(
+                    values,
+                    key=lambda value, ordering=order: ordering[value["tool_call_id"]],
+                )
+            index = end
         return canonical
 
     @staticmethod
@@ -758,18 +786,21 @@ class PyTRIOBackend:
             raise AgentContractError(
                 "Native tool results do not match parent call IDs/order."
             )
-        if parent.tool_results and [item["content"] for item in observations] != [
-            item["content"] for item in parent.tool_results
-        ]:
-            raise AgentContractError(
-                "Native continuation changed recorded tool observations."
-            )
-        if parent.tool_results and [
-            item.get("call_id") for item in parent.tool_results
-        ] != [call["id"] for call in calls]:
-            raise AgentContractError(
-                "Recorded observations have incompatible tool-call IDs."
-            )
+        if parent.tool_results:
+            recorded = {item.get("call_id"): item for item in parent.tool_results}
+            if len(recorded) != len(parent.tool_results) or set(recorded) != {
+                call["id"] for call in calls
+            }:
+                raise AgentContractError(
+                    "Recorded observations have incompatible tool-call IDs."
+                )
+            if any(
+                recorded[item["tool_call_id"]].get("content") != item["content"]
+                for item in observations
+            ):
+                raise AgentContractError(
+                    "Native continuation changed recorded tool observations."
+                )
         if parent.input_ids is None or parent.output_ids is None:
             raise AgentContractError(
                 "Native parent is missing exact sampled token evidence."

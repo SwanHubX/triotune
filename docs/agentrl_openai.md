@@ -319,6 +319,101 @@ argument. Missing values stay missing. Trace metadata therefore reports
 `trainable=False`; do not re-tokenize response text to manufacture PPO samples.
 Existing PyTRIO agent training and its exact-token exporter remain unchanged.
 
+## Standard SDK entry for third-party agents
+
+The existing `openai-proxy` extra provides the dependencies for a session-bound
+official `AsyncOpenAI` client. No `openai-agents` dependency or Triotune `Agent`
+tool loop is needed. `adapter.as_async_openai(session=session)` and
+`proxy.create_client(session=session)` both return a real `AsyncOpenAI` object;
+requests use an in-process ASGI connection and never start a listening server.
+Every request automatically uses the bound session ID, including calls through
+SDK `with_options()` copies. Conflicting session headers are rejected by the
+transport rather than creating a second conversation.
+
+For a user-defined asynchronous agent, use a client-only workflow:
+
+```python
+import json
+
+from triotune.agentrl.sdk.openai import OpenAIClient, OpenAIWorkflow
+
+
+async def run_external_agent(upstream_sdk, model, question):
+    async def execute(client, text):
+        # This is ordinary third-party SDK code, not a Triotune Agent loop.
+        messages = [{"role": "user", "content": text}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "add",
+                "description": "Add two numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                    "required": ["a", "b"],
+                    "additionalProperties": False,
+                },
+            },
+        }]
+        first = await client.chat.completions.create(
+            model=model, messages=messages, tools=tools
+        )
+        messages.append(first.choices[0].message.model_dump(exclude_none=True))
+        for call in first.choices[0].message.tool_calls or []:
+            arguments = json.loads(call.function.arguments)
+            # External frameworks retain responsibility for tool registration,
+            # argument/domain validation, retries and side-effect ownership.
+            value = arguments["a"] + arguments["b"]
+            messages.append({
+                "role": "tool", "tool_call_id": call.id, "content": str(value)
+            })
+        final = await client.chat.completions.create(
+            model=model, messages=messages, tools=tools
+        )
+        return final.choices[0].message.content
+
+    workflow = OpenAIWorkflow(client=OpenAIClient(upstream_sdk, model=model))
+    result = await workflow.run(question, execute=execute)
+    return result.output, result.export_trajectory()
+```
+
+`execute` is awaited as `execute(client, input)` and may return any result type.
+`SDKRunResult.output` preserves that value; its `session`, `session_id`, and
+`export_trajectory()` expose the same trace and delayed reward lifecycle as the
+built-in loop. `context`, `training`, and `snapshot` retain the existing
+collector identity checks. The workflow restores the outer execution context
+and finishes sessions as completed/failed/cancelled, including callback errors,
+provider failures and cancellation. Callbacks must await their request work;
+transport teardown cancels outstanding requests rather than leaving running
+interactions behind. Injected upstream SDK clients and snapshots are not closed.
+
+Subsequent Chat `tool` messages and Responses `function_call_output` items are
+captured as tool observations on their original interactions. Association uses
+call ID and verified session history, not the most recent request. Explicit
+parent references retain the external-provider delta contract. Unknown/foreign
+IDs, fabricated calls, duplicate results in one request, and conflicting result
+replays fail before forwarding; full-history echoes do not duplicate stored
+results or events. Valid observations are stored before the next provider call,
+so a later failure does not erase already executed external tool work. Only
+submitted observations are visible: the adapter cannot infer unreported side
+effects, tool latency, retries, or a domain error flag from opaque result text.
+
+The standard entry also works with a `PyTRIOBackend` adapter. Qwen observations
+received in parallel-completion order are matched by ID and rendered in the
+model's original call order while retaining the sampled token prefix unchanged.
+The native backend's full-history, snapshot, schema and sampling constraints
+remain in force; no API trace is automatically promoted to PPO data.
+
+Bound SDK clients use `max_retries=0`: a failed recorded request cannot be
+retried as a new request in a terminal session. Configure provider retry and
+timeout behavior on the upstream SDK client instead. Direct bound-client usage
+does not finish or release the session when the SDK client closes; the embedding
+application calls `session.finish()` and then submits rewards/exports/releases.
+For an existing proxy, use `proxy.create_client(session=session)` to register the
+exact collector-created session without reconstruction. The connection transport
+and base URL are factory-owned; optional SDK settings use `client_options` in
+`workflow.run(..., execute=..., client_options=...)`.
+
 ## Optional local HTTP forwarding
 
 `pip install -e '.[openai-proxy]'` additionally installs FastAPI.
