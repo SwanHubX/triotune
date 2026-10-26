@@ -10,19 +10,35 @@ changing session, reward, or PPO provenance rules.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
+import json
 import math
+import re
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 from uuid import uuid4
 
-from ...runtime.conversation import ChatTemplateRenderer
+from ...runtime.conversation import (
+    ChatTemplateRenderer,
+    NativeToolContinuationRenderer,
+    _reject_constant,
+    _unique_object,
+)
 from ...runtime.sampling import (
     PPO_TEMPERATURE,
     PPO_TOP_P,
     SamplingSnapshot,
 )
-from ...types import AgentContractError, ExecutionContext, validate_tokens
+from ...types import (
+    ActionParseError,
+    AgentAction,
+    AgentContractError,
+    ExecutionContext,
+    validate_tokens,
+)
+from .native import ModelOutput, ModelOutputParser, Qwen35ToolParser
 
 
 class OpenAIBackend(Protocol):
@@ -43,6 +59,12 @@ class OpenAIBackend(Protocol):
         method: Any | None = None,
     ) -> Any: ...
 
+    def validate_request(
+        self, endpoint: str, payload: Mapping[str, Any], *, session: Any
+    ) -> None:
+        """Validate request options before the client allocates an interaction."""
+        ...
+
     async def close(self) -> None:
         """Release resources owned by the backend implementation."""
         ...
@@ -62,6 +84,16 @@ class ExternalOpenAIBackend:
         self.client = client
         self.owns_client = owns_client
 
+    def validate_request(
+        self, endpoint: str, payload: Mapping[str, Any], *, session: Any
+    ) -> None:
+        """External SDK validation remains owned by ``OpenAIClient``."""
+        del endpoint, payload
+        if getattr(session, "sampling_source_bound", False):
+            raise AgentContractError(
+                "A fixed-policy rollout cannot switch to an external provider."
+            )
+
     async def complete(
         self,
         endpoint: str,
@@ -71,7 +103,10 @@ class ExternalOpenAIBackend:
         method: Any | None = None,
     ) -> Any:
         """Call the SDK method without blocking an asyncio event loop."""
-        del session
+        if getattr(session, "sampling_source_bound", False):
+            raise AgentContractError(
+                "A fixed-policy rollout cannot switch to an external provider."
+            )
         if method is None:
             method = (
                 self.client.chat.completions.create
@@ -143,8 +178,17 @@ def _response_messages(value: Any) -> list[dict[str, Any]]:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": item.get("arguments", ""),
-                    "name": item.get("name", ""),
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": item.get("call_id", item.get("id", "")),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", "{}"),
+                            },
+                        }
+                    ],
                 }
             )
         elif item_type == "function_call_output":
@@ -170,6 +214,11 @@ class PyTRIOBackend:
     session to carry the same snapshot and policy version, rejects sampling
     controls that would change PPO behavior-policy semantics, and never
     accepts a model name other than the one bound at construction time.
+
+    Qwen/Qwen3.5-4B selects the native XML tool adapter automatically. A local
+    alias can opt in through model_format='qwen3.5' with the matching tokenizer.
+    Unknown model formats retain the earlier text-only sampling behavior and
+    explicitly reject tools rather than treating raw calls as final answers.
     """
 
     def __init__(
@@ -179,8 +228,18 @@ class PyTRIOBackend:
         model: str,
         max_tokens: int = 256,
         renderer: Any | None = None,
+        output_parser: ModelOutputParser | None = None,
+        model_format: str | None = None,
+        template_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
-        """Bind a fixed snapshot, tokenizer renderer, model, and output budget."""
+        """Bind a fixed snapshot, tokenizer renderer, model, and output budget.
+
+        ``output_parser`` is the raw-generation interface, not an OpenAI API
+        response parser. ``template_kwargs`` supplies model-template flags such
+        as enable_thinking; generation/tokenization controls remain reserved.
+        A native tool run always uses the bound tokenizer renderer, so callers
+        cannot override its actual input IDs with arbitrary request payloads.
+        """
         if not isinstance(snapshot, SamplingSnapshot):
             raise AgentContractError("PyTRIO backend requires a SamplingSnapshot.")
         if not isinstance(model, str) or not model:
@@ -189,6 +248,29 @@ class PyTRIOBackend:
         self.model = model
         self.max_tokens = _strict_int(max_tokens, name="max_tokens", minimum=1)
         self.renderer = renderer
+        self.template_kwargs = dict(template_kwargs or {})
+        # Reuse renderer validation for reserved tokenize/generation controls.
+        ChatTemplateRenderer(snapshot.tokenizer, **self.template_kwargs)
+        if model_format not in {None, "qwen3.5"}:
+            raise AgentContractError("Unsupported model tool format.")
+        self.native_tools = (
+            model_format == "qwen3.5"
+            or model == "Qwen/Qwen3.5-4B"
+            or isinstance(output_parser, Qwen35ToolParser)
+        )
+        if self.native_tools:
+            template = getattr(snapshot.tokenizer, "chat_template", "")
+            if not isinstance(template, str) or any(
+                marker not in template
+                for marker in ("<tool_call>", "<function=", "<parameter=")
+            ):
+                raise AgentContractError(
+                    "Qwen3.5 tools require the matching tokenizer template."
+                )
+            self._native_template = template
+        self.output_parser = output_parser or (
+            Qwen35ToolParser(snapshot.tokenizer) if self.native_tools else None
+        )
         if snapshot.policy_version is None:
             raise AgentContractError(
                 "PyTRIO backend requires a snapshot with policy_version."
@@ -214,11 +296,12 @@ class PyTRIOBackend:
             raise AgentContractError(
                 "Session provenance does not match the bound PyTRIO snapshot."
             )
+        session.bind_sampling_source(snapshot=self.snapshot, model=self.model)
         return context
 
     @staticmethod
     def _validate_sampling_options(payload: Mapping[str, Any]) -> None:
-        """Keep PPO behavior sampling deterministic at temperature/top-p one.
+        """Sample the unwarped PPO behavior policy at temperature/top-p one.
 
         The existing PPO contract assumes behavior logprobs came from the
         fixed sampler configuration.  Requests that would introduce multiple
@@ -251,10 +334,12 @@ class PyTRIOBackend:
             raise AgentContractError(
                 "PyTRIO backend requires a synchronous completion."
             )
-        if "seed" in payload:
+        if payload.get("seed") is not None:
             _strict_int(payload["seed"], name="seed")
 
-    def _prompt_tokens(self, endpoint: str, payload: Mapping[str, Any]) -> list[int]:
+    def _prompt_tokens(
+        self, endpoint: str, payload: Mapping[str, Any], *, session: Any
+    ) -> list[int]:
         """Render OpenAI input with the snapshot tokenizer into exact IDs.
 
         A reserved ``_triotune_input_ids`` field supports callers that already
@@ -289,11 +374,454 @@ class PyTRIOBackend:
         tools = payload.get("tools", ()) or ()
         renderer = ChatTemplateRenderer(self.snapshot.tokenizer)
         tokens = renderer.render(messages, tools)
+        # A continuation must begin with the exact parent request and sampled
+        # output IDs. If the native tool layout cannot be represented by the
+        # tokenizer template, reject it instead of re-encoding displayed text.
         validate_tokens(tokens, name="rendered prompt")
         return tokens
 
+    @staticmethod
+    def _canonical_messages(messages):
+        """Validate supported text-only Chat messages into comparable values.
+
+        JSON argument strings and dictionaries represent the same action, but
+        multimodal content, arbitrary metadata, and missing tool-call IDs do
+        not. This normalization is for lineage comparison and template input;
+        it is never used to recover generated token IDs.
+        """
+        if not isinstance(messages, list) or not messages:
+            raise AgentContractError("Native tools require nonempty text messages.")
+        canonical = []
+        for index, item in enumerate(messages):
+            if not isinstance(item, Mapping):
+                raise AgentContractError("Native messages must be objects.")
+            # Official SDK model_dump() includes optional provider fields with
+            # None values. Omitted/null optional fields are equivalent, but a
+            # non-null audio/refusal/annotation payload is unsupported here.
+            item = {
+                key: value
+                for key, value in item.items()
+                if value is not None or key in {"role", "content"}
+            }
+            if set(item) - {
+                "role",
+                "content",
+                "reasoning_content",
+                "tool_calls",
+                "tool_call_id",
+            }:
+                raise AgentContractError("Unsupported native message layout.")
+            role = item.get("role")
+            if (
+                not isinstance(role, str)
+                or role not in {"system", "user", "assistant", "tool"}
+                or (role == "system" and index)
+            ):
+                raise AgentContractError(
+                    "Unsupported native message role or system position."
+                )
+            content = item.get("content")
+            if content is None and role == "assistant":
+                content = ""
+            if not isinstance(content, str):
+                raise AgentContractError("Native message content must be text.")
+            message = {"role": role, "content": content}
+            if role == "assistant":
+                reasoning = item.get("reasoning_content", "")
+                if not isinstance(reasoning, str):
+                    raise AgentContractError("Native reasoning_content must be text.")
+                message["reasoning_content"] = reasoning
+                if item.get("tool_calls"):
+                    calls = []
+                    for call in item["tool_calls"]:
+                        if (
+                            not isinstance(call, dict)
+                            or call.get("type") != "function"
+                            or not isinstance(call.get("id"), str)
+                            or not call["id"]
+                        ):
+                            raise AgentContractError(
+                                "Native assistant requires named function-call IDs."
+                            )
+                        function = call.get("function", {})
+                        if not isinstance(function, dict):
+                            raise AgentContractError(
+                                "Native function descriptors must be objects."
+                            )
+                        arguments = function.get("arguments")
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(
+                                    arguments,
+                                    parse_constant=_reject_constant,
+                                    object_pairs_hook=_unique_object,
+                                )
+                            except (ValueError, TypeError) as exc:
+                                raise AgentContractError(
+                                    "Invalid historical tool arguments."
+                                ) from exc
+                        if not isinstance(arguments, dict) or not isinstance(
+                            function.get("name"), str
+                        ):
+                            raise AgentContractError(
+                                "Historical tool arguments must be objects."
+                            )
+                        calls.append(
+                            {
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": function["name"],
+                                    "arguments": arguments,
+                                },
+                            }
+                        )
+                    message["tool_calls"] = calls
+            elif any(key in item for key in ("tool_calls", "reasoning_content")):
+                raise AgentContractError(
+                    "Only assistant messages can contain model actions."
+                )
+            if role == "tool":
+                if (
+                    not isinstance(item.get("tool_call_id"), str)
+                    or not item["tool_call_id"]
+                ):
+                    raise AgentContractError(
+                        "Native tool results require tool_call_id."
+                    )
+                message["tool_call_id"] = item["tool_call_id"]
+            elif "tool_call_id" in item:
+                raise AgentContractError("Only tool messages can carry tool_call_id.")
+            canonical.append(message)
+        return canonical
+
+    @staticmethod
+    def _native_tools(payload):
+        """Normalize function schemas and reject unsupported policy controls."""
+        choice = payload.get("tool_choice", "auto")
+        if choice not in ("auto", "none"):
+            raise AgentContractError(
+                "Qwen3.5 supports only tool_choice='auto' or 'none'."
+            )
+        raw = payload.get("tools", [])
+        if not isinstance(raw, (list, tuple)):
+            raise AgentContractError(
+                "Native tools must be a sequence of function schemas."
+            )
+        tools = []
+        for item in raw:
+            if not isinstance(item, Mapping) or item.get("type") != "function":
+                raise AgentContractError("Only native function tools are supported.")
+            allowed = (
+                {"type", "function"}
+                if "function" in item
+                else {"type", "name", "description", "parameters", "strict"}
+            )
+            if set(item) - allowed:
+                raise AgentContractError("Unsupported native function tool layout.")
+            function = copy.deepcopy(
+                item.get(
+                    "function",
+                    {key: value for key, value in item.items() if key != "type"},
+                )
+            )
+            if not isinstance(function, dict) or set(function) - {
+                "name",
+                "description",
+                "parameters",
+                "strict",
+            }:
+                raise AgentContractError("Unsupported native function descriptor.")
+            name = function.get("name")
+            if function.get("strict") not in (None, False):
+                raise AgentContractError(
+                    "Constrained strict tool generation is unsupported."
+                )
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z_][\w.-]*", name) is None
+            ):
+                raise AgentContractError("Native function name is invalid.")
+            schema = function.get("parameters", {})
+            if not isinstance(schema, dict) or schema.get("type") != "object":
+                raise AgentContractError(
+                    "Native function parameters must be an object schema."
+                )
+            Qwen35ToolParser.check_schema(schema)
+            function.pop("strict", None)
+            tools.append({"type": "function", "function": function})
+        if len({item["function"]["name"] for item in tools}) != len(tools):
+            raise AgentContractError("Native function names must be unique.")
+        try:
+            json.dumps(tools, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            raise AgentContractError(
+                "Native tools must contain finite JSON values."
+            ) from exc
+        return tools
+
+    def _native_messages(self, endpoint, payload):
+        """Convert full-history Responses items without losing call associations.
+
+        Incremental provider-managed state and reasoning items without an
+        inspectable summary cannot be rendered safely by this local backend.
+        Those layouts are rejected explicitly; the external OpenAI backend is
+        unaffected and continues to support its existing request contract.
+        """
+        if endpoint == "/v1/chat/completions":
+            return self._canonical_messages(payload.get("messages"))
+        if payload.get("previous_response_id") is not None:
+            raise AgentContractError(
+                "Qwen3.5 Responses requires full history, not previous_response_id."
+            )
+        value = payload.get("input")
+        if isinstance(value, str):
+            value = [{"role": "user", "content": value}]
+        if not isinstance(value, list):
+            raise AgentContractError(
+                "Native Responses input must be text or a full item list."
+            )
+        messages = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise AgentContractError(
+                    "Native Responses input items must be objects."
+                )
+            kind = item.get("type")
+            if kind is not None and not isinstance(kind, str):
+                raise AgentContractError("Native Responses item types must be strings.")
+            layouts = {
+                "message": {"type", "role", "content", "id", "status"},
+                "reasoning": {"type", "summary", "id", "status"},
+                "function_call": {
+                    "type",
+                    "name",
+                    "arguments",
+                    "call_id",
+                    "id",
+                    "status",
+                },
+                "function_call_output": {"type", "call_id", "output", "id", "status"},
+            }
+            if set(item) - layouts.get(kind or "message", set()):
+                raise AgentContractError("Unsupported native Responses item fields.")
+            role = item.get("role")
+            if (
+                isinstance(role, str)
+                and role in {"system", "user", "assistant"}
+                and kind
+                in {
+                    None,
+                    "message",
+                }
+            ):
+                content = item.get("content")
+                if isinstance(content, list):
+                    if any(
+                        not isinstance(part, dict)
+                        or part.get("type") not in {"input_text", "output_text"}
+                        or not isinstance(part.get("text"), str)
+                        for part in content
+                    ):
+                        raise AgentContractError(
+                            "Only text Responses content is supported."
+                        )
+                    content = "".join(part["text"] for part in content)
+                message = {"role": item["role"], "content": content}
+                if (
+                    messages
+                    and messages[-1]["role"] == "assistant"
+                    and item["role"] == "assistant"
+                ):
+                    messages[-1]["content"] += content
+                else:
+                    messages.append(message)
+            elif kind == "reasoning":
+                summary = item.get("summary")
+                if not isinstance(summary, list) or any(
+                    not isinstance(part, dict)
+                    or part.get("type") != "summary_text"
+                    or not isinstance(part.get("text"), str)
+                    for part in summary
+                ):
+                    raise AgentContractError(
+                        "Unsupported native Responses reasoning item."
+                    )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "".join(part["text"] for part in summary),
+                    }
+                )
+            elif kind == "function_call":
+                if not messages or messages[-1]["role"] != "assistant":
+                    messages.append({"role": "assistant", "content": ""})
+                messages[-1].setdefault("tool_calls", []).append(
+                    {
+                        "id": item.get("call_id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments"),
+                        },
+                    }
+                )
+            elif kind == "function_call_output":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id"),
+                        "content": item.get("output"),
+                    }
+                )
+            else:
+                raise AgentContractError("Unsupported native Responses item layout.")
+        if payload.get("instructions") is not None:
+            if not isinstance(payload["instructions"], str):
+                raise AgentContractError("Responses instructions must be text.")
+            messages.insert(0, {"role": "system", "content": payload["instructions"]})
+        return self._canonical_messages(messages)
+
+    def _native_prompt(self, endpoint, payload, session, *, preflight: bool = False):
+        """Verify parent messages, tools, and results before token-safe appending."""
+        if self.snapshot.tokenizer.chat_template != self._native_template:
+            raise AgentContractError("The bound native tokenizer template was changed.")
+        if self.renderer is not None or "_triotune_input_ids" in payload:
+            raise AgentContractError(
+                "Native tools require the bound tokenizer renderer."
+            )
+        messages, tools = (
+            self._native_messages(endpoint, payload),
+            self._native_tools(payload),
+        )
+        renderer = NativeToolContinuationRenderer(
+            self.snapshot.tokenizer, **self.template_kwargs
+        )
+        advertised_tools = tools if payload.get("tool_choice", "auto") == "auto" else []
+        if preflight and session.interactions:
+            # The client has not allocated this request yet, so parent lineage
+            # is intentionally resolved by OpenAISession.start_request().
+            # Validate the layout and template without guessing that parent.
+            return renderer.render(messages, advertised_tools), messages, tools
+        if not session.interactions:
+            return renderer.render(messages, advertised_tools), messages, tools
+        current = session.interactions[-1]
+        parent_id = current.parent_interaction_id
+        if parent_id is None:
+            if any(item["role"] in {"assistant", "tool"} for item in messages):
+                raise AgentContractError(
+                    "Native continuation requires a verified parent interaction."
+                )
+            return renderer.render(messages, advertised_tools), messages, tools
+        parent = session.get_interaction(parent_id)
+        evidence = parent.response.get("_triotune_sampling", {})
+        original_messages = evidence.get("model_messages")
+        original_assistant = evidence.get("assistant_message")
+        if (
+            original_messages is None
+            or original_assistant is None
+            or evidence.get("model_tools") != tools
+        ):
+            raise AgentContractError(
+                "Native parent lacks compatible model history or tool schemas."
+            )
+        if (
+            evidence.get("tool_choice", "auto") != payload.get("tool_choice", "auto")
+            or evidence.get("template_kwargs") != self.template_kwargs
+        ):
+            raise AgentContractError(
+                "Native continuation changed template or tool-choice settings."
+            )
+        index = len(original_messages)
+        if (
+            messages[:index] != original_messages
+            or len(messages) <= index
+            or messages[index] != self._canonical_messages([original_assistant])[0]
+        ):
+            raise AgentContractError(
+                "Native continuation changed the parent message prefix."
+            )
+        calls = messages[index].get("tool_calls", [])
+        observations = messages[index + 1 :]
+        if (
+            not calls
+            or len(observations) != len(calls)
+            or any(item["role"] != "tool" for item in observations)
+        ):
+            raise AgentContractError(
+                "Native continuation requires one result per parent tool call."
+            )
+        if [item["tool_call_id"] for item in observations] != [
+            call["id"] for call in calls
+        ]:
+            raise AgentContractError(
+                "Native tool results do not match parent call IDs/order."
+            )
+        if parent.tool_results and [item["content"] for item in observations] != [
+            item["content"] for item in parent.tool_results
+        ]:
+            raise AgentContractError(
+                "Native continuation changed recorded tool observations."
+            )
+        if parent.tool_results and [
+            item.get("call_id") for item in parent.tool_results
+        ] != [call["id"] for call in calls]:
+            raise AgentContractError(
+                "Recorded observations have incompatible tool-call IDs."
+            )
+        if parent.input_ids is None or parent.output_ids is None:
+            raise AgentContractError(
+                "Native parent is missing exact sampled token evidence."
+            )
+        tokens = renderer.render_after_tool(
+            messages,
+            advertised_tools,
+            assistant_index=index,
+            prompt_tokens=parent.input_ids,
+            output_tokens=parent.output_ids,
+        )
+        return tokens, messages, tools
+
+    def validate_request(
+        self, endpoint: str, payload: Mapping[str, Any], *, session: Any
+    ) -> None:
+        """Run all deterministic preflight checks before request identity allocation."""
+        if endpoint not in {"/v1/chat/completions", "/v1/responses"}:
+            raise AgentContractError(f"Unsupported OpenAI endpoint: {endpoint}.")
+        self._validate_session(session)
+        if payload.get("model") != self.model:
+            raise AgentContractError(
+                "Request model must match the model bound to the PyTRIO snapshot."
+            )
+        self._validate_sampling_options(payload)
+        stop = payload.get("stop")
+        sampler_stop = getattr(self.snapshot.sampler, "stop", None)
+        if stop is not None and stop != sampler_stop:
+            raise AgentContractError(
+                "Request stop settings must match the bound PyTRIO snapshot."
+            )
+        if not self.native_tools and (payload.get("tools") or "tool_choice" in payload):
+            raise AgentContractError(
+                "No native tool format is registered for this model."
+            )
+        if self.native_tools:
+            self._native_prompt(endpoint, payload, session, preflight=True)
+        else:
+            self._prompt_tokens(endpoint, payload, session=session)
+        self._max_tokens(endpoint, payload)
+
     def _max_tokens(self, endpoint: str, payload: Mapping[str, Any]) -> int:
         """Resolve the endpoint-specific output budget without ambiguity."""
+        unsupported = (
+            {"max_output_tokens"}
+            if endpoint == "/v1/chat/completions"
+            else {"max_tokens", "max_completion_tokens"}
+        )
+        if unsupported.intersection(payload):
+            raise AgentContractError(
+                "Output token limit does not belong to this OpenAI endpoint."
+            )
         names = (
             ("max_completion_tokens", "max_tokens")
             if endpoint == "/v1/chat/completions"
@@ -332,14 +860,42 @@ class PyTRIOBackend:
                 "Request model must match the model bound to the PyTRIO snapshot."
             )
         self._validate_sampling_options(payload)
-        prompt_tokens = self._prompt_tokens(endpoint, payload)
-        max_tokens = self._max_tokens(endpoint, payload)
-        stop = payload.get("stop")
-        sampler_stop = getattr(self.snapshot.sampler, "stop", None)
-        if stop is not None and stop != sampler_stop:
+        if not self.native_tools and (payload.get("tools") or "tool_choice" in payload):
             raise AgentContractError(
-                "Request stop settings must match the bound PyTRIO snapshot."
+                "No native tool format is registered for this model."
             )
+        if self.native_tools:
+            allowed = {
+                "model",
+                "messages",
+                "input",
+                "instructions",
+                "tools",
+                "tool_choice",
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                "seed",
+                "temperature",
+                "top_p",
+                "n",
+                "stream",
+                "background",
+                "stop",
+                "extra_headers",
+                "previous_response_id",
+                "_triotune_input_ids",
+            }
+            if set(payload) - allowed:
+                raise AgentContractError("Unsupported native tool request options.")
+        if self.native_tools:
+            prompt_tokens, model_messages, model_tools = self._native_prompt(
+                endpoint, payload, session
+            )
+        else:
+            prompt_tokens = self._prompt_tokens(endpoint, payload, session=session)
+            model_messages, model_tools = None, None
+        max_tokens = self._max_tokens(endpoint, payload)
         generation = await self.snapshot.sampler.generate(
             prompt_tokens,
             max_tokens=max_tokens,
@@ -350,6 +906,66 @@ class PyTRIOBackend:
             raise AgentContractError("Sampler exceeded the requested output budget.")
         reason = generation.stop_reason
         truncated = reason in {"length", "max_tokens", "max_length"}
+        parsed = None
+        parse_error = None
+        parse_error_type = None
+        if not truncated and self.output_parser is not None:
+            try:
+                parsed = self.output_parser.parse_generation(
+                    generation,
+                    tools=(model_tools or ())
+                    if payload.get("tool_choice", "auto") == "auto"
+                    else (),
+                    prompt_tokens=prompt_tokens,
+                )
+                if (
+                    not isinstance(parsed, ModelOutput)
+                    or parsed.generation is not generation
+                ):
+                    raise AgentContractError(
+                        "Model output parser must return ModelOutput with the original Generation."
+                    )
+                if (
+                    not isinstance(parsed.action, AgentAction)
+                    or not isinstance(parsed.assistant_message, dict)
+                    or parsed.action.assistant_message != parsed.assistant_message
+                    or not isinstance(parsed.reasoning, str)
+                    or not isinstance(parsed.raw_text, str)
+                ):
+                    raise AgentContractError(
+                        "Model parser action and presentation fields disagree."
+                    )
+                parsed.action.__post_init__()
+            except ActionParseError as exc:
+                # Return sampled evidence even when the model action is
+                # malformed. The recording client raises after committing it,
+                # ensuring failed traces retain every original token/logprob.
+                parse_error = str(exc)
+                parse_error_type = "action"
+                parsed = None
+            except AgentContractError as exc:
+                # A broken adapter is not a model-action error. Preserve the
+                # sampled evidence with a distinct error type so the recording
+                # client can reject the integration without losing the trace
+                # or presenting the malformed result as a successful answer.
+                parse_error = str(exc)
+                parse_error_type = "contract"
+                parsed = None
+        if parsed is None:
+            parsed = ModelOutput(
+                generation,
+                AgentAction(
+                    {"role": "assistant", "content": generation.text},
+                    final_text=generation.text,
+                ),
+                {"role": "assistant", "content": generation.text},
+                "",
+                self.snapshot.tokenizer.decode(
+                    list(generation.tokens), skip_special_tokens=False
+                )
+                if self.native_tools
+                else generation.text,
+            )
         evidence = {
             "input_ids": list(prompt_tokens),
             "output_ids": list(generation.tokens),
@@ -360,23 +976,46 @@ class PyTRIOBackend:
             ),
             "snapshot_id": self.snapshot.snapshot_id,
             "policy_version": self.snapshot.policy_version,
+            "raw_text": parsed.raw_text,
+            "reasoning": parsed.reasoning,
+            "parse_error": parse_error,
+            "parse_error_type": parse_error_type,
         }
+        if model_messages is not None:
+            evidence.update(
+                {
+                    "model_messages": model_messages,
+                    "assistant_message": parsed.assistant_message,
+                    "model_tools": model_tools,
+                    "template_kwargs": copy.deepcopy(self.template_kwargs),
+                    "tool_choice": payload.get("tool_choice", "auto"),
+                }
+            )
         usage = {
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generation.tokens),
             "input_tokens": len(prompt_tokens),
             "output_tokens": len(generation.tokens),
+            "total_tokens": len(prompt_tokens) + len(generation.tokens),
         }
         response_id = f"pytrio_{uuid4().hex}"
         if endpoint == "/v1/chat/completions":
             return {
                 "id": response_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
                 "model": self.model,
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": generation.text},
-                        "finish_reason": "length" if truncated else "stop",
+                        "message": (parsed.assistant_message),
+                        "finish_reason": (
+                            "length"
+                            if truncated
+                            else "tool_calls"
+                            if parsed.action.tool_calls
+                            else "stop"
+                        ),
                     }
                 ],
                 "usage": usage,
@@ -384,16 +1023,66 @@ class PyTRIOBackend:
             }
         return {
             "id": response_id,
+            "object": "response",
+            "created_at": time.time(),
             "model": self.model,
             "status": "incomplete" if truncated else "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "incomplete" if truncated else "completed",
-                    "content": [{"type": "output_text", "text": generation.text}],
-                }
-            ],
+            "output": (
+                (
+                    [
+                        {
+                            "type": "reasoning",
+                            "summary": [
+                                {"type": "summary_text", "text": parsed.reasoning}
+                            ],
+                        }
+                    ]
+                    if parsed.reasoning
+                    else []
+                )
+                + (
+                    [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": parsed.assistant_message["content"],
+                                }
+                            ],
+                        }
+                    ]
+                    if parsed.action.tool_calls and parsed.assistant_message["content"]
+                    else []
+                )
+                + (
+                    [
+                        {
+                            "type": "function_call",
+                            "call_id": call.call_id,
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        }
+                        for call in parsed.action.tool_calls
+                    ]
+                    if parsed.action.tool_calls
+                    else [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "incomplete" if truncated else "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": parsed.action.final_text or "",
+                                }
+                            ],
+                        }
+                    ]
+                )
+            ),
             "usage": usage,
             "_triotune_sampling": evidence,
         }

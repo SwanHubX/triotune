@@ -14,7 +14,12 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from ...types import AgentEvent, _execution_context
+from ...types import (
+    ActionParseError,
+    AgentContractError,
+    AgentEvent,
+    _execution_context,
+)
 from .backend import ExternalOpenAIBackend, OpenAIBackend
 from .session import OpenAISession
 
@@ -133,6 +138,9 @@ class OpenAIClient:
             if key.lower() != "x-client-request-id"
         }
         token = None
+        validate_request = getattr(self.backend, "validate_request", None)
+        if callable(validate_request):
+            validate_request(endpoint, payload, session=session)
         interaction = session.start_request(
             endpoint, payload, parent_interaction_id=parent_interaction_id
         )
@@ -144,6 +152,13 @@ class OpenAIClient:
                 endpoint, payload, session=session, method=method
             )
             session.complete_request(interaction, response)
+            if isinstance(response, dict):
+                sampling = response.get("_triotune_sampling", {})
+                error = sampling.get("parse_error")
+                if error:
+                    if sampling.get("parse_error_type") == "contract":
+                        raise AgentContractError(error)
+                    raise ActionParseError(error)
             return response
         except BaseException as exc:
             interaction.status = (

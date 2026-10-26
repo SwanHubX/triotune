@@ -73,8 +73,10 @@ class OpenAIInteraction:
 class OpenAITrajectoryExport:
     """Serializable API trace export, not an exact-token PPO ``RolloutExport``.
 
-    API usage and text logprobs do not establish the original prompt/action
-    token IDs. This trace must not be re-tokenized into behavior-policy data.
+    External API usage and text logprobs do not establish original token IDs.
+    A PyTRIO backend can retain exact arrays in interaction records, but those
+    records still require an explicit episode/trajectory exporter before PPO.
+    This trace must not be re-tokenized into fabricated behavior-policy data.
     """
 
     session_id: str
@@ -181,6 +183,10 @@ class OpenAISession:
         self._context = context
         self._identity = replace(context)
         self._training = training
+        # This in-process binding stores live source objects, never IDs or
+        # credentials in exported metadata. Labels alone cannot distinguish
+        # two clients serving different weights under the same version name.
+        self._sampling_binding: tuple[Any, ...] | None = None
         self.interactions: list[OpenAIInteraction] = []
         self.rewards: list[Any] = []
         self.events: list[AgentEvent] = []
@@ -218,6 +224,55 @@ class OpenAISession:
     def group_id(self) -> str:
         """Expose the collector group identity associated with this candidate."""
         return self.context.group_id
+
+    def bind_sampling_source(self, *, snapshot, model: str) -> None:
+        """Pin the actual sampler resources for this session's entire rollout.
+
+        Training identity is checked by the backend before binding. Repeated
+        requests may use different adapter wrappers only if the snapshot,
+        sampler, tokenizer, and underlying sampling client are the same live
+        objects. This check does not refresh weights or close trainer-owned
+        resources; immutable policy internals remain the provider's contract.
+        """
+        self.validate_identity()
+        sampler = snapshot.sampler
+        if not self.training or self.status != "open" or self.released:
+            raise AgentContractError(
+                "Sampling source binding requires an open training session."
+            )
+        if any(
+            item.input_ids is None
+            for item in self.interactions
+            if item.status != "running"
+        ):
+            raise AgentContractError(
+                "An external-provider trace cannot become a fixed-policy rollout."
+            )
+        source = (
+            snapshot,
+            sampler,
+            snapshot.tokenizer,
+            getattr(sampler, "client", None),
+            getattr(sampler, "tokenizer", None),
+        )
+        settings = (model, copy.deepcopy(getattr(sampler, "stop", None)))
+        if self._sampling_binding is None:
+            self._sampling_binding = (*source, settings)
+        elif (
+            any(
+                left is not right
+                for left, right in zip(self._sampling_binding[:-1], source, strict=True)
+            )
+            or self._sampling_binding[-1] != settings
+        ):
+            raise AgentContractError(
+                "Session sampling source changed within a rollout."
+            )
+
+    @property
+    def sampling_source_bound(self) -> bool:
+        """Indicate whether requests are pinned to live fixed-policy resources."""
+        return self._sampling_binding is not None
 
     def validate_identity(self, context: ExecutionContext | None = None) -> None:
         """Reject changed provenance before API calls, tool evidence or export.
@@ -671,6 +726,14 @@ class OpenAISession:
                 "Reward position refers to an unknown interaction."
             )
         positioned = self.interactions[index]
+        if (
+            assignment.target == "token"
+            and positioned.output_ids is not None
+            and assignment.position[1] >= len(positioned.output_ids)
+        ):
+            raise AgentContractError(
+                "Token reward offset exceeds the original sampled output."
+            )
         if explicit_target is not None and explicit_target is not positioned:
             raise AgentContractError(
                 "Reward position conflicts with its explicit target."
@@ -695,6 +758,11 @@ class OpenAISession:
         only legacy scalar submissions default to the final interaction.
         Idempotency compares both the complete reward payload and its resolved
         target, so reuse of a submission ID cannot silently move a reward.
+
+        When exact output IDs are available, token positions and dense process
+        vectors must match those arrays rather than decoded answer text or
+        provider usage counters. External traces without exact IDs preserve
+        their deferred token-validation semantics.
         """
         self._require_idle()
         if self.status != "completed" or self.released:
@@ -737,6 +805,11 @@ class OpenAISession:
                 if index >= len(self.interactions):
                     raise AgentContractError(
                         "Process reward refers to an unknown interaction."
+                    )
+                original = self.interactions[index].output_ids
+                if original is not None and len(values) != len(original):
+                    raise AgentContractError(
+                        "Process rewards must align with original sampled output tokens."
                     )
                 for offset, value in enumerate(values):
                     assignment = RewardAssignment(

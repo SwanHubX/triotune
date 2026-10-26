@@ -1,7 +1,7 @@
 """Small workflow façade for context-bound OpenAI agent executions.
 
-The workflow does not allocate rollout identities, refresh policies, or invoke
-the PyTRIO sampler.  A collector supplies those objects and this façade checks
+The workflow does not allocate rollout identities, refresh policies, or directly
+invoke a sampler. A collector supplies those objects and this façade checks
 their relationship before delegating to ``Agent``.  Keeping reward submission
 and trace export as explicit methods also makes the delayed lifecycle visible
 to callers instead of hiding it inside a request callback.
@@ -36,9 +36,11 @@ class OpenAIWorkflow:
     ) -> AgentRunResult:
         """Bind a collector candidate and optionally verify its sampling snapshot.
 
-        Snapshot validation checks provenance only. This external OpenAI
-        workflow does not invoke the snapshot sampler, implement EpisodeExecutor
-        or produce a PPO RolloutExport. Its exported trace remains untrainable.
+        The snapshot argument validates provenance only; model execution is
+        delegated to the agent's configured backend. A PyTRIO backend binds its
+        own fixed snapshot, whereas an external backend calls its provider.
+        This facade does not implement EpisodeExecutor or produce a PPO
+        RolloutExport. Its exported trace remains untrainable.
 
         Supplying ``snapshot`` turns provenance checking on: the supplied root
         context must carry the same snapshot ID and policy version, and the

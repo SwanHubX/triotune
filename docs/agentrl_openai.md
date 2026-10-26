@@ -126,9 +126,9 @@ async def record_candidate(
 
 The existing collector already creates the complete context before executor
 calls; no alternative candidate allocator is used. This SDK facade is not yet
-an `EpisodeExecutor`: the example records external API evidence for a candidate,
-not model actions sampled from PyTRIO. Snapshot validation checks identity only
-and never invokes its sampler or selects its weights. Export always retains
+an `EpisodeExecutor`: with the external backend, the example records provider
+evidence rather than PyTRIO model actions. Workflow snapshot validation checks
+identity only; model execution belongs to the configured backend. Export retains
 `trainable=False`, even when `training_context=True`. To sample through the
 current policy instead of an external provider, construct
 `PyTRIOBackend(snapshot, model=...)` and pass it to `OpenAIClient(backend=...)`.
@@ -139,6 +139,81 @@ the snapshot's `PyTRIOAgentSampler`, so the existing `call_async()` and trainer
 owned sampler lifecycle remain authoritative. The API trace remains separate
 from PPO `RolloutExport`; an exporter still must convert these records into the
 existing episode/trajectory contract before training.
+
+The first PyTRIO request pins the live snapshot, sampler, tokenizer, underlying
+client, model label, and stop settings to its session. Reusing snapshot/version
+strings does not permit swapping those resources between requests. A session
+cannot mix external-provider evidence with fixed-policy samples. Binding does
+not transfer ownership or close resources, and the trainer must still keep
+remote weights immutable throughout collection.
+
+## Qwen3.5 native tools on PyTRIO
+
+`PyTRIOBackend` selects the native adapter automatically for the project's
+`Qwen/Qwen3.5-4B`. For a local model alias, specify `model_format="qwen3.5"`;
+the bound tokenizer must still expose the Qwen3.5 tool template. Other model
+names retain text-only sampling and explicitly reject tool requests. No model
+weights or sampling clients are created by the adapter.
+
+```python
+from triotune.agentrl.sdk.openai import Agent, OpenAIClient, PyTRIOBackend
+
+
+async def run_native_candidate(snapshot, context, tools):
+    # Snapshot and candidate identity are allocated by the training owner.
+    backend = PyTRIOBackend(
+        snapshot,
+        model="Qwen/Qwen3.5-4B",
+        max_tokens=1024,
+        template_kwargs={"enable_thinking": False},
+    )
+    agent = Agent(
+        name="calculator",
+        instructions="Use the available functions to answer the question.",
+        tools=tools,
+        client=OpenAIClient(backend=backend),
+    )
+    return await agent.run("What is 2 + 3?", context=context, training=True)
+```
+
+There are two distinct parsing boundaries. `ModelOutputParser.parse_generation`
+consumes the original `Generation` and prompt IDs; `Qwen35ToolParser` implements
+the Qwen3.5 XML-style `<tool_call><function=...><parameter=...>` grammar. It
+separates reasoning (including a `<think>` opening already present in the prompt),
+function calls, and final text. `OpenAINativeActionParser` instead consumes the
+OpenAI-shaped Chat Completions/Responses objects produced after this conversion.
+Multiple calls retain their order and receive distinct call IDs. Malformed
+parameters, unknown functions, duplicate fields, and non-finite JSON numbers
+cannot reach the tool executor. Parsing failures still retain the sampled IDs,
+logprobs, raw text, stop reason, and error in the failed session trace.
+
+Scalar parameters support both JSON boolean/null spellings and the
+`True`/`False`/`None` forms emitted by Qwen's Jinja template, only when the
+declared type allows them. String fields remain literal strings. A broken
+custom parser is reported as a contract error, separately from a malformed
+model action, while preserving the already sampled arrays in either case.
+
+Messages and tool schemas are rendered with `SamplingSnapshot.tokenizer`.
+Continuation requires a verified parent, unchanged messages and tool schemas,
+the parent's actual assistant action, and one matching observation per call.
+`NativeToolContinuationRenderer` encodes only the new template/observation
+suffix, appending it to the exact parent prompt IDs and sampled output IDs.
+Neither whitespace-normalized tool calls nor display text are re-encoded to
+replace sampled actions. Noncanonical sampled BPE segmentations, reasoning, and
+returned EOS IDs therefore remain in the causal prefix. Incompatible template
+boundaries, changed histories, and mismatched tool results are rejected before
+the next sample call.
+
+The native adapter supports text-only Chat Completions and full-history
+Responses input, function tools, and `tool_choice="auto"` or `"none"`.
+Provider-managed `previous_response_id` continuation, forced/required tools,
+constrained strict generation, multimodal messages, unsupported schema keywords,
+and arbitrary request token-ID overrides are explicitly rejected on this path.
+The external OpenAI backend retains its existing provider behavior. Native
+sampling still exports an SDK trace with `trainable=False`, not an automatic
+PPO `RolloutExport`.
+
+## Session lifecycle and rewards
 
 Sessions start with status `open`. `Agent.run()` automatically finishes them
 as `completed`, `failed`, or `cancelled`, including tool failures and turn-limit
@@ -208,6 +283,13 @@ arrays. A targeted submission can alternatively specify `interaction_id`,
 must resolve to the same interaction. Non-trajectory assignments need a position
 or ID; token assignments always need a token offset. Legacy scalar submissions
 default to the final interaction.
+
+When exact PyTRIO output IDs are available, token offsets are bounded by that
+original output and `EpisodeScore.process_rewards` vectors must cover it
+exactly, including reasoning, tool syntax, and returned end markers. These
+checks occur before any reward or idempotency key is committed. External traces
+without original output IDs keep their existing deferred-validation behavior;
+reported usage counts are not treated as token-alignment evidence.
 
 `EpisodeScore` is a session-scoped submission and cannot be redirected by an
 explicit interaction/request/response ID. Its outcome (`reward`, `success`,

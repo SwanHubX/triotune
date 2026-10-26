@@ -142,6 +142,73 @@ class TokenAppendRenderer(ChatTemplateRenderer):
         return list(previous.prompt_tokens + output) + tokens[overlap:]
 
 
+class NativeToolContinuationRenderer(ChatTemplateRenderer):
+    """Append native tool observations without re-encoding sampled actions.
+
+    A native assistant action can contain reasoning and structured tool calls.
+    Re-rendering those fields would canonicalize whitespace, JSON values, and
+    token segmentation. Instead a unique placeholder replaces the whole last
+    assistant action in a template probe. Only the closing boundary and new
+    observations after that placeholder are encoded. The actual prefix always
+    comes from the recorded sampling request and its unmodified output IDs.
+
+    The caller must first verify that the message history and assistant action
+    correspond to the selected parent interaction. This helper validates the
+    tokenizer boundary, not request lineage or model tool-call syntax.
+    """
+
+    def render_after_tool(
+        self, messages, tools, *, assistant_index, prompt_tokens, output_tokens
+    ) -> list[int]:
+        """Render a suffix and check its closing marker before appending IDs."""
+        validate_tokens(prompt_tokens, name="parent prompt")
+        validate_tokens(output_tokens, name="parent output")
+        marker = "TRIOTUNE_NATIVE_ACTION_BOUNDARY_12ac69"
+        probe = copy.deepcopy(list(messages))
+        probe[assistant_index] = {
+            "role": "assistant",
+            "content": marker,
+            "reasoning_content": "",
+        }
+        kwargs = dict(self.template_kwargs)
+        if tools and self.advertise_tools:
+            kwargs["tools"] = list(tools)
+
+        def suffix(items, generation_prompt):
+            text = self.tokenizer.apply_chat_template(
+                items, tokenize=False, add_generation_prompt=generation_prompt, **kwargs
+            )
+            if not isinstance(text, str) or text.count(marker) != 1:
+                raise AgentContractError(
+                    "Native template must preserve one action boundary."
+                )
+            return text.split(marker, 1)[1]
+
+        closing = suffix(probe[: assistant_index + 1], False)
+        continuation = suffix(probe, True)
+        if not closing or not continuation.startswith(closing):
+            raise AgentContractError("Native template has no stable closing boundary.")
+        boundary = list(self.tokenizer.encode(closing, add_special_tokens=False))
+        extra = list(self.tokenizer.encode(continuation, add_special_tokens=False))
+        if not boundary or extra[: len(boundary)] != boundary:
+            raise AgentContractError(
+                "Native template boundary merges with observations."
+            )
+        # A sampled EOS may already contain all or part of the closing marker.
+        # Deduplicate only identical token IDs; decoded text is never proof of
+        # token identity, and no generated token is replaced by its encoding.
+        overlap = 0
+        for size in range(1, min(len(output_tokens), len(boundary)) + 1):
+            if tuple(boundary[:size]) == tuple(output_tokens[-size:]):
+                overlap = size
+        tokens = list(prompt_tokens) + list(output_tokens) + extra[overlap:]
+        expected = list(prompt_tokens) + list(output_tokens)
+        if tokens[: len(expected)] != expected:
+            raise AgentContractError("Native continuation changed the sampled prefix.")
+        validate_tokens(tokens, name="native continuation")
+        return tokens
+
+
 class JsonActionParser:
     """Parse {"tool_calls": [{"name": ..., "arguments": {...}}]} or {"final": ...}.
 

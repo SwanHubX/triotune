@@ -14,9 +14,12 @@ from .backend import ExternalOpenAIBackend, OpenAIBackend, PyTRIOBackend
 from .client import OpenAIClient
 from .function_tool import function_tool
 from .native import (
+    ModelOutput,
+    ModelOutputParser,
     OpenAIChatObservationFormatter,
     OpenAINativeActionParser,
     OpenAIResponsesObservationFormatter,
+    Qwen35ToolParser,
 )
 from .proxy_server import OpenAIProxyServer
 from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport
@@ -26,6 +29,8 @@ __all__ = [
     "Agent",
     "AgentRunResult",
     "ExternalOpenAIBackend",
+    "ModelOutput",
+    "ModelOutputParser",
     "OpenAIBackend",
     "OpenAIChatObservationFormatter",
     "OpenAIClient",
@@ -37,5 +42,6 @@ __all__ = [
     "OpenAITrajectoryExport",
     "OpenAIWorkflow",
     "PyTRIOBackend",
+    "Qwen35ToolParser",
     "function_tool",
 ]

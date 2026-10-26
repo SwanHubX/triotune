@@ -1537,7 +1537,9 @@ class PyTRIOBackendTests(unittest.IsolatedAsyncioTestCase):
         for options in cases:
             session = OpenAISession(context=self.context(), training=True)
             adapter = OpenAIClient(backend=backend)
-            prevalidated = options.get("stream") or options.get("n", 1) != 1
+            prevalidated = (
+                options.get("stream") or options.get("n", 1) != 1 or "stop" in options
+            )
             expected_error = ValueError if prevalidated else AgentContractError
             with self.subTest(options=options), self.assertRaises(expected_error):
                 await adapter.create_chat_completion(
@@ -1545,7 +1547,7 @@ class PyTRIOBackendTests(unittest.IsolatedAsyncioTestCase):
                     session=session,
                     **options,
                 )
-            self.assertEqual(session.status, "open" if prevalidated else "failed")
+            self.assertEqual(session.status, "open")
         mismatch = OpenAISession(
             context=self.context(snapshot_id="other"), training=True
         )
