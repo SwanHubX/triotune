@@ -96,6 +96,17 @@ class AgentConfig:
     )
     stop: str | list[str] | list[int] | None = None
     log_path: str | None = None
+    # Concat keeps the full episode in one PPO row. Individual exports one row
+    # per generated turn with all preceding actions masked as context. The
+    # latter defines independent temporal targets at explicit turn boundaries.
+    export_mode: str = "concat"
+    # None requires every requested candidate. A positive threshold allows
+    # accepted partial groups, counted by candidate rather than fragment count.
+    min_usable_group_size: int | None = None
+    # Shared generated actions are counted once by default. Repeat deliberately
+    # assigns each path copy its own loss contribution; causal evidence must
+    # still agree with the original sampled action and its conditioning prefix.
+    shared_prefix_policy: str = "deduplicate"
 
     def __post_init__(self) -> None:
         for name, cls in (
@@ -110,6 +121,12 @@ class AgentConfig:
                 raise TypeError(f"{name} must be a {cls.__name__} or mapping.")
         positive_int(self.max_concurrency, "max_concurrency")
         positive_int(self.max_refill_batches, "max_refill_batches")
+        if self.min_usable_group_size is not None:
+            positive_int(self.min_usable_group_size, "min_usable_group_size")
+        if self.export_mode not in {"concat", "individual"}:
+            raise ValueError("export_mode must be concat or individual.")
+        if self.shared_prefix_policy not in {"deduplicate", "repeat"}:
+            raise ValueError("shared_prefix_policy must be deduplicate or repeat.")
         if not isinstance(self.prompt_key, str) or not self.prompt_key.strip():
             raise ValueError("prompt_key must be a nonempty string.")
         if self.on_system_failure not in {"raise", "drop_group"}:
@@ -157,6 +174,7 @@ class AgentConfig:
     def build_workflow(self, *, tokenizer, tools, scorer, logger=None):
         """Compose the built-in JSON adapters with application tools/scoring."""
         from .diagnostics.logging import JsonlEpisodeLogger
+        from .rollout.trajectory import EpisodeTrajectoryBuilder
         from .rollout.workflow import AgentRolloutWorkflow
         from .runtime.conversation import (
             ChatTemplateRenderer,
@@ -187,7 +205,10 @@ class AgentConfig:
                 limits=self.limits,
                 retry=self.retry,
                 prompt_key=self.prompt_key,
+                trajectory_builder=EpisodeTrajectoryBuilder(mode=self.export_mode),
             ),
             max_concurrency=self.max_concurrency,
             logger=logger,
+            min_usable_group_size=self.min_usable_group_size,
+            shared_prefix_policy=self.shared_prefix_policy,
         )

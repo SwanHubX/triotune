@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 from numbers import Real
 
 
-def validate_policy_versions(trajectories: Sequence["Trajectory"]) -> None:
+def validate_policy_versions(
+    trajectories: Sequence[Trajectory],
+    *,
+    current_version: int | str | None = None,
+    max_staleness: int = 0,
+) -> None:
     """Reject a batch that combines known and unknown policy provenance.
 
     Behavior log probabilities are meaningful only relative to the policy that
@@ -22,9 +27,12 @@ def validate_policy_versions(trajectories: Sequence["Trajectory"]) -> None:
     direct legacy callers may omit provenance, but an update must not silently
     mix those two modes or combine two different versions.
     """
+    if type(max_staleness) is not int or max_staleness < 0:
+        raise ValueError("max_staleness must be a nonnegative integer.")
     versions = set()
     has_unversioned = False
     for trajectory in trajectories:
+        trajectory.__post_init__()
         version = trajectory.policy_version
         if version is None:
             has_unversioned = True
@@ -34,6 +42,20 @@ def validate_policy_versions(trajectories: Sequence["Trajectory"]) -> None:
         raise ValueError(
             "One PPO update must use one policy_version for every trajectory."
         )
+    if versions and current_version is not None:
+        version = next(iter(versions))
+        # Numeric versions support a bounded age. Opaque labels support exact
+        # equality only: ordering a checkpoint URI or external label would
+        # invent a temporal relationship that its producer never guaranteed.
+        valid = (
+            0 <= current_version - version <= max_staleness
+            if type(version) is int and type(current_version) is int
+            else version == current_version
+        )
+        if not valid:
+            raise ValueError(
+                "Stale or future policy_version cannot enter this PPO update."
+            )
 
 
 @dataclass(slots=True)
@@ -67,6 +89,43 @@ class Trajectory:
     sample_index: int | None = None
     snapshot_id: str | None = None
     policy_version: int | str | None = None
+    task_id: str | None = None
+    fragment_id: str | None = None
+    interaction_ids: tuple[str, ...] = ()
+    parent_interaction_id: str | None = None
+    # Action keys are completion-aligned (interaction ID, original token
+    # offset) pairs. Context has None. They identify shared sampled actions
+    # independently of their physical position in a branch or fragment.
+    action_keys: list[tuple[str, int] | None] | None = None
+
+    @property
+    def provenance(self) -> dict:
+        """Return a serializable source map for an ordered remote training row.
+
+        This mapping stays beside SDK datums instead of entering loss inputs,
+        where strings and identity fields have no numerical training meaning.
+        A caller can persist it with a request ID and recover the origin of
+        every row in the corresponding remote response.
+        """
+        source = {
+            name: getattr(self, name)
+            for name in (
+                "rollout_id",
+                "episode_id",
+                "group_id",
+                "sample_index",
+                "snapshot_id",
+                "policy_version",
+                "task_id",
+                "fragment_id",
+                "interaction_ids",
+                "parent_interaction_id",
+            )
+        }
+        source["action_keys"] = (
+            tuple(self.action_keys) if self.action_keys is not None else None
+        )
+        return source
 
     def __post_init__(self) -> None:
         if not self.prompt_tokens or not self.completion_tokens:
@@ -97,7 +156,14 @@ class Trajectory:
             raise ValueError(
                 "group_id must be a nonempty string identifying the prompt group."
             )
-        for name in ("rollout_id", "episode_id", "snapshot_id"):
+        for name in (
+            "rollout_id",
+            "episode_id",
+            "snapshot_id",
+            "task_id",
+            "fragment_id",
+            "parent_interaction_id",
+        ):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a nonempty string or None.")
@@ -110,7 +176,30 @@ class Trajectory:
             or not isinstance(self.policy_version, (int, str))
             or (isinstance(self.policy_version, str) and not self.policy_version)
         ):
-            raise ValueError("policy_version must be a nonempty integer/string or None.")
+            raise ValueError(
+                "policy_version must be a nonempty integer/string or None."
+            )
+        if len(set(self.interaction_ids)) != len(self.interaction_ids) or any(
+            not isinstance(value, str) or not value for value in self.interaction_ids
+        ):
+            raise ValueError("interaction_ids must contain unique nonempty strings.")
+        if self.action_keys is not None:
+            if len(self.action_keys) != n:
+                raise ValueError("action_keys must align with completion tokens.")
+            for key, active in zip(self.action_keys, self.loss_mask, strict=True):
+                if key is None:
+                    if active:
+                        raise ValueError("Every active token needs an action key.")
+                elif (
+                    not isinstance(key, tuple)
+                    or len(key) != 2
+                    or key[0] not in self.interaction_ids
+                    or type(key[1]) is not int
+                    or key[1] < 0
+                ):
+                    raise ValueError(
+                        "Action keys must identify an interaction and token offset."
+                    )
         if not math.isfinite(self.reward):
             raise ValueError("reward must be finite.")
         if not isinstance(self.reward_components, Mapping):

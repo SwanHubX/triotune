@@ -17,6 +17,22 @@ from .trajectory import PreparedBatch, Trajectory
 IGNORE_INDEX = -100
 
 
+class TrainingDatums(list):
+    """SDK rows with an ordered, local-only provenance sidecar.
+
+    The list itself is the exact payload accepted by PyTRIO. ``provenance[i]``
+    describes row i without injecting unsupported fields into SDK loss inputs.
+    The actor retains this sidecar for request/response auditing; serializing
+    the list for a remote call does not require server-side metadata support.
+    """
+
+    def __init__(self, datums, trajectories):
+        super().__init__(datums)
+        self.provenance = tuple(t.provenance for t in trajectories)
+        if len(self) != len(self.provenance):
+            raise ValueError("Datum provenance must identify every training row.")
+
+
 def build_datum(
     trajectory: Trajectory,
     mask: Sequence[bool] | None = None,
@@ -62,7 +78,7 @@ def build_datum(
 def batch_datums(batch: PreparedBatch, *, native: bool = False):
     """Materialize every prepared trajectory for one PyTRIO request."""
 
-    return [
+    return TrainingDatums([
         build_datum(
             t,
             mask,
@@ -76,7 +92,7 @@ def batch_datums(batch: PreparedBatch, *, native: bool = False):
             batch.proximal_logprobs,
             strict=True,
         )
-    ]
+    ], batch.trajectories)
 
 
 def completion_logprobs(

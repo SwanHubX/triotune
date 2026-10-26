@@ -100,7 +100,7 @@ class AgentTrainingLoop:
         snapshot = await self.snapshot_factory()
         # Hold one policy fixed across all evaluation batches so the aggregate
         # describes a single model state, even when the dataset is streamed.
-        episodes, trajectories = [], []
+        episodes, trajectories, exports, groups = [], [], [], {}
         row_offset, dropped = 0, 0
         task_ids = set()
         batch_size = config.eval_batch_size or config.batch_size
@@ -132,12 +132,14 @@ class AgentTrainingLoop:
                 )
                 episodes.extend(batch.episodes)
                 trajectories.extend(batch.trajectories)
+                exports.extend(batch.exports)
+                groups.update(batch.groups)
                 dropped += batch.dropped_groups
                 row_offset += len(batch_rows)
                 progress.update(1)
         if not episodes:
             raise ValueError("Agent evaluation dataset is empty.")
-        self.last_eval_batch = AgentRolloutBatch(episodes, trajectories, dropped)
+        self.last_eval_batch = AgentRolloutBatch(episodes, trajectories, dropped, exports=exports, groups=groups)
         metrics = self.last_eval_batch.metrics(prefix="eval/agent")
         metrics.update(
             evaluation_metrics(episodes, pass_ks=self.config.evaluation.pass_ks)
@@ -175,7 +177,7 @@ class AgentTrainingLoop:
         """
         config = self.trainer.args
         snapshot = await self.snapshot_factory()
-        episodes, accepted = [], []
+        episodes, accepted, exports, groups = [], [], [], {}
         self.last_train_snapshot = snapshot
         group_count, empty_batches, dropped, refills = 0, 0, 0, 0
         collection_count = 0
@@ -203,13 +205,16 @@ class AgentTrainingLoop:
             if config.dynamic_sampling:
                 generated = filter_agent_groups(generated)
             accepted.extend(generated)
+            accepted_ids = {t.rollout_id for t in generated}
+            exports.extend(e for e in batch.exports if e.logical_rollout_id in accepted_ids)
+            groups.update(batch.groups)
             group_count += len({t.group_id for t in generated})
             empty_batches = 0 if generated else empty_batches + 1
             if empty_batches >= config.max_empty_batches:
                 raise RuntimeError(
                     "Agent dynamic sampling found too many uninformative groups."
                 )
-        return AgentRolloutBatch(episodes, accepted, dropped, refills)
+        return AgentRolloutBatch(episodes, accepted, dropped, refills, exports, groups)
 
     async def train(self) -> PPOState:
         """Run collection, updates, configured evaluations, and final saving.

@@ -28,7 +28,6 @@ from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
-from .ppo.trajectory import PPOState, Trajectory, validate_policy_versions
 from .ppo.critic import Critic, PyTRIOCritic
 from .ppo.rollout import (
     filter_informative_groups,
@@ -36,6 +35,7 @@ from .ppo.rollout import (
     generate_rollouts,
     score_reference,
 )
+from .ppo.trajectory import PPOState, Trajectory, validate_policy_versions
 
 if TYPE_CHECKING:
     from ..agentrl.runtime.sampling import SamplingSnapshot
@@ -267,10 +267,10 @@ class PPOTrainer:
         """
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
-        await self.initialize()
         # Validate provenance before reference scoring or critic work. The
         # actor repeats this check as a defense for callers using it directly.
-        validate_policy_versions(trajectories)
+        validate_policy_versions(trajectories, current_version=self.state.global_step)
+        await self.initialize()
         initial_actor_tokens = self._actor.train_tokens
         initial_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
         start = time.perf_counter()
@@ -310,7 +310,12 @@ class PPOTrainer:
         total_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
         actor_tokens = total_actor_tokens - initial_actor_tokens
         critic_tokens = total_critic_tokens - initial_critic_tokens
-        rewards = [t.reward for t in trajectories]
+        # Outcome statistics describe logical candidates; token usage and
+        # physical trajectory counts continue to describe actual remote work.
+        logical = {
+            t.rollout_id or ("row", i): t for i, t in enumerate(trajectories)
+        }
+        rewards = [t.reward for t in logical.values()]
         active_logprobs = [
             logprob
             for trajectory in batch.trajectories
@@ -335,12 +340,12 @@ class PPOTrainer:
         reward_components = {
             name: [
                 trajectory.reward_components[name]
-                for trajectory in trajectories
+                for trajectory in logical.values()
                 if name in trajectory.reward_components
             ]
             for name in {
                 name
-                for trajectory in trajectories
+                for trajectory in logical.values()
                 for name in trajectory.reward_components
             }
         }
@@ -385,6 +390,7 @@ class PPOTrainer:
                     np.mean([t.truncated for t in trajectories])
                 ),
                 "train/trajectories": float(len(trajectories)),
+                "train/logical_rollouts": float(len(logical)),
                 "train/action_tokens": float(sum(sum(mask) for mask in batch.masks)),
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
                 "train/optimizer_steps": float(self.state.optimizer_steps),

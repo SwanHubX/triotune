@@ -91,6 +91,11 @@ class FunctionToolExecutor:
         raised inside the function are system failures unless the function
         explicitly uses ToolActionError. This avoids hiding implementation bugs
         as ordinary task mistakes. Cancellation continues to propagate.
+
+        Tool implementations can read current_execution_context() to obtain
+        trusted candidate and interaction identity. asyncio.to_thread preserves
+        that context for synchronous functions, so model arguments never need
+        to carry session IDs or other execution authority.
         """
         try:
             tool = self._tools.get(call.name)

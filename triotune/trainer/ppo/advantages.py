@@ -7,8 +7,8 @@ from collections.abc import Sequence
 import numpy as np
 
 from ...api.cli_args import NormConfig, PPOConfig
-from .trajectory import PreparedBatch, Trajectory
 from .gae import compute_gae
+from .trajectory import PreparedBatch, Trajectory
 
 
 def normalize(
@@ -88,25 +88,53 @@ def prepare_advantages(
     if not trajectories:
         raise ValueError("An update requires at least one trajectory.")
     group_ids = [trajectory.group_id for trajectory in trajectories]
-    rewards = []
+    rewards, reward_groups, reward_indices = [], [], {}
+    row_indices = []
     masks = []
-    for trajectory in trajectories:
+    action_counts = defaultdict(int)
+    for index, trajectory in enumerate(trajectories):
+        key = (
+            ("rollout", trajectory.rollout_id)
+            if trajectory.rollout_id
+            else ("row", index)
+        )
+        action_counts[key] += sum(trajectory.loss_mask)
+    references = {}
+    for index, trajectory in enumerate(trajectories):
+        key = (
+            ("rollout", trajectory.rollout_id)
+            if trajectory.rollout_id
+            else ("row", index)
+        )
         reward = trajectory.reward
+        reference = (trajectory.group_id, reward)
+        if key in references and references[key] != reference:
+            raise ValueError(
+                "Fragments of one rollout must share group and outcome reward."
+            )
+        references[key] = reference
         if config.overlong_tokens:
             excess = max(
                 0,
-                sum(trajectory.loss_mask)
-                - (config.max_tokens - config.overlong_tokens),
+                action_counts[key] - (config.max_tokens - config.overlong_tokens),
             )
             reward -= (
                 min(1.0, excess / config.overlong_tokens)
                 * config.overlong_penalty_factor
             )
         reward = (reward + config.reward_bias) * config.reward_scaling
-        rewards.append([max(-config.reward_clip, min(config.reward_clip, reward))])
+        # A logical candidate contributes one normalization observation even
+        # when it exports several rows. Leave-one-out baselines therefore
+        # exclude the candidate, not an arbitrary physical fragment of it.
+        if key not in reward_indices:
+            reward_indices[key] = len(rewards)
+            rewards.append([max(-config.reward_clip, min(config.reward_clip, reward))])
+            reward_groups.append(trajectory.group_id)
+        row_indices.append(reward_indices[key])
         masks.append(list(trajectory.loss_mask))
 
-    outcome_scores = normalize(rewards, group_ids, config.reward_norm)
+    normalized = normalize(rewards, reward_groups, config.reward_norm)
+    outcome_scores = [normalized[index] for index in row_indices]
     advantages, returns = [], []
     for trajectory, score, mask in zip(
         trajectories, outcome_scores, masks, strict=True
@@ -118,8 +146,7 @@ def prepare_advantages(
         if config.kl_ctl and trajectory.reference_logprobs is None:
             raise ValueError("kl_ctl > 0 requires fixed-reference completion logprobs.")
         # Keep task/process rewards separate from policy-reference KL.  Token
-        # GAE consumes both signals exactly as before.  Turn GAE follows
-        # AReaL's macro-timestep design: task rewards participate in the turn
+        # GAE consumes both signals at active tokens. Task rewards enter the turn
         # recurrence, while KL remains a token-local actor penalty and never
         # enters the critic's turn-level return target.
         task_rewards = (
@@ -134,8 +161,7 @@ def prepare_advantages(
         for index, active in enumerate(mask):
             if active and config.kl_ctl:
                 log_ratio = (
-                    trajectory.logprobs[index]
-                    - trajectory.reference_logprobs[index]
+                    trajectory.logprobs[index] - trajectory.reference_logprobs[index]
                 )
                 kl = (
                     log_ratio
@@ -156,9 +182,7 @@ def prepare_advantages(
         )
         adv, ret = compute_gae(
             gae_rewards,
-            trajectory.values
-            if config.use_critic
-            else [0.0] * (len(mask) + 1),
+            trajectory.values if config.use_critic else [0.0] * (len(mask) + 1),
             mask,
             discount=config.discount,
             gae_lambda=config.gae_lambda,

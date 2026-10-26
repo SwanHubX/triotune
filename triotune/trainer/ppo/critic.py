@@ -17,9 +17,8 @@ from ...api.client_api import call_async, optimizer_params
 from ...utils.checkpoint import save_checkpoint_async
 from ...utils.datums import materialize_datum
 from ...utils.token_usage import compute_train_tokens
+from .datum import IGNORE_INDEX, TrainingDatums
 from .trajectory import Trajectory
-from .datum import IGNORE_INDEX
-
 
 # ---------------------------------------------------------------------------
 # Marker-based value readout and clipped value objective
@@ -45,7 +44,7 @@ def critic_datums(trajectories, token_ids):
                     tokens, {"target_tokens": np.asarray(labels, dtype=np.int32)}
                 )
             )
-    return rows
+    return TrainingDatums(rows, [t for t in trajectories for _ in token_ids])
 
 
 def values_from_logprobs(logprobs, trajectories, config):
@@ -220,6 +219,7 @@ class PyTRIOCritic:
         self.optimizer_steps = 0
         self.train_tokens = 0
         self.checkpoint_path = None
+        self.datum_provenance: tuple[dict, ...] = ()
 
     async def compute_values(self, trajectories):
         """Read one causal T+1 value row per trajectory from remote logprobs."""
@@ -231,6 +231,7 @@ class PyTRIOCritic:
         for t in trajectories:
             t.__post_init__()
         data = critic_datums(trajectories, self.token_ids)
+        self.datum_provenance = data.provenance
         result = await call_async(
             self.client,
             "forward",
@@ -279,6 +280,7 @@ class PyTRIOCritic:
         rows = []
         for _ in range(self.config.critic_update_epochs):
             for data, loss_fn in chunks:
+                self.datum_provenance = data.provenance
                 result = await call_async(
                     self.client, "forward_backward_custom", data, loss_fn=loss_fn
                 )

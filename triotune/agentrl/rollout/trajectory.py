@@ -8,8 +8,10 @@ markers remain visible as context but are excluded from policy optimization.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ...trainer.ppo.trajectory import Trajectory
-from ..types import AgentContractError, EpisodeResult
+from ..types import AgentContractError, EpisodeResult, RolloutExport
 
 
 class EpisodeTrajectoryBuilder:
@@ -19,6 +21,79 @@ class EpisodeTrajectoryBuilder:
     Re-rendering that changes any previous token is rejected, never repaired by
     re-tokenizing text or attaching behavior scores to different tokens.
     """
+
+    def __init__(self, *, mode: str = "concat"):
+        """Choose whole-episode or disjoint per-turn training rows.
+
+        Individual rows retain the initial prompt and all preceding tokens as
+        masked context. Only the selected turn is active. This keeps group
+        prompts identical and avoids training shared history repeatedly.
+        Each turn receives the candidate outcome and its own process rewards;
+        GAE runs independently within each row. This is an explicit temporal
+        objective and need not equal concatenated GAE when discount, lambda,
+        dense rewards, or critic bootstrap differ across turn boundaries.
+        """
+        if mode not in {"concat", "individual"}:
+            raise ValueError("Export mode must be concat or individual.")
+        self.mode = mode
+
+    def export(self, episode: EpisodeResult) -> RolloutExport:
+        """Export a candidate with stable fragment-to-interaction mapping.
+
+        Outcome normalization uses one reference reward per logical rollout,
+        regardless of its fragment count. Repeated context carries no active
+        action mask; the collector additionally checks action keys for custom
+        exporters that provide overlapping paths or branching trajectories.
+        """
+        whole = self.build(episode)
+        if self.mode == "concat":
+            rows = [whole]
+        else:
+            rows = []
+            for index in range(len(whole.interaction_ids)):
+                end = (
+                    max(i for i, turn in enumerate(whole.turn_ids) if turn == index) + 1
+                )
+                mask = [turn == index for turn in whole.turn_ids[:end]]
+                rows.append(
+                    replace(
+                        whole,
+                        completion_tokens=whole.completion_tokens[:end],
+                        logprobs=whole.logprobs[:end],
+                        loss_mask=mask,
+                        turn_ids=[index if active else -1 for active in mask],
+                        token_rewards=(
+                            [
+                                value if active else 0.0
+                                for value, active in zip(
+                                    whole.token_rewards[:end], mask, strict=True
+                                )
+                            ]
+                            if whole.token_rewards is not None
+                            else None
+                        ),
+                        fragment_id=f"{whole.rollout_id}:turn:{index}",
+                        interaction_ids=whole.interaction_ids[: index + 1],
+                        parent_interaction_id=(
+                            whole.interaction_ids[index - 1] if index else None
+                        ),
+                        action_keys=whole.action_keys[:end],
+                        truncated=whole.truncated
+                        if index == len(episode.turns) - 1
+                        else False,
+                    )
+                )
+        return RolloutExport(
+            trajectories=rows,
+            logical_rollout_id=whole.rollout_id,
+            fragment_map={row.fragment_id: row.interaction_ids for row in rows},
+            group_id=whole.group_id,
+            metadata={
+                "mode": self.mode,
+                "outcome_scope": "rollout",
+                "shared_prefix": "context_only",
+            },
+        )
 
     def validate_prefix(self, episode: EpisodeResult, prompt_tokens: list[int]) -> None:
         """Reject a next request that changes any previously sampled token.
@@ -47,11 +122,19 @@ class EpisodeTrajectoryBuilder:
             raise AgentContractError(
                 "Only scored episodes with model actions can be trained."
             )
+        episode.__post_init__()
+        interaction_ids = tuple(
+            interaction.interaction_id
+            for interaction in episode.interactions
+            if interaction.turn is not None
+        ) or tuple(f"{episode.episode_id}:turn:{i}" for i in range(len(episode.turns)))
+        if len(interaction_ids) != len(episode.turns):
+            raise AgentContractError("Interactions must identify every generated turn.")
         initial = list(episode.turns[0].prompt_tokens)
         # Track the complete serialized sequence while extending arrays only
         # for positions after the initial prompt, as required by Trajectory.
         full = initial.copy()
-        logprobs, masks, turns, process_rewards = [], [], [], []
+        logprobs, masks, turns, process_rewards, action_keys = [], [], [], [], []
         score = episode.score
         if any(index >= len(episode.turns) for index in score.process_rewards):
             raise AgentContractError("Process rewards refer to an unknown turn.")
@@ -69,6 +152,7 @@ class EpisodeTrajectoryBuilder:
             masks.extend([False] * len(gap))
             turns.extend([-1] * len(gap))
             process_rewards.extend([0.0] * len(gap))
+            action_keys.extend([None] * len(gap))
             generation = turn.generation
             # Missing process scores mean no extra process reward for this
             # turn. A supplied vector must cover its original output, including
@@ -83,6 +167,9 @@ class EpisodeTrajectoryBuilder:
             masks.extend([True] * len(generation.tokens))
             turns.extend([index] * len(generation.tokens))
             process_rewards.extend(rewards)
+            action_keys.extend(
+                (interaction_ids[index], i) for i in range(len(generation.tokens))
+            )
         # Keep the terminal task score separate from dense process rewards;
         # existing PPO advantage preparation combines them at the right places.
         return Trajectory(
@@ -96,9 +183,13 @@ class EpisodeTrajectoryBuilder:
             token_rewards=process_rewards if score.process_rewards else None,
             truncated=episode.status in {"max_turns", "token_limit", "context_limit"},
             reward_components={**score.components, "success": float(score.success)},
-            rollout_id=episode.rollout_id,
+            rollout_id=episode.rollout_id or episode.episode_id,
             episode_id=episode.episode_id,
             sample_index=episode.sample_index,
             snapshot_id=episode.snapshot_id,
             policy_version=episode.policy_version,
+            task_id=episode.task_id,
+            fragment_id=f"{episode.rollout_id or episode.episode_id}:concat",
+            interaction_ids=interaction_ids,
+            action_keys=action_keys,
         )

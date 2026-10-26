@@ -13,9 +13,9 @@ from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
 from ...utils.token_usage import compute_train_tokens
 from .advantages import prepare_advantages
-from .trajectory import PreparedBatch, Trajectory, validate_policy_versions
 from .datum import batch_datums, build_datum, completion_logprobs
 from .loss import make_loss_fn
+from .trajectory import PreparedBatch, Trajectory, validate_policy_versions
 
 
 def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
@@ -116,6 +116,7 @@ class PPOActor:
         self.client, self.config = client, config
         self.optimizer_steps = 0
         self.train_tokens = 0
+        self.datum_provenance: tuple[dict, ...] = ()
 
     async def prepare(self, trajectories: list[Trajectory]) -> PreparedBatch:
         """Recompute optional proximal scores and freeze one actor update batch."""
@@ -168,6 +169,7 @@ class PPOActor:
         for _ in range(config.update_epochs):
             for chunk in chunks:
                 data = batch_datums(chunk, native=config.loss_backend == "native")
+                self.datum_provenance = data.provenance
                 if config.loss_backend == "native":
                     result = await call_async(
                         self.client,
@@ -232,7 +234,11 @@ class PPOActor:
                 row["_loss_weight"] = float(
                     row["train/action_tokens"]
                     if config.loss_aggregation == "token_mean"
-                    else sum(any(mask) for mask in chunk.masks)
+                    else len({
+                        t.rollout_id or ("row", i)
+                        for i, (t, mask) in enumerate(zip(chunk.trajectories, chunk.masks, strict=True))
+                        if any(mask)
+                    })
                     if config.loss_aggregation in {"seq_mean", "constant"}
                     else 1.0
                 )

@@ -60,7 +60,7 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([item[2] for item in observed], [0, 1, 2])
-        self.assertEqual(len({item[0] for item in observed}), 1)
+        self.assertEqual(len({item[0] for item in observed}), 3)
         self.assertEqual(len({item[1] for item in observed}), 1)
         self.assertNotEqual(observed[0][0], observed[0][1])
         self.assertEqual({item[3] for item in observed}, {"snapshot-0"})

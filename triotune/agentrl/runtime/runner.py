@@ -13,6 +13,7 @@ import asyncio
 import copy
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import partial
 from typing import Any
 from uuid import uuid4
@@ -20,24 +21,32 @@ from uuid import uuid4
 from pytrio import PyTrioError
 
 from ..config import RetryPolicy
+from ..rollout.trajectory import EpisodeTrajectoryBuilder
 from ..types import (
     SYSTEM_STATUSES,
     ActionParseError,
     ActionParser,
     AgentContractError,
+    AgentEvent,
     AgentTurn,
     ConversationRenderer,
     EpisodeLimits,
     EpisodeResult,
     EpisodeScorer,
+    ExecutionContext,
+    GenerationEvent,
+    Interaction,
     ObservationFormatter,
     RetryEvent,
+    RewardEvent,
+    ToolCallEvent,
     ToolExecutor,
+    ToolResultEvent,
     ToolSystemError,
     TrajectoryExporter,
+    _execution_context,
     validate_tokens,
 )
-from ..rollout.trajectory import EpisodeTrajectoryBuilder
 from .sampling import SamplingSnapshot
 
 
@@ -100,6 +109,20 @@ class EpisodeRunner:
                         stage, turn, attempt, type(exc).__name__, str(exc), again
                     )
                 )
+                episode.events.append(
+                    AgentEvent(
+                        context=_execution_context.get(),
+                        kind="retry",
+                        status="retrying" if again else "exhausted",
+                        details={
+                            "stage": stage,
+                            "turn": turn,
+                            "attempt": attempt,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                )
                 if not again:
                     raise
                 await asyncio.sleep(self.retry.delay(attempt))
@@ -112,6 +135,7 @@ class EpisodeRunner:
         group_id: str,
         rollout_id: str | None = None,
         sample_index: int = 0,
+        context: ExecutionContext | None = None,
         seed: int | None = None,
         is_eval: bool = False,
     ) -> EpisodeResult:
@@ -124,6 +148,8 @@ class EpisodeRunner:
             rollout_id: Identity of the logical task execution. It may later
                 produce more than one physical training row.
             sample_index: Candidate index within the logical rollout group.
+            context: Collector-owned immutable identity shared with adapters.
+                Direct callers can omit it to create a standalone candidate.
             seed: First turn's seed; following turns increment this value.
             is_eval: Provenance flag stored in the returned episode.
 
@@ -133,21 +159,44 @@ class EpisodeRunner:
         """
         from .conversation import ChatTemplateRenderer
 
-        if rollout_id is None:
-            # Direct runner callers historically supplied only ``group_id``.
-            # Using it as the fallback keeps those integrations valid while
-            # making the distinction explicit for collector-owned executions.
-            rollout_id = group_id
+        if context is None:
+            context = ExecutionContext(
+                rollout_id=rollout_id or uuid4().hex,
+                episode_id=uuid4().hex,
+                group_id=group_id,
+                sample_index=sample_index,
+                group_size=sample_index + 1,
+                snapshot_id=snapshot.snapshot_id,
+                policy_version=snapshot.policy_version,
+                task_id=str(row["task_id"]) if "task_id" in row else None,
+            )
+        if (
+            context.group_id != group_id
+            or context.sample_index != sample_index
+            or context.snapshot_id != snapshot.snapshot_id
+            or context.policy_version != snapshot.policy_version
+            or context.interaction_id is not None
+            or rollout_id is not None
+            and context.rollout_id != rollout_id
+        ):
+            raise AgentContractError(
+                "Execution context does not match the supplied candidate."
+            )
         episode = EpisodeResult(
-            uuid4().hex,
+            context.episode_id,
             group_id,
             snapshot.snapshot_id,
             is_eval,
-            rollout_id=rollout_id,
+            rollout_id=context.rollout_id,
             policy_version=snapshot.policy_version,
             sample_index=sample_index,
+            context=context,
+            task_id=context.task_id,
         )
-        episode.task_id = str(row["task_id"]) if "task_id" in row else None
+        # Context remains task-local across awaits and synchronous adapters
+        # dispatched through asyncio.to_thread. The matching reset in finally
+        # prevents identities from leaking into the next candidate or caller.
+        context_token = _execution_context.set(context)
         started = time.perf_counter()
         try:
             async with asyncio.timeout(self.limits.episode_timeout):
@@ -167,6 +216,7 @@ class EpisodeRunner:
                     )
                 renderer = self.renderer or ChatTemplateRenderer(snapshot.tokenizer)
                 await self._execute(episode, messages, snapshot, renderer, seed)
+                _execution_context.set(context)
                 if episode.status not in SYSTEM_STATUSES:
                     # Invalid actions and budget exits can still carry useful
                     # negative task signals. Infrastructure failures cannot.
@@ -183,9 +233,28 @@ class EpisodeRunner:
                             raise AgentContractError(
                                 "An unfinished episode cannot be scored successful."
                             )
+                        for index, interaction in enumerate(episode.interactions):
+                            interaction.reward = (
+                                episode.score.reward
+                                if index == len(episode.interactions) - 1
+                                else 0.0
+                            )
+                            interaction.process_rewards = (
+                                episode.score.process_rewards.get(index, ())
+                            )
+                            episode.events.append(
+                                RewardEvent(
+                                    context=interaction.context,
+                                    reward=interaction.reward,
+                                    process_rewards=interaction.process_rewards,
+                                )
+                            )
                     except Exception as exc:  # noqa: BLE001 -- isolate arbitrary scorer implementations
                         episode.status, episode.error = "scoring_failure", str(exc)
                         episode.score = None
+        except asyncio.CancelledError:
+            episode.status, episode.score = "cancelled", None
+            raise
         except TimeoutError:
             episode.status, episode.error = (
                 "timeout",
@@ -203,6 +272,15 @@ class EpisodeRunner:
             )
         finally:
             episode.elapsed_seconds = time.perf_counter() - started
+            episode.events.append(
+                AgentEvent(
+                    context=context,
+                    kind="episode_end",
+                    status=episode.status,
+                    latency=episode.elapsed_seconds,
+                )
+            )
+            _execution_context.reset(context_token)
         return episode
 
     async def _execute(self, episode, messages, snapshot, renderer, seed) -> None:
@@ -237,69 +315,168 @@ class EpisodeRunner:
                 episode.status = "token_limit"
                 return
             budget = min(limits.max_tokens_per_turn, remaining, context_budget)
+            context = replace(
+                episode.context,
+                interaction_id=uuid4().hex,
+                parent_interaction_id=(
+                    episode.interactions[-1].interaction_id
+                    if episode.interactions
+                    else None
+                ),
+            )
+            interaction = Interaction(
+                context=context,
+                input_token_span=(0, len(prompt_tokens)),
+                resource_owner=context.resource_owner,
+            )
+            episode.interactions.append(interaction)
+            context_token = _execution_context.set(context)
+            started = time.perf_counter()
             try:
-                generation = await self._operation(
+                await self._execute_turn(
                     episode,
-                    "sampling",
+                    interaction,
+                    messages,
+                    snapshot,
+                    prompt_tokens,
+                    budget,
+                    None if seed is None else seed + index,
                     index,
-                    partial(
-                        snapshot.sampler.generate,
-                        prompt_tokens,
-                        max_tokens=budget,
-                        seed=None if seed is None else seed + index,
-                    ),
-                    timeout=limits.sampling_timeout,
                 )
-            except (AgentContractError, TimeoutError):
+            except BaseException as exc:
+                # Cancellation has no task reward. Its evidence remains
+                # available without converting it into a model-side failure.
+                interaction.status = (
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "tool_failure"
+                    if isinstance(exc, ToolSystemError)
+                    else "contract_error"
+                )
                 raise
-            except Exception as exc:  # noqa: BLE001 -- classify errors from arbitrary sampling clients
-                episode.status, episode.error = "sampling_failure", str(exc)
-                return
-            generation.__post_init__()
-            if len(generation.tokens) > budget:
-                raise AgentContractError(
-                    "Sampler exceeded the requested output budget."
-                )
-            turn = AgentTurn(tuple(prompt_tokens), generation)
-            episode.turns.append(turn)
-            generated_tokens += len(generation.tokens)
-            if generation.stop_reason in {"length", "max_tokens", "max_length"}:
-                # An unfinished tool action must not be executed. Its original
-                # output remains recorded for truncated-trajectory handling.
-                episode.status = "token_limit"
-                return
-            try:
-                turn.action = self.parser.parse(generation)
-                turn.action.__post_init__()
-            except ActionParseError as exc:
-                episode.status, episode.error = "invalid_action", str(exc)
-                return
-            messages.append(turn.action.assistant_message)
-            if turn.action.final_text is not None:
-                episode.status, episode.final_text = "completed", turn.action.final_text
-                return
-            for call in turn.action.tool_calls:
-                # Preserve call order within a turn. Cross-episode concurrency
-                # is managed by the collector, not by parallelizing tool side
-                # effects inside a single agent decision.
-                result = await self._operation(
-                    episode,
-                    "tool",
-                    index,
-                    partial(self.tools.execute, call),
-                    timeout=limits.tool_timeout,
-                    retry_safe=self.retry.retry_tools
-                    and bool(
-                        getattr(self.tools, "is_retry_safe", lambda call: False)(call)
-                    ),
-                )
-                result.__post_init__()
-                if result.call_id != call.call_id or result.name != call.name:
-                    raise AgentContractError(
-                        "Tool result does not match its requested call."
+            finally:
+                interaction.latency = time.perf_counter() - started
+                interaction.retries = [r for r in episode.retries if r.turn == index]
+                episode.events.append(
+                    AgentEvent(
+                        context=context,
+                        kind="interaction_end",
+                        status=interaction.status,
+                        latency=interaction.latency,
                     )
-                turn.tool_results.append(result)
-            messages.extend(self.observations.format(turn.tool_results))
-        # Exhaustion after tool feedback is distinct from receiving a final
-        # answer, even if a tool happened to produce the correct task result.
+                )
+                _execution_context.reset(context_token)
+            if interaction.turn is not None:
+                generated_tokens += len(interaction.turn.generation.tokens)
+            if interaction.status != "tool_results":
+                return
+        # A tool observation alone does not terminate a task successfully.
         episode.status = "max_turns"
+
+    async def _execute_turn(
+        self,
+        episode,
+        interaction,
+        messages,
+        snapshot,
+        prompt_tokens,
+        budget,
+        seed,
+        index,
+    ):
+        """Execute one request while retaining partial evidence on every exit.
+
+        The interaction exists before sampling, so timeouts and backend failures
+        have identities even when no generation is available. Successful output
+        is added to the episode's training turns before parsing. A malformed
+        action therefore remains a scoreable model failure rather than being
+        mistaken for missing infrastructure data.
+        """
+        limits = self.limits
+        context = interaction.context
+        started = time.perf_counter()
+        try:
+            generation = await self._operation(
+                episode,
+                "sampling",
+                index,
+                partial(
+                    snapshot.sampler.generate,
+                    prompt_tokens,
+                    max_tokens=budget,
+                    seed=seed,
+                ),
+                timeout=limits.sampling_timeout,
+            )
+        except (AgentContractError, TimeoutError):
+            raise
+        except Exception as exc:  # noqa: BLE001 -- classify sampling adapter failures
+            episode.status, episode.error = "sampling_failure", str(exc)
+            interaction.status = "sampling_failure"
+            return
+        generation.__post_init__()
+        if len(generation.tokens) > budget:
+            raise AgentContractError("Sampler exceeded the requested output budget.")
+        turn = AgentTurn(tuple(prompt_tokens), generation)
+        interaction.turn = turn
+        interaction.output_token_span = (
+            len(prompt_tokens),
+            len(prompt_tokens) + len(generation.tokens),
+        )
+        episode.turns.append(turn)
+        episode.events.append(
+            GenerationEvent(
+                context=context,
+                generation=generation,
+                latency=time.perf_counter() - started,
+            )
+        )
+        if generation.stop_reason in {"length", "max_tokens", "max_length"}:
+            episode.status = interaction.status = "token_limit"
+            return
+        try:
+            turn.action = self.parser.parse(generation)
+            turn.action.__post_init__()
+        except ActionParseError as exc:
+            episode.status, episode.error = "invalid_action", str(exc)
+            interaction.status = "invalid_action"
+            return
+        messages.append(turn.action.assistant_message)
+        if turn.action.final_text is not None:
+            episode.status, episode.final_text = "completed", turn.action.final_text
+            interaction.status = "completed"
+            return
+        for call in turn.action.tool_calls:
+            episode.events.append(
+                ToolCallEvent(context=context, call=call, status="requested")
+            )
+            started = time.perf_counter()
+            result = await self._operation(
+                episode,
+                "tool",
+                index,
+                partial(self.tools.execute, call),
+                timeout=limits.tool_timeout,
+                retry_safe=self.retry.retry_tools
+                and bool(
+                    getattr(self.tools, "is_retry_safe", lambda call: False)(call)
+                ),
+            )
+            result.__post_init__()
+            if result.call_id != call.call_id or result.name != call.name:
+                raise AgentContractError(
+                    "Tool result does not match its requested call."
+                )
+            turn.tool_results.append(result)
+            episode.events.append(
+                ToolResultEvent(
+                    context=context,
+                    result=result,
+                    latency=time.perf_counter() - started,
+                    status="action_error" if result.is_error else "completed",
+                )
+            )
+        messages.extend(self.observations.format(turn.tool_results))
+        interaction.status = "tool_results"
