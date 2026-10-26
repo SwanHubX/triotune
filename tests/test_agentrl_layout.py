@@ -20,7 +20,7 @@ class AgentRLLayoutTests(unittest.TestCase):
         )
         self.assertEqual(
             {path.parent.name for path in PACKAGE.glob("*/__init__.py")},
-            {"runtime", "rollout", "training", "diagnostics"},
+            {"runtime", "rollout", "training", "diagnostics", "sdk"},
         )
         self.assertFalse((ROOT / "triotune" / "agent").exists())
 
@@ -60,6 +60,7 @@ class AgentRLLayoutTests(unittest.TestCase):
             "training.evaluation": ("evaluation_metrics", "paired_task_metrics"),
             "diagnostics.logging": ("JsonlEpisodeLogger",),
             "diagnostics.validation": ("probe_tokenizer",),
+            "sdk.openai": ("Agent", "OpenAIClient", "OpenAISession", "function_tool"),
         }
         self.assertEqual(len(agentrl.__all__), len(set(agentrl.__all__)))
         for suffix, names in modules.items():

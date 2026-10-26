@@ -1,5 +1,9 @@
 # Agent execution and training data
 
+For inference with the optional OpenAI SDK and registered local tools, see
+[OpenAI SDK tools and sessions](agentrl_openai.md). Its API traces are separate
+from the exact-token PPO trajectory contracts described here.
+
 ## Candidate identity
 
 `ExecutionContext` contains immutable rollout, episode, group, candidate,

@@ -16,6 +16,8 @@ dependencies = [
 [project.optional-dependencies]
 dpo = ["torch>=2.3"]
 ppo = ["torch>=2.3"]
+openai = ["openai>=1.66,<3"]
+openai-proxy = ["openai>=1.66,<3", "fastapi>=0.100"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -30,6 +32,8 @@ packages = [
     "triotune.agentrl.rollout",
     "triotune.agentrl.training",
     "triotune.agentrl.diagnostics",
+    "triotune.agentrl.sdk",
+    "triotune.agentrl.sdk.openai",
     "triotune.dataset",
     "triotune.trainer",
     "triotune.trainer.dpo",

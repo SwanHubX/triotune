@@ -30,6 +30,7 @@ from .runtime.conversation import (
 from .runtime.runner import EpisodeRunner
 from .runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 from .runtime.tools import FunctionTool, FunctionToolExecutor
+from .sdk.openai import Agent, OpenAIClient, OpenAISession, function_tool
 from .training.evaluation import evaluation_metrics, paired_task_metrics
 from .training.loop import AgentTrainingLoop
 from .training.rewards import (
@@ -88,6 +89,7 @@ __all__ = [
     "ActionParseError",
     "ActionParser",
     "AgentAction",
+    "Agent",
     "AgentConfig",
     "AgentContractError",
     "AgentEvaluationConfig",
@@ -115,6 +117,8 @@ __all__ = [
     "ExecutionContext",
     "FunctionTool",
     "FunctionToolExecutor",
+    "OpenAIClient",
+    "OpenAISession",
     "Generation",
     "GenerationEvent",
     "Interaction",
@@ -146,6 +150,7 @@ __all__ = [
     "ToolSystemError",
     "TrajectoryExporter",
     "TurnRewardScorer",
+    "function_tool",
     "current_execution_context",
     "evaluation_metrics",
     "paired_task_metrics",

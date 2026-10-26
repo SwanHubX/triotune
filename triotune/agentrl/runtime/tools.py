@@ -32,6 +32,7 @@ class FunctionTool:
     parameters: dict[str, Any]
     function: Callable[..., Any]
     retry_safe: bool = False
+    validator: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not callable(self.function):
@@ -40,6 +41,14 @@ class FunctionTool:
             raise ValueError("Tool parameters must declare an object schema.")
         if type(self.retry_safe) is not bool:
             raise ValueError("retry_safe must be a boolean.")
+        if self.validator is not None and not callable(self.validator):
+            raise ValueError("validator must be callable or None.")
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Validate and optionally normalize model supplied tool arguments."""
+        if self.validator is None:
+            return arguments
+        return self.validator(arguments)
 
 
 class FunctionToolExecutor:
@@ -105,12 +114,16 @@ class FunctionToolExecutor:
                 inspect.signature(tool.function).bind(**call.arguments)
             except TypeError as exc:
                 raise ToolActionError(str(exc)) from exc
+            try:
+                arguments = tool.validate_arguments(call.arguments)
+            except (TypeError, ValueError) as exc:
+                raise ToolActionError(str(exc)) from exc
             if inspect.iscoroutinefunction(tool.function):
-                value = await tool.function(**call.arguments)
+                value = await tool.function(**arguments)
             else:
                 # A synchronous tool must not block other episodes. Cancelling
                 # this await does not forcibly terminate a running worker thread.
-                value = await asyncio.to_thread(tool.function, **call.arguments)
+                value = await asyncio.to_thread(tool.function, **arguments)
                 if inspect.isawaitable(value):
                     # Callable wrappers can return an awaitable even when the
                     # callable itself is not declared with async def.
