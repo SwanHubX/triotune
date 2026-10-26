@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -192,18 +193,37 @@ class AgentRolloutWorkflow:
         self.min_usable_group_size = min_usable_group_size
         self.shared_prefix_policy = shared_prefix_policy
         self.accept_sample = accept_sample
+        self._resource_started = False
 
     async def start(self) -> None:
         """Start session-scoped scorer and tool resources."""
+        if self._resource_started:
+            return
         start = getattr(self.runner, "start", None)
         if callable(start):
             await start()
+        logger_start = getattr(self.logger, "start", None)
+        if callable(logger_start):
+            result = logger_start()
+            if inspect.isawaitable(result):
+                await result
+        self._resource_started = True
 
     async def close(self) -> None:
         """Close resources owned by the underlying episode runner."""
+        if not self._resource_started:
+            return
+        logger_close = getattr(self.logger, "close", None) or getattr(
+            self.logger, "aclose", None
+        )
+        if callable(logger_close):
+            result = logger_close()
+            if inspect.isawaitable(result):
+                await result
         close = getattr(self.runner, "close", None)
         if callable(close):
             await close()
+        self._resource_started = False
 
     async def __aenter__(self):
         await self.start()
@@ -232,6 +252,7 @@ class AgentRolloutWorkflow:
         """
         if type(n_samples) is not int or n_samples < 1:
             raise ValueError("n_samples must be a positive integer.")
+        await self.start()
         minimum = self.min_usable_group_size or n_samples
         if minimum > n_samples:
             raise ValueError("min_usable_group_size must not exceed n_samples.")
@@ -314,9 +335,18 @@ class AgentRolloutWorkflow:
                                 group_id,
                             )
                         self._validate_export(exported, episode, context)
-                        if self.accept_sample is not None and not self.accept_sample(
-                            episode, exported
-                        ):
+                        accepted = (
+                            True
+                            if self.accept_sample is None
+                            else self.accept_sample(episode, exported)
+                        )
+                        if inspect.isawaitable(accepted):
+                            accepted = await accepted
+                        if not isinstance(accepted, bool):
+                            raise AgentContractError(
+                                "Sample acceptance hook must return a boolean."
+                            )
+                        if not accepted:
                             episode.status = "rejected"
                             episode.error = "Sample acceptance hook rejected the episode."
                             exported = None

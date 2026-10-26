@@ -78,10 +78,6 @@ class Trajectory:
     reference_logprobs: list[float] | None = None
     values: list[float] | None = None
     token_rewards: list[float] | None = None
-    # Optional PRM/direct-advantage signal.  It is deliberately separate from
-    # token_rewards so critic returns never learn a value target from a signal
-    # that the caller declared to be an advantage.
-    token_advantages: list[float] | None = None
     turn_ids: list[int] | None = None
     reward_components: dict[str, float] = field(default_factory=dict)
     # Provenance is optional for legacy callers that construct trajectories
@@ -101,6 +97,11 @@ class Trajectory:
     # offset) pairs. Context has None. They identify shared sampled actions
     # independently of their physical position in a branch or fragment.
     action_keys: list[tuple[str, int] | None] | None = None
+    # Optional PRM/direct-advantage signal.  It is deliberately separate from
+    # token_rewards so critic returns never learn a value target from a signal
+    # that the caller declared to be an advantage.  It is appended after the
+    # historical fields to preserve positional construction compatibility.
+    token_advantages: list[float] | None = None
 
     @property
     def provenance(self) -> dict:

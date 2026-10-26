@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -776,7 +776,9 @@ class FailureClassifier(Protocol):
 class SampleAcceptance(Protocol):
     """Decide whether a scored execution may enter a training batch."""
 
-    def __call__(self, episode: EpisodeResult, export: RolloutExport | None) -> bool: ...
+    def __call__(
+        self, episode: EpisodeResult, export: RolloutExport | None
+    ) -> bool | Awaitable[bool]: ...
 
 
 class EpisodeLogger(Protocol):

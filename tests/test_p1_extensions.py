@@ -33,6 +33,22 @@ class StructuredRewardTests(unittest.TestCase):
 
 
 class PPOPlanTests(unittest.TestCase):
+    def test_trajectory_field_keeps_historical_positional_fields(self):
+        trajectory = Trajectory(
+            [1],
+            [2],
+            [-1.0],
+            0.0,
+            "g",
+            [True],
+            False,
+            None,
+            None,
+            None,
+            [0],
+        )
+        self.assertEqual(trajectory.turn_ids, [0])
+
     def test_trajectory_estimator_is_public(self):
         advantages, returns = compute_trajectory_level_gae(
             [1.0, 2.0, 0.0], [0.5, 0.0, 0.0, 3.0], [True, True, False], truncated=True
