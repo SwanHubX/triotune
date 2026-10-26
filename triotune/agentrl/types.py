@@ -521,6 +521,9 @@ class EpisodeScore:
         for assignment in self.assignments:
             if not hasattr(assignment, "target") or not hasattr(assignment, "value"):
                 raise AgentContractError("Reward assignments must expose target and value.")
+            validate = getattr(assignment, "__post_init__", None)
+            if callable(validate):
+                validate()
             if isinstance(assignment.value, bool) or not isinstance(
                 assignment.value, (int, float)
             ) or not math.isfinite(float(assignment.value)):
