@@ -16,6 +16,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 from triotune.agentrl import ExecutionContext
+from triotune.agentrl.config import RetryPolicy
 from triotune.agentrl.sdk.openai import (
     OpenAIClient,
     OpenAIProxyServer,
@@ -111,6 +112,11 @@ class ThirdPartySDKTests(unittest.IsolatedAsyncioTestCase):
                             for index, call_id in enumerate(call_ids)
                         ]
                     ),
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
                 }
             return {
                 "id": f"chat-{identity}",
@@ -144,6 +150,11 @@ class ThirdPartySDKTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     }
                 ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             }
 
         self.upstream = SimpleNamespace(
@@ -560,6 +571,88 @@ class ThirdPartySDKTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executed, [])
         self.assertEqual(self.observed, [])
 
+    async def test_explicit_request_id_replay_and_total_budgets(self):
+        session = OpenAISession()
+        payload = {"messages": [{"role": "user", "content": "once"}]}
+        first = await self.adapter.create_chat_completion(
+            **payload, session=session, request_id="request-fixed"
+        )
+        replay = await self.adapter.create_chat_completion(
+            **payload, session=session, request_id="request-fixed"
+        )
+        self.assertEqual(first, replay)
+        self.assertEqual(len(session.interactions), 1)
+        with self.assertRaises(AgentContractError):
+            await self.adapter.create_chat_completion(
+                messages=[{"role": "user", "content": "changed"}],
+                session=session,
+                request_id="request-fixed",
+            )
+        limited = OpenAISession(max_generated_tokens=1, episode_timeout=1.0)
+        await self.adapter.create_chat_completion(
+            messages=[{"role": "user", "content": "first"}],
+            session=limited,
+            request_id="limited-request",
+        )
+        cached = await self.adapter.create_chat_completion(
+            messages=[{"role": "user", "content": "first"}],
+            session=limited,
+            request_id="limited-request",
+        )
+        self.assertEqual(cached["id"], limited.interactions[0].response_id)
+        with self.assertRaises(AgentContractError):
+            await self.adapter.create_chat_completion(
+                messages=[{"role": "user", "content": "second"}], session=limited
+            )
+        self.assertEqual(len(limited.interactions), 1)
+
+    async def test_proxy_explicit_request_id_replays_cached_completion(self):
+        """HTTP retries reuse explicit identity, never prompt equality alone."""
+        import httpx
+
+        session = OpenAISession()
+        proxy = OpenAIProxyServer(
+            self.adapter,
+            session_factory=lambda identity: session,
+        )
+        headers = {
+            "X-Triotune-Session-Id": session.session_id,
+            "X-Triotune-Request-Id": "retry-id",
+        }
+        payload = {"model": "fake", "messages": [{"role": "user", "content": "same"}]}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.create_app()),
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
+            second = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
+            self.assertEqual(first.json(), second.json())
+            self.assertEqual(first.headers["X-Client-Request-Id"], "retry-id")
+            self.assertEqual(second.headers["X-Client-Request-Id"], "retry-id")
+            conflict = await client.post(
+                "/v1/chat/completions",
+                json={**payload, "messages": [{"role": "user", "content": "changed"}]},
+                headers=headers,
+            )
+            self.assertEqual(conflict.status_code, 400)
+        self.assertEqual(len(session.interactions), 1)
+        self.assertEqual(len(self.observed), 1)
+
+    async def test_total_episode_timeout_finishes_failed_session(self):
+        self.mode = "block"
+        session = OpenAISession(episode_timeout=0.01)
+        with self.assertRaises(TimeoutError):
+            await self.adapter.create_chat_completion(
+                messages=[{"role": "user", "content": "timeout"}], session=session
+            )
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(session.interactions[0].status, "failed")
+        session.export_trajectory()
+
     async def test_native_pytrio_callback_uses_exact_arrays_and_out_of_order_results(
         self,
     ):
@@ -676,3 +769,92 @@ class ThirdPartySDKTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first.output_ids, tuple(sampling.generated[0]))
             self.assertEqual(second.logprobs, (-0.25,) * len(second.output_ids))
             self.assertFalse(result.export_trajectory().metadata["trainable"])
+
+    async def test_workflow_scoring_retry_acceptance_and_resource_lifecycle(self):
+        """SDK postprocessing reuses runner semantics without entering PPO."""
+        calls = []
+
+        class Scorer:
+            resource_owner = "workflow"
+
+            async def start(self):
+                calls.append("start")
+
+            async def close(self):
+                calls.append("close")
+
+            async def score(self, row, result):
+                calls.append("score")
+                if calls.count("score") == 1:
+                    raise ConnectionError("retry scorer")
+                return 0.75
+
+        async def accept(result, trace):
+            calls.append("accept")
+            self.assertIsNone(trace)
+            self.assertFalse(result.trainable)
+            self.assertEqual(result.status, "completed")
+            return False
+
+        workflow = OpenAIWorkflow(
+            client=self.adapter,
+            scorer=Scorer(),
+            accept_sample=accept,
+            scorer_retry=RetryPolicy(max_attempts=2, initial_delay=0, max_delay=0),
+            scorer_timeout=1,
+            resource_owner="workflow",
+        )
+        async with workflow:
+            result = await workflow.run("compute", execute=self.callback)
+            self.assertFalse(result.accepted)
+            self.assertFalse(result.session.accepted)
+            self.assertEqual(result.session.rewards, [0.75])
+            self.assertEqual(len(result.session.retries), 1)
+            self.assertEqual(calls, ["start", "score", "score", "accept"])
+        self.assertEqual(calls[-1], "close")
+
+    async def test_interaction_scorer_targets_original_request(self):
+        from triotune.agentrl import EpisodeScore, RewardAssignment
+
+        async def score(row, result, interaction):
+            index = result.session.interactions.index(interaction)
+            return EpisodeScore(
+                0,
+                False,
+                assignments=(
+                    RewardAssignment("interaction", index + 1, source="sdk-prm"),
+                ),
+            )
+
+        result = await OpenAIWorkflow(
+            client=self.adapter, interaction_scorer=score
+        ).run("compute", execute=self.callback)
+        first, second = result.session.interactions
+        self.assertEqual(first.reward["position"], 0)
+        self.assertEqual(second.reward["position"], 1)
+        self.assertEqual(len(first.reward_submissions), 1)
+        self.assertEqual(len(second.reward_submissions), 1)
+
+    async def test_failure_classifier_covers_callback_and_scoring_failures(self):
+        def classify(stage, error, record):
+            return "sdk_failure", f"{stage}:{type(error).__name__}"
+
+        async def broken_score(row, result):
+            raise RuntimeError("bad scorer")
+
+        for execution_failure in (False, True):
+            session = OpenAISession()
+            scorer = None if execution_failure else broken_score
+            workflow = OpenAIWorkflow(
+                client=self.adapter, scorer=scorer, failure_classifier=classify
+            )
+
+            async def execute(sdk, input, fail=execution_failure):
+                if fail:
+                    raise RuntimeError("bad callback")
+                return await self.callback(sdk, input)
+
+            with self.assertRaises(RuntimeError):
+                await workflow.run("compute", execute=execute, session=session)
+            self.assertEqual(session.failure_classification[0], "sdk_failure")
+            self.assertIs(session.accepted, None if execution_failure else False)

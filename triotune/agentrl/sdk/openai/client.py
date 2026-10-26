@@ -10,6 +10,7 @@ context, so transport choice cannot alter provenance or failure cleanup.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -71,6 +72,7 @@ class OpenAIClient:
         model=None,
         session=None,
         parent_interaction_id=None,
+        request_id=None,
         **kwargs,
     ):
         """Submit one non-streaming Chat Completions request.
@@ -89,10 +91,18 @@ class OpenAIClient:
                 **kwargs,
             },
             parent_interaction_id=parent_interaction_id,
+            request_id=request_id,
         )
 
     async def create_response(
-        self, *, input, model=None, session=None, parent_interaction_id=None, **kwargs
+        self,
+        *,
+        input,
+        model=None,
+        session=None,
+        parent_interaction_id=None,
+        request_id=None,
+        **kwargs,
     ):
         """Submit one non-streaming Responses request with session identity."""
         return await self._create(
@@ -101,6 +111,7 @@ class OpenAIClient:
             session or self.session,
             {"input": input, "model": self.model if model is None else model, **kwargs},
             parent_interaction_id=parent_interaction_id,
+            request_id=request_id,
         )
 
     def as_async_openai(self, *, session: OpenAISession | None = None, **options: Any):
@@ -121,7 +132,14 @@ class OpenAIClient:
         )
 
     async def _create(
-        self, endpoint, method, session, payload, *, parent_interaction_id=None
+        self,
+        endpoint,
+        method,
+        session,
+        payload,
+        *,
+        parent_interaction_id=None,
+        request_id=None,
     ):
         """Validate, allocate, execute, and finalize one request interaction.
 
@@ -155,18 +173,60 @@ class OpenAIClient:
             if key.lower() != "x-client-request-id"
         }
         token = None
+        identity_payload = copy.deepcopy(payload)
+        replay = session.replay_request(
+            endpoint,
+            identity_payload,
+            request_id=request_id,
+            parent_interaction_id=parent_interaction_id,
+        )
+        if replay is not None:
+            return replay
+        remaining_tokens = session.remaining_generated_tokens()
+        if remaining_tokens is not None:
+            if remaining_tokens <= 0:
+                raise AgentContractError(
+                    "Session total generated-token budget exceeded."
+                )
+            names = (
+                ("max_completion_tokens", "max_tokens")
+                if endpoint == "/v1/chat/completions"
+                else ("max_output_tokens",)
+            )
+            supplied = [payload[name] for name in names if name in payload]
+            if any(type(value) is not int or value < 1 for value in supplied):
+                raise AgentContractError(
+                    "Output token limits must be positive integers."
+                )
+            if len(supplied) > 1 and len(set(supplied)) != 1:
+                raise AgentContractError("Conflicting output token limits.")
+            payload[names[0]] = (
+                min(supplied[0], remaining_tokens) if supplied else remaining_tokens
+            )
+            for alias in names[1:]:
+                payload.pop(alias, None)
         validate_request = getattr(self.backend, "validate_request", None)
         if callable(validate_request):
             validate_request(endpoint, payload, session=session)
         interaction = session.start_request(
-            endpoint, payload, parent_interaction_id=parent_interaction_id
+            endpoint,
+            payload,
+            parent_interaction_id=parent_interaction_id,
+            request_id=request_id,
+            identity_payload=identity_payload,
         )
         try:
             headers["X-Client-Request-Id"] = interaction.request_id
             payload["extra_headers"] = headers
             token = _execution_context.set(interaction.context)
-            response = await self.backend.complete(
+            pending = self.backend.complete(
                 endpoint, payload, session=session, method=method
+            )
+            remaining = session.remaining_timeout()
+            response = (
+                await asyncio.wait_for(pending, remaining)
+                if remaining is not None
+                else await pending
             )
             session.complete_request(interaction, response)
             if isinstance(response, dict):

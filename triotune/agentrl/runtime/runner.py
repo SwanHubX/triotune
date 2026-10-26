@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -22,6 +23,7 @@ from pytrio import PyTrioError
 
 from ..config import RetryPolicy
 from ..rollout.trajectory import EpisodeTrajectoryBuilder
+from ..training.rewards import RewardAssignment, RewardLedger
 from ..types import (
     SYSTEM_STATUSES,
     ActionParseError,
@@ -34,8 +36,8 @@ from ..types import (
     EpisodeResult,
     EpisodeScore,
     EpisodeScorer,
-    FailureClassifier,
     ExecutionContext,
+    FailureClassifier,
     GenerationEvent,
     Interaction,
     InteractionScorer,
@@ -50,8 +52,187 @@ from ..types import (
     _execution_context,
     validate_tokens,
 )
-from ..training.rewards import RewardAssignment, RewardLedger
 from .sampling import SamplingSnapshot
+
+
+class RuntimeBoundary:
+    """Share retries, failure classification, and owned-resource lifecycle.
+
+    EpisodeRunner and SDK execution use the same boundary semantics without
+    sharing model/tool-loop implementations. A record must expose ``context``
+    and ``events``; optional ``retries`` and ``export_metadata`` fields receive
+    the richer EpisodeResult evidence when available. Cancellation is never
+    caught as a retryable failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        retry: RetryPolicy | None = None,
+        failure_classifier: FailureClassifier | None = None,
+        resource_owner: str = "runner",
+    ) -> None:
+        if not isinstance(resource_owner, str) or not resource_owner:
+            raise ValueError("resource_owner must be a nonempty string.")
+        self.retry = retry or RetryPolicy()
+        self.failure_classifier = failure_classifier
+        self.resource_owner = resource_owner
+        self.started = False
+        self._lock = asyncio.Lock()
+        self._resources = []
+
+    async def start(self, *resources) -> None:
+        """Start each owned resource once in declaration order."""
+        async with self._lock:
+            try:
+                for resource in resources:
+                    if resource is None or any(
+                        resource is current for current in self._resources
+                    ):
+                        continue
+                    if (
+                        getattr(resource, "resource_owner", self.resource_owner)
+                        == self.resource_owner
+                    ):
+                        method = getattr(resource, "start", None)
+                        if callable(method):
+                            result = method()
+                            if inspect.isawaitable(result):
+                                await result
+                    self._resources.append(resource)
+                self.started = True
+            except BaseException as error:
+                # Partial startup must not leak the resources that succeeded
+                # before a later resource failed. Preserve the startup error;
+                # cleanup errors are attached as notes for diagnostics.
+                failure = None
+                for resource in reversed(self._resources):
+                    if (
+                        getattr(resource, "resource_owner", self.resource_owner)
+                        != self.resource_owner
+                    ):
+                        continue
+                    method = getattr(resource, "close", None) or getattr(
+                        resource, "aclose", None
+                    )
+                    if callable(method):
+                        try:
+                            result = method()
+                            if inspect.isawaitable(result):
+                                await result
+                        except Exception as exc:  # noqa: BLE001 -- preserve startup error
+                            failure = exc
+                self._resources.clear()
+                self.started = False
+                if failure is not None:
+                    error.add_note(f"Runtime resource cleanup also failed: {failure}")
+                raise
+
+    async def close(self) -> None:
+        """Close owned resources once in reverse declaration order."""
+        async with self._lock:
+            if not self.started:
+                return
+            for resource in reversed(self._resources):
+                if (
+                    getattr(resource, "resource_owner", self.resource_owner)
+                    != self.resource_owner
+                ):
+                    continue
+                method = getattr(resource, "close", None) or getattr(
+                    resource, "aclose", None
+                )
+                if callable(method):
+                    result = method()
+                    if inspect.isawaitable(result):
+                        await result
+            self._resources.clear()
+            self.started = False
+
+    def classify(self, stage, error, record):
+        """Apply one failure hook and preserve its status as diagnostic data."""
+        if self.failure_classifier is None:
+            return None
+        method = getattr(self.failure_classifier, "classify", self.failure_classifier)
+        result = method(stage, error, record)
+        if isinstance(result, tuple):
+            status, message = result
+        else:
+            status, message = result, str(error)
+        if not isinstance(status, str) or not status:
+            raise AgentContractError("Failure classifier must return a status string.")
+        metadata = getattr(record, "export_metadata", None)
+        if isinstance(metadata, dict):
+            metadata["system_failure"] = True
+        return status, str(message)
+
+    async def operation(
+        self,
+        record,
+        stage,
+        turn,
+        factory,
+        *,
+        timeout=None,
+        retry_safe=True,
+        retry_policy=None,
+    ):
+        """Retry transient operations without retrying cancellation or actions."""
+        policy = retry_policy or self.retry
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                remaining = (
+                    record.remaining_timeout()
+                    if callable(getattr(record, "remaining_timeout", None))
+                    else None
+                )
+                if remaining is not None:
+                    if remaining <= 0:
+                        raise TimeoutError("Total execution timeout exceeded.")
+                    timeout = remaining if timeout is None else min(timeout, remaining)
+                if timeout is None:
+                    return await factory()
+                return await asyncio.wait_for(factory(), timeout)
+            except Exception as exc:
+                transient = (
+                    exc.retryable
+                    if isinstance(exc, (ToolSystemError, PyTrioError))
+                    else isinstance(exc, (ConnectionError, TimeoutError, OSError))
+                )
+                if not transient:
+                    raise
+                again = retry_safe and attempt < policy.max_attempts
+                retry = RetryEvent(
+                    stage, turn, attempt, type(exc).__name__, str(exc), again
+                )
+                retries = getattr(record, "retries", None)
+                if isinstance(retries, list):
+                    retries.append(retry)
+                record.events.append(
+                    AgentEvent(
+                        context=_execution_context.get() or record.context,
+                        kind="retry",
+                        status="retrying" if again else "exhausted",
+                        details={
+                            "stage": stage,
+                            "turn": turn,
+                            "attempt": attempt,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                )
+                if not again:
+                    raise
+                delay = policy.delay(attempt)
+                remaining = (
+                    record.remaining_timeout()
+                    if callable(getattr(record, "remaining_timeout", None))
+                    else None
+                )
+                if remaining is not None and delay >= remaining:
+                    raise TimeoutError("Total execution timeout exceeded.") from exc
+                await asyncio.sleep(delay)
 
 
 class EpisodeRunner:
@@ -105,50 +286,28 @@ class EpisodeRunner:
         if scorer_timeout is not None and scorer_timeout <= 0:
             raise ValueError("scorer_timeout must be positive when provided.")
         if not isinstance(score_partial, bool):
-            raise ValueError("score_partial must be boolean.")
+            raise TypeError("score_partial must be boolean.")
         self.score_partial = score_partial
         self.reward_ledger = reward_ledger or RewardLedger()
         if not isinstance(resource_owner, str) or not resource_owner:
             raise ValueError("resource_owner must be a nonempty string.")
         self.resource_owner = resource_owner
+        self._boundary = RuntimeBoundary(
+            retry=self.retry,
+            failure_classifier=self.failure_classifier,
+            resource_owner=self.resource_owner,
+        )
         self._resource_started = False
-        self._resource_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start scorer/tool resources once for the runner's session."""
-        async with self._resource_lock:
-            if self._resource_started:
-                return
-            for resource in (self.tools, self.scorer, self.interaction_scorer):
-                if getattr(resource, "resource_owner", self.resource_owner) != self.resource_owner:
-                    continue
-                method = getattr(resource, "start", None)
-                if callable(method):
-                    result = method()
-                    if asyncio.iscoroutine(result):
-                        await result
-            self._resource_started = True
+        await self._boundary.start(self.tools, self.scorer, self.interaction_scorer)
+        self._resource_started = self._boundary.started
 
     async def close(self) -> None:
         """Release resources owned by this runner, preserving shared clients."""
-        async with self._resource_lock:
-            if not self._resource_started:
-                return
-            for resource in (
-                self.interaction_scorer,
-                self.scorer,
-                self.tools,
-            )[::-1]:
-                if getattr(resource, "resource_owner", self.resource_owner) != self.resource_owner:
-                    continue
-                method = getattr(resource, "close", None) or getattr(
-                    resource, "aclose", None
-                )
-                if callable(method):
-                    result = method()
-                    if asyncio.iscoroutine(result):
-                        await result
-            self._resource_started = False
+        await self._boundary.close()
+        self._resource_started = self._boundary.started
 
     async def __aenter__(self):
         await self.start()
@@ -159,18 +318,8 @@ class EpisodeRunner:
 
     def _classify(self, stage, error, episode):
         """Apply an optional failure hook while retaining built-in statuses."""
-        if self.failure_classifier is None:
-            return None
-        method = getattr(self.failure_classifier, "classify", self.failure_classifier)
-        result = method(stage, error, episode)
-        if isinstance(result, tuple):
-            status, message = result
-        else:
-            status, message = result, str(error)
-        if not isinstance(status, str) or not status:
-            raise AgentContractError("Failure classifier must return a status string.")
-        episode.export_metadata["system_failure"] = True
-        return status, str(message)
+        self._boundary.failure_classifier = self.failure_classifier
+        return self._boundary.classify(stage, error, episode)
 
     async def submit_reward(self, episode, score=None):
         """Submit a delayed score exactly once and emit interaction evidence."""
@@ -185,7 +334,9 @@ class EpisodeRunner:
         episode.score = score
         episode.export_metadata["reward_submitted"] = True
         for index, interaction in enumerate(episode.interactions):
-            interaction.reward = score.reward if index == len(episode.interactions) - 1 else 0.0
+            interaction.reward = (
+                score.reward if index == len(episode.interactions) - 1 else 0.0
+            )
             interaction.process_rewards = score.process_rewards.get(index, ())
             episode.events.append(
                 RewardEvent(
@@ -208,43 +359,15 @@ class EpisodeRunner:
         retry_policy=None,
     ):
         """Retry transient transport errors within the existing episode deadline."""
-        policy = retry_policy or self.retry
-        for attempt in range(1, policy.max_attempts + 1):
-            try:
-                if timeout is None:
-                    return await factory()
-                return await asyncio.wait_for(factory(), timeout)
-            except Exception as exc:
-                transient = (
-                    exc.retryable
-                    if isinstance(exc, (ToolSystemError, PyTrioError))
-                    else isinstance(exc, (ConnectionError, TimeoutError, OSError))
-                )
-                if not transient:
-                    raise
-                again = retry_safe and attempt < policy.max_attempts
-                episode.retries.append(
-                    RetryEvent(
-                        stage, turn, attempt, type(exc).__name__, str(exc), again
-                    )
-                )
-                episode.events.append(
-                    AgentEvent(
-                        context=_execution_context.get(),
-                        kind="retry",
-                        status="retrying" if again else "exhausted",
-                        details={
-                            "stage": stage,
-                            "turn": turn,
-                            "attempt": attempt,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                        },
-                    )
-                )
-                if not again:
-                    raise
-                await asyncio.sleep(policy.delay(attempt))
+        return await self._boundary.operation(
+            episode,
+            stage,
+            turn,
+            factory,
+            timeout=timeout,
+            retry_safe=retry_safe,
+            retry_policy=retry_policy or self.retry,
+        )
 
     async def _score_interactions(self, row, episode) -> None:
         """Run optional interaction scorers with their own retry/deadline."""
@@ -273,8 +396,7 @@ class EpisodeRunner:
             if isinstance(result, EpisodeScore):
                 assignments.extend(
                     replace(item, position=index)
-                    if item.target in {"interaction", "turn"}
-                    and item.position is None
+                    if item.target in {"interaction", "turn"} and item.position is None
                     else item
                     for item in result.assignments
                 )
@@ -316,7 +438,10 @@ class EpisodeRunner:
                     raise AgentContractError(
                         "Interaction scorer must return RewardAssignment objects."
                     )
-                if assignment.target in {"interaction", "turn"} and assignment.position is None:
+                if (
+                    assignment.target in {"interaction", "turn"}
+                    and assignment.position is None
+                ):
                     assignment = replace(assignment, position=index)
                 assignments.append(assignment)
         episode.export_metadata["interaction_assignments"] = tuple(assignments)
@@ -438,9 +563,8 @@ class EpisodeRunner:
                         if interaction_assignments:
                             episode.score = replace(
                                 episode.score,
-                                assignments=tuple(
-                                    episode.score.assignments
-                                ) + tuple(interaction_assignments),
+                                assignments=tuple(episode.score.assignments)
+                                + tuple(interaction_assignments),
                             )
                             episode.score.__post_init__()
                         if episode.status != "completed" and episode.score.success:

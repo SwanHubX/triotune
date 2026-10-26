@@ -12,11 +12,21 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from ...config import RetryPolicy
+from ...runtime.runner import RuntimeBoundary
 from ...runtime.sampling import SamplingSnapshot
-from ...types import AgentContractError, ExecutionContext, _execution_context
+from ...training.rewards import RewardAssignment
+from ...types import (
+    AgentContractError,
+    AgentEvent,
+    EpisodeScore,
+    ExecutionContext,
+    FailureClassifier,
+    _execution_context,
+)
 from .agent import Agent, AgentRunResult
 from .client import OpenAIClient
 from .session import OpenAISession, OpenAITrajectoryExport
@@ -33,6 +43,27 @@ class SDKRunResult:
 
     output: Any
     session: OpenAISession
+    accepted: bool = True
+
+    @property
+    def context(self) -> ExecutionContext:
+        """Expose immutable candidate identity to generic lifecycle hooks."""
+        return self.session.context
+
+    @property
+    def status(self) -> str:
+        """Expose terminal SDK status without claiming EpisodeResult semantics."""
+        return self.session.status
+
+    @property
+    def interactions(self):
+        """Expose SDK interactions as a read-only tuple."""
+        return tuple(self.session.interactions)
+
+    @property
+    def trainable(self) -> bool:
+        """Remain false until an EpisodeResult and RolloutExport are produced."""
+        return False
 
     @property
     def session_id(self) -> str:
@@ -48,7 +79,18 @@ class OpenAIWorkflow:
     """Run an agent while preserving collector identity and session isolation."""
 
     def __init__(
-        self, agent: Agent | None = None, *, client: OpenAIClient | None = None
+        self,
+        agent: Agent | None = None,
+        *,
+        client: OpenAIClient | None = None,
+        scorer: Any | None = None,
+        interaction_scorer: Any | None = None,
+        accept_sample: Any | None = None,
+        retry: RetryPolicy | None = None,
+        scorer_retry: RetryPolicy | None = None,
+        scorer_timeout: float | None = None,
+        failure_classifier: FailureClassifier | None = None,
+        resource_owner: str = "openai-workflow",
     ):
         """Bind either a built-in agent or a client for external async functions."""
         if (agent is None) == (client is None):
@@ -57,6 +99,41 @@ class OpenAIWorkflow:
             )
         self.agent = agent
         self.client = client if client is not None else agent.client
+        if not isinstance(self.client, OpenAIClient):
+            raise AgentContractError("OpenAIWorkflow requires OpenAIClient.")
+        if scorer_timeout is not None and (
+            isinstance(scorer_timeout, bool)
+            or not isinstance(scorer_timeout, (int, float))
+            or scorer_timeout <= 0
+        ):
+            raise AgentContractError("scorer_timeout must be positive or None.")
+        self.scorer = scorer
+        self.interaction_scorer = interaction_scorer
+        self.accept_sample = accept_sample
+        self.scorer_retry = scorer_retry
+        self.scorer_timeout = scorer_timeout
+        self.boundary = RuntimeBoundary(
+            retry=retry,
+            failure_classifier=failure_classifier,
+            resource_owner=resource_owner,
+        )
+
+    async def start(self, *resources) -> None:
+        """Start owned scorers, acceptance hooks, and callback resources once."""
+        await self.boundary.start(
+            self.scorer, self.interaction_scorer, self.accept_sample, *resources
+        )
+
+    async def close(self) -> None:
+        """Close workflow-owned hooks without closing an injected SDK client."""
+        await self.boundary.close()
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.close()
 
     async def run(
         self,
@@ -68,6 +145,8 @@ class OpenAIWorkflow:
         snapshot: SamplingSnapshot | None = None,
         execute: Callable[[Any, Any], Awaitable[Any]] | None = None,
         client_options: Mapping[str, Any] | None = None,
+        episode_timeout: float | None = None,
+        max_generated_tokens: int | None = None,
         **kwargs,
     ) -> AgentRunResult | SDKRunResult:
         """Bind a collector candidate and optionally verify its sampling snapshot.
@@ -93,6 +172,7 @@ class OpenAIWorkflow:
         """
         if type(training) is not bool:
             raise AgentContractError("training must be boolean.")
+        await self.start(execute)
         if snapshot is not None:
             expected = (
                 context
@@ -120,24 +200,37 @@ class OpenAIWorkflow:
                 raise AgentContractError(
                     "Third-party callbacks own their request options."
                 )
-            return await self._run_function(
+            result = await self._run_function(
                 input,
                 execute,
                 session=session,
                 context=context,
                 training=training,
                 client_options=client_options,
+                episode_timeout=episode_timeout,
+                max_generated_tokens=max_generated_tokens,
             )
+            return await self._postprocess(input, result)
         if self.agent is None or client_options is not None:
             raise AgentContractError(
                 "Client-only workflows require an execute callback."
             )
-        return await self.agent.run(
+        result = await self.agent.run(
             input, context=context, session=session, training=training, **kwargs
         )
+        return await self._postprocess(input, result)
 
     async def _run_function(
-        self, input, execute, *, session, context, training, client_options
+        self,
+        input,
+        execute,
+        *,
+        session,
+        context,
+        training,
+        client_options,
+        episode_timeout,
+        max_generated_tokens,
     ):
         """Isolate identity, transport ownership, and cleanup around one callback.
 
@@ -165,17 +258,32 @@ class OpenAIWorkflow:
             or session.released
         ):
             raise AgentContractError("Third-party runs require a fresh session.")
+        if episode_timeout is not None or max_generated_tokens is not None:
+            session.configure_limits(
+                episode_timeout=episode_timeout,
+                max_generated_tokens=max_generated_tokens,
+            )
+        session.begin_execution()
         session.running = True
         token = _execution_context.set(session.context)
         status, error, failure = "completed", None, None
-        try:
+
+        async def invoke():
             async with self.client.as_async_openai(
                 session=session, **dict(client_options or {})
             ) as sdk:
                 pending = execute(sdk, input)
                 if not inspect.isawaitable(pending):
                     raise AgentContractError("execute must return an awaitable.")
-                output = await pending
+                return await pending
+
+        try:
+            remaining = session.remaining_timeout()
+            output = (
+                await asyncio.wait_for(invoke(), remaining)
+                if remaining is not None
+                else await invoke()
+            )
             if not session.interactions or any(
                 item.status != "completed" for item in session.interactions
             ):
@@ -189,6 +297,11 @@ class OpenAIWorkflow:
                 "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             )
             error = f"{type(exc).__name__}: {exc}"
+            if not isinstance(exc, asyncio.CancelledError):
+                classified = self.boundary.classify("execution", exc, session)
+                if classified is not None:
+                    session.failure_classification = classified
+                    error = classified[1]
             raise
         finally:
             session.running = False
@@ -200,6 +313,140 @@ class OpenAIWorkflow:
                 failure.add_note(f"Session finalization also failed: {cleanup_error}")
             finally:
                 _execution_context.reset(token)
+
+    async def _postprocess(self, input, result):
+        """Apply existing scoring and acceptance semantics to one SDK trace.
+
+        SDK traces remain non-trainable until P2.5 supplies an EpisodeResult and
+        RolloutExport. A scoring or acceptance infrastructure failure therefore
+        marks this result unaccepted and raises; it cannot silently enter PPO.
+        """
+        session = result.session
+        try:
+            if self.interaction_scorer is not None:
+                method = getattr(
+                    self.interaction_scorer, "score", self.interaction_scorer
+                )
+                for index, interaction in enumerate(session.interactions):
+                    value = await self.boundary.operation(
+                        session,
+                        "interaction_scoring",
+                        index,
+                        lambda method=method, interaction=interaction: method(
+                            input, result, interaction
+                        ),
+                        timeout=self.scorer_timeout,
+                        retry_policy=self.scorer_retry,
+                    )
+                    await self._submit_interaction_score(
+                        session, interaction, index, value
+                    )
+            if self.scorer is not None:
+                method = getattr(self.scorer, "score", self.scorer)
+                score = await self.boundary.operation(
+                    session,
+                    "scoring",
+                    len(session.interactions) - 1,
+                    lambda: method(input, result),
+                    timeout=self.scorer_timeout,
+                    retry_policy=self.scorer_retry,
+                )
+                if score is not None:
+                    session.submit_reward(
+                        score, submission_id=f"workflow-score:{session.session_id}"
+                    )
+            accepted = True
+            if self.accept_sample is not None:
+                # P0/P1 SampleAcceptance accepts export=None for records that
+                # have no training export. Passing OpenAITrajectoryExport here
+                # would falsely imply the P2.5 EpisodeExecutor bridge exists.
+                accepted = self.accept_sample(result, None)
+                if inspect.isawaitable(accepted):
+                    remaining = session.remaining_timeout()
+                    accepted = (
+                        await asyncio.wait_for(accepted, remaining)
+                        if remaining is not None
+                        else await accepted
+                    )
+                if type(accepted) is not bool:
+                    raise AgentContractError(
+                        "Sample acceptance hook must return a boolean."
+                    )
+            session.accepted = accepted
+            return replace(result, accepted=accepted)
+        except Exception as exc:
+            session.accepted = False
+            stage = "acceptance" if self.accept_sample is not None else "scoring"
+            classified = self.boundary.classify(stage, exc, session)
+            if classified is not None:
+                session.failure_classification = classified
+            session.events.append(
+                AgentEvent(
+                    context=session.context,
+                    kind="postprocess_failure",
+                    status="failed",
+                    details={"stage": stage, "error": f"{type(exc).__name__}: {exc}"},
+                )
+            )
+            raise
+
+    async def _submit_interaction_score(
+        self, session, interaction, index, value
+    ) -> None:
+        """Map interaction scorer output through the P1 RewardAssignment contract."""
+        if value is None:
+            return
+        assignments = []
+        if isinstance(value, EpisodeScore):
+            if value.reward:
+                assignments.append(
+                    RewardAssignment(
+                        "interaction",
+                        value.reward,
+                        source="interaction_scorer",
+                        position=index,
+                    )
+                )
+            for turn, rewards in value.process_rewards.items():
+                if turn not in {0, index}:
+                    raise AgentContractError(
+                        "Interaction scorer process rewards target another interaction."
+                    )
+                for offset, reward in enumerate(rewards):
+                    assignments.append(
+                        RewardAssignment(
+                            "token",
+                            reward,
+                            source="interaction_scorer",
+                            position=(index, offset),
+                        )
+                    )
+            assignments.extend(value.assignments)
+        elif isinstance(value, (tuple, list)):
+            assignments.extend(value)
+        elif isinstance(value, RewardAssignment):
+            assignments.append(value)
+        else:
+            session.submit_reward(
+                value,
+                interaction_id=interaction.interaction_id,
+                submission_id=f"interaction-score:{interaction.interaction_id}",
+            )
+            return
+        for number, assignment in enumerate(assignments):
+            if not isinstance(assignment, RewardAssignment):
+                raise AgentContractError(
+                    "Interaction scorer must return RewardAssignment objects."
+                )
+            if (
+                assignment.target in {"interaction", "turn"}
+                and assignment.position is None
+            ):
+                assignment = replace(assignment, position=index)
+            session.submit_reward(
+                assignment,
+                submission_id=f"interaction-score:{interaction.interaction_id}:{number}",
+            )
 
     async def submit_reward(
         self, result: AgentRunResult | SDKRunResult, reward: Any, **kwargs

@@ -28,7 +28,7 @@ from .runtime.conversation import (
     NativeToolContinuationRenderer,
     TokenAppendRenderer,
 )
-from .runtime.runner import EpisodeRunner
+from .runtime.runner import EpisodeRunner, RuntimeBoundary
 from .runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 from .runtime.tools import FunctionTool, FunctionToolExecutor
 from .sdk.openai import (
@@ -150,6 +150,7 @@ __all__ = [
     "RewardSubmitter",
     "RewardTerm",
     "RolloutExport",
+    "RuntimeBoundary",
     "SampleAcceptance",
     "SamplingSnapshot",
     "TokenAppendRenderer",

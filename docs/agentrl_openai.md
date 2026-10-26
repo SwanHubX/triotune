@@ -409,6 +409,43 @@ retried as a new request in a terminal session. Configure provider retry and
 timeout behavior on the upstream SDK client instead. Direct bound-client usage
 does not finish or release the session when the SDK client closes; the embedding
 application calls `session.finish()` and then submits rewards/exports/releases.
+
+`OpenAIClient` and `OpenAIWorkflow` also accept explicit `request_id` values.
+Reusing one ID with identical endpoint, payload, and parent returns the stored
+completed response without another provider call or duplicated tool events.
+Reusing it with different content, while the original is running, or after a
+failure is rejected. This identity-based completion rule is independent of
+prompt-prefix lineage and is therefore safe for repeated identical prompts.
+
+`Agent(episode_timeout=..., max_generated_tokens=...)` and third-party
+`OpenAIWorkflow.run(..., execute=..., episode_timeout=...,
+max_generated_tokens=...)` configure one session-owned total boundary. The
+deadline covers backend requests and tool-loop work; generated-token accounting
+uses original IDs when available and provider usage otherwise. A request that
+would exceed the boundary is rejected before allocation, while a response that
+crosses it remains in the failed trace. API retries are owned by the provider
+client and default to zero for recorded SDK sessions; local tool retries remain
+the existing runner policy and are never inferred from API retry settings.
+
+`RuntimeBoundary` is the shared implementation for transient retries, custom
+failure classification, and owned resource start/close order. `EpisodeRunner`
+uses it for its existing sampler/tool/scorer stages; SDK `Agent` uses it only
+for explicitly retry-safe tools, and `OpenAIWorkflow` uses it for optional
+trace scorers, acceptance hooks, and callback resources. Provider/API retries
+remain inside the provider client and never cause a completed local tool to run
+again. Cancellation bypasses retry classification, while completed tool results
+remain attached to their original interaction on later failures.
+
+SDK scoring hooks receive `(input, result)` and interaction hooks receive
+`(input, result, openai_interaction)`. They share timeout, retry, failure and
+resource lifecycle mechanics with the runner, but do not pretend that SDK
+records are `EpisodeResult`. SDK results expose read-only `context`, `status`,
+`interactions`, and `trainable=False` views. A sample acceptance hook receives
+`(result, None)`, matching the existing optional-export boundary. A false result
+sets `accepted=False`; it does not create or submit a PPO row. Full reuse of
+`EpisodeScorer`, `EpisodeResult`, `RolloutExport`, normalization, GAE and loss
+weighting belongs to the explicit P2.5 training bridge.
+
 For an existing proxy, use `proxy.create_client(session=session)` to register the
 exact collector-created session without reconstruction. The connection transport
 and base URL are factory-owned; optional SDK settings use `client_options` in

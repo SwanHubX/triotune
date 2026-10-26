@@ -13,6 +13,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any
+from uuid import uuid4
 
 from ...types import AgentContractError
 from .backend import OpenAIBackend
@@ -153,6 +154,13 @@ class OpenAIProxyServer:
                         "Request attempts to switch its bound session."
                     )
                 request.headers[identity_header] = session.session_id
+                # One explicit identity survives transport/API retries and is
+                # independent of prompt contents. Replaying the same prepared
+                # SDK request can therefore return its cached completion, while
+                # a fresh application request receives a new identity.
+                request.headers.setdefault(
+                    "X-Triotune-Request-Id", f"sdk_{uuid4().hex}"
+                )
                 task = asyncio.current_task()
                 self.active.add(task)
                 try:
@@ -239,7 +247,12 @@ class OpenAIProxyServer:
         self.sessions[session_id].finish(status, error=error)
 
     async def chat_completions(
-        self, payload: dict[str, Any], *, session_id=None, parent_interaction_id=None
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id=None,
+        parent_interaction_id=None,
+        request_id=None,
     ) -> Any:
         """Forward one Chat Completions payload through a session registry entry."""
         return (
@@ -248,16 +261,26 @@ class OpenAIProxyServer:
                 payload,
                 session_id,
                 parent_interaction_id,
+                request_id,
             )
         )[0]
 
     async def responses(
-        self, payload: dict[str, Any], *, session_id=None, parent_interaction_id=None
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id=None,
+        parent_interaction_id=None,
+        request_id=None,
     ) -> Any:
         """Forward one Responses payload through a session registry entry."""
         return (
             await self._request(
-                self.client.create_response, payload, session_id, parent_interaction_id
+                self.client.create_response,
+                payload,
+                session_id,
+                parent_interaction_id,
+                request_id,
             )
         )[0]
 
@@ -278,6 +301,7 @@ class OpenAIProxyServer:
         payload,
         session_id,
         parent_interaction_id,
+        request_id,
         *,
         session=None,
         is_new=None,
@@ -298,7 +322,10 @@ class OpenAIProxyServer:
                     "Supply session identity through the header or handler arguments."
                 )
             response = await endpoint(
-                session=session, parent_interaction_id=parent_interaction_id, **payload
+                session=session,
+                parent_interaction_id=parent_interaction_id,
+                request_id=request_id,
+                **payload,
             )
             return response, session
         except BaseException:
@@ -306,7 +333,7 @@ class OpenAIProxyServer:
             raise
 
     @staticmethod
-    def _identity_headers(session, request_count):
+    def _identity_headers(session, request_count, request_id=None):
         """Expose only the interaction registered by this specific HTTP call.
 
         A rejected continuation must not borrow the preceding interaction's
@@ -316,8 +343,12 @@ class OpenAIProxyServer:
         if session is None:
             return {}
         headers = {"X-Triotune-Session-Id": session.session_id}
+        interaction = None
         if len(session.interactions) > request_count:
             interaction = session.interactions[request_count]
+        elif request_id in session.request_to_interaction:
+            interaction = session.get_interaction(request_id=request_id)
+        if interaction is not None:
             headers.update(
                 {
                     "X-Triotune-Interaction-Id": interaction.interaction_id,
@@ -341,7 +372,9 @@ class OpenAIProxyServer:
 
         app = FastAPI()
 
-        async def forward(endpoint, payload, session_id, parent_interaction_id):
+        async def forward(
+            endpoint, payload, session_id, parent_interaction_id, request_id
+        ):
             """Execute one route request while retaining its precise identity."""
             # Select one session here and pass it explicitly. A shared client
             # is never mutated, so independent HTTP requests cannot mix traces.
@@ -355,6 +388,7 @@ class OpenAIProxyServer:
                     payload,
                     session_id,
                     parent_interaction_id,
+                    request_id,
                     session=session,
                     is_new=is_new,
                 )
@@ -362,7 +396,7 @@ class OpenAIProxyServer:
                 raise HTTPException(
                     status_code=400,
                     detail=str(exc),
-                    headers=self._identity_headers(session, request_count),
+                    headers=self._identity_headers(session, request_count, request_id),
                 ) from exc
             except APIStatusError as exc:
                 # Keep upstream API failures visible to downstream SDK retry
@@ -371,7 +405,7 @@ class OpenAIProxyServer:
                 return JSONResponse(
                     status_code=exc.status_code,
                     content={"error": body},
-                    headers=self._identity_headers(session, request_count),
+                    headers=self._identity_headers(session, request_count, request_id),
                 )
             except APIConnectionError as exc:
                 return JSONResponse(
@@ -379,7 +413,7 @@ class OpenAIProxyServer:
                     content={
                         "error": {"message": str(exc), "type": type(exc).__name__}
                     },
-                    headers=self._identity_headers(session, request_count),
+                    headers=self._identity_headers(session, request_count, request_id),
                 )
             except Exception:  # noqa: BLE001 -- preserve identity for unexpected SDK failures
                 # The client retains the original exception in its failed
@@ -393,11 +427,11 @@ class OpenAIProxyServer:
                             "type": "proxy_error",
                         }
                     },
-                    headers=self._identity_headers(session, request_count),
+                    headers=self._identity_headers(session, request_count, request_id),
                 )
             return JSONResponse(
                 content=session._jsonable(response),
-                headers=self._identity_headers(session, request_count),
+                headers=self._identity_headers(session, request_count, request_id),
             )
 
         @app.post("/v1/chat/completions")
@@ -409,12 +443,16 @@ class OpenAIProxyServer:
             parent_interaction_id: str | None = Header(
                 default=None, alias="X-Triotune-Parent-Interaction-Id"
             ),
+            request_id: str | None = Header(
+                default=None, alias="X-Triotune-Request-Id"
+            ),
         ):
             return await forward(
                 self.client.create_chat_completion,
                 payload,
                 session_id,
                 parent_interaction_id,
+                request_id,
             )
 
         @app.post("/v1/responses")
@@ -426,9 +464,16 @@ class OpenAIProxyServer:
             parent_interaction_id: str | None = Header(
                 default=None, alias="X-Triotune-Parent-Interaction-Id"
             ),
+            request_id: str | None = Header(
+                default=None, alias="X-Triotune-Request-Id"
+            ),
         ):
             return await forward(
-                self.client.create_response, payload, session_id, parent_interaction_id
+                self.client.create_response,
+                payload,
+                session_id,
+                parent_interaction_id,
+                request_id,
             )
 
         return app

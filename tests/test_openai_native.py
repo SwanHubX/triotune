@@ -757,6 +757,32 @@ class NativeToolsTests(unittest.IsolatedAsyncioTestCase):
                     )
             self.assertEqual(sampler.calls, [])
 
+    async def test_agent_total_token_budget_preserves_completed_tool_results(self):
+        first_output = "</think>\n" + xml_call() + "<|im_end|>"
+        client, sampler, session = self.setup_backend(
+            [first_output, "</think>\n5<|im_end|>"]
+        )
+        if isinstance(self.tokenizer, NativeTokenizer):
+            budget = len(self.tokenizer.encode(first_output, add_special_tokens=False))
+        else:
+            visible = first_output.removesuffix("<|im_end|>")
+            budget = sum(
+                len(self.tokenizer.encode(char, add_special_tokens=False))
+                for char in visible
+            ) + len(self.tokenizer.encode("<|im_end|>", add_special_tokens=False))
+        agent = Agent(
+            name="budget",
+            instructions="Use add",
+            tools=[add],
+            client=client,
+            max_generated_tokens=budget,
+        )
+        with self.assertRaisesRegex(TimeoutError, "token budget"):
+            await agent.run("go", session=session, training=True)
+        self.assertEqual(len(sampler.calls), 1)
+        self.assertEqual(session.interactions[0].tool_results[0]["content"], "5")
+        self.assertEqual(session.status, "failed")
+
     async def test_native_request_preflight_does_not_consume_proxy_capacity(self):
         """Pure request validation must keep the earlier empty-session cleanup."""
         adapter, sampler, template = self.setup_backend(["</think>\n5<|im_end|>"])

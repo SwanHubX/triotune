@@ -54,6 +54,7 @@ class OpenAIInteraction:
     started_at: float
     context: ExecutionContext
     request: dict[str, Any] = field(default_factory=dict)
+    identity_payload: dict[str, Any] = field(default_factory=dict)
     response: dict[str, Any] = field(default_factory=dict)
     server_request_id: str | None = None
     error: str | None = None
@@ -114,6 +115,8 @@ class OpenAISession:
         snapshot_id: str | None = None,
         policy_version: int | str | None = None,
         resource_owner: str | None = None,
+        max_generated_tokens: int | None = None,
+        episode_timeout: float | None = None,
     ) -> None:
         """Bind collector identity or create independently identified inference records.
 
@@ -124,6 +127,19 @@ class OpenAISession:
         """
         if type(training) is not bool:
             raise AgentContractError("training must be boolean.")
+        if max_generated_tokens is not None and (
+            type(max_generated_tokens) is not int or max_generated_tokens < 1
+        ):
+            raise AgentContractError("max_generated_tokens must be positive or None.")
+        if episode_timeout is not None and (
+            isinstance(episode_timeout, bool)
+            or not isinstance(episode_timeout, (int, float))
+            or not math.isfinite(float(episode_timeout))
+            or episode_timeout <= 0
+        ):
+            raise AgentContractError(
+                "episode_timeout must be finite and positive or None."
+            )
         if training and context is None:
             raise AgentContractError(
                 "Training sessions require a collector ExecutionContext."
@@ -197,6 +213,9 @@ class OpenAISession:
         self.interactions: list[OpenAIInteraction] = []
         self.rewards: list[Any] = []
         self.events: list[AgentEvent] = []
+        self.retries: list[Any] = []
+        self.failure_classification: tuple[str, str] | None = None
+        self.accepted: bool | None = None
         self._reward_ids: dict[str, dict[str, Any]] = {}
         self._by_id: dict[str, OpenAIInteraction] = {}
         self._interaction_contexts: dict[str, ExecutionContext] = {}
@@ -206,6 +225,66 @@ class OpenAISession:
         self.error: str | None = None
         self.released = False
         self.running = False
+        self._max_generated_tokens = max_generated_tokens
+        self._episode_timeout = episode_timeout
+        self._started_at = None
+
+    def configure_limits(
+        self,
+        *,
+        max_generated_tokens: int | None = None,
+        episode_timeout: float | None = None,
+    ) -> None:
+        """Configure one attempt's total budgets before its first request.
+
+        The session owns these limits so direct clients, the built-in Agent,
+        proxy calls, and third-party callbacks cannot silently use different
+        timeout or generated-token accounting. Existing interactions cannot be
+        reconfigured; this prevents a later continuation from extending an
+        already running episode.
+        """
+        if self.interactions or self.running or self.status != "open" or self.released:
+            raise AgentContractError(
+                "Session limits must be configured before execution."
+            )
+        if max_generated_tokens is not None and (
+            type(max_generated_tokens) is not int or max_generated_tokens < 1
+        ):
+            raise AgentContractError("max_generated_tokens must be positive or None.")
+        if episode_timeout is not None and (
+            isinstance(episode_timeout, bool)
+            or not isinstance(episode_timeout, (int, float))
+            or not math.isfinite(float(episode_timeout))
+            or episode_timeout <= 0
+        ):
+            raise AgentContractError(
+                "episode_timeout must be finite and positive or None."
+            )
+        self._max_generated_tokens = max_generated_tokens
+        self._episode_timeout = episode_timeout
+
+    def begin_execution(self) -> None:
+        """Start the monotonic clock used by all requests in this session."""
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+
+    def remaining_timeout(self) -> float | None:
+        """Return seconds remaining in the total episode budget."""
+        if self._episode_timeout is None or self._started_at is None:
+            return None
+        return self._episode_timeout - (time.monotonic() - self._started_at)
+
+    def remaining_generated_tokens(self) -> int | None:
+        """Return the unsampled output budget, using original IDs when present."""
+        if self._max_generated_tokens is None:
+            return None
+        used = 0
+        for item in self.interactions:
+            if item.output_ids is not None:
+                used += len(item.output_ids)
+            elif item.output_tokens is not None:
+                used += item.output_tokens
+        return self._max_generated_tokens - used
 
     @property
     def session_id(self) -> str:
@@ -682,6 +761,8 @@ class OpenAISession:
         payload: dict[str, Any],
         *,
         parent_interaction_id: str | None = None,
+        request_id: str | None = None,
+        identity_payload: dict[str, Any] | None = None,
     ) -> OpenAIInteraction:
         """Allocate request and child identity before backend execution.
 
@@ -691,6 +772,10 @@ class OpenAISession:
         separate sessions.
         """
         self.validate_identity()
+        self.begin_execution()
+        remaining = self.remaining_timeout()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("Session episode timeout exceeded.")
         if self.status != "open" or self.released:
             raise AgentContractError(
                 "A terminal or released session cannot start requests."
@@ -700,12 +785,21 @@ class OpenAISession:
                 "Concurrent requests require separate OpenAI sessions."
             )
         parent = self._parent(endpoint, payload, parent_interaction_id)
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or not request_id
+            or len(request_id) > 128
+            or request_id in self.request_to_interaction
+        ):
+            raise AgentContractError(
+                "Request IDs must be new strings of 1 to 128 characters."
+            )
         results = self._tool_result_bindings(
             endpoint, payload, parent, explicit_parent=parent_interaction_id is not None
         )
         interaction_id = f"int_{uuid4().hex}"
         interaction = OpenAIInteraction(
-            request_id=f"req_{uuid4().hex}",
+            request_id=request_id or f"req_{uuid4().hex}",
             interaction_id=interaction_id,
             parent_interaction_id=parent,
             endpoint=endpoint,
@@ -716,6 +810,9 @@ class OpenAISession:
                 parent_interaction_id=parent,
             ),
             request=copy.deepcopy(payload),
+            identity_payload=copy.deepcopy(
+                payload if identity_payload is None else identity_payload
+            ),
         )
         self.interactions.append(interaction)
         self._by_id[interaction_id] = interaction
@@ -735,6 +832,44 @@ class OpenAISession:
             self.record_tool_results(owner, [result])
             self.events.append(ToolResultEvent(context=owner.context, result=result))
         return interaction
+
+    def replay_request(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        request_id: str | None,
+        parent_interaction_id: str | None = None,
+    ) -> Any | None:
+        """Resolve an explicit duplicate request without prompt-based guessing.
+
+        Only an exact endpoint, payload, and resolved parent match can replay a
+        completed response. The provider is not called again, no interaction or
+        tool event is appended, and the stored response is copied before it is
+        returned. Reusing an ID for different content or while the original is
+        active/failed is a contract error rather than a second completion.
+        """
+        if request_id is None:
+            return None
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise AgentContractError("Request IDs must contain 1 to 128 characters.")
+        interaction_id = self.request_to_interaction.get(request_id)
+        if interaction_id is None:
+            return None
+        interaction = self._by_id[interaction_id]
+        parent = self._parent(endpoint, payload, parent_interaction_id)
+        if (
+            interaction.endpoint != endpoint
+            or interaction.parent_interaction_id != parent
+            or self._normalized(interaction.identity_payload)
+            != self._normalized(payload)
+        ):
+            raise AgentContractError(
+                "Request ID was reused with different request content."
+            )
+        if interaction.status != "completed" or not interaction.response:
+            raise AgentContractError("Only a completed request can be replayed.")
+        return copy.deepcopy(interaction.response)
 
     def complete_request(self, interaction: OpenAIInteraction, response: Any) -> None:
         """Capture provider IDs, usage, logprobs, and optional raw token evidence.
@@ -836,6 +971,17 @@ class OpenAISession:
             interaction.logprobs = tuple(float(value) for value in logprobs)
             interaction.stop_reason = stop_reason
             interaction.sampling_source = source
+        if (
+            self._max_generated_tokens is not None
+            and interaction.output_ids is None
+            and interaction.output_tokens is None
+        ):
+            raise AgentContractError(
+                "Generated-token budgets require exact IDs or provider output usage."
+            )
+        remaining_tokens = self.remaining_generated_tokens()
+        if remaining_tokens is not None and remaining_tokens < 0:
+            raise AgentContractError("Session total generated-token budget exceeded.")
         interaction.status = _value(response, "status", "completed") or "completed"
         if choices and _value(choices[0], "finish_reason") in {
             "length",
@@ -1082,6 +1228,9 @@ class OpenAISession:
                 "status": self.status,
                 "error": self.error,
                 "released": self.released,
+                "accepted": self.accepted,
+                "failure_classification": self.failure_classification,
+                "retries": self._jsonable(self.retries),
                 "events": self._jsonable(self.events),
             },
         )
