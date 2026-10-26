@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from triotune.agentrl import FunctionToolExecutor
+from triotune.agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 from triotune.agentrl.sdk.openai import (
     Agent,
     OpenAIChatObservationFormatter,
@@ -17,6 +18,7 @@ from triotune.agentrl.sdk.openai import (
     OpenAIProxyServer,
     OpenAISession,
     OpenAIWorkflow,
+    PyTRIOBackend,
     function_tool,
 )
 from triotune.agentrl.types import (
@@ -1362,6 +1364,222 @@ class ProxyAllocationTests(unittest.IsolatedAsyncioTestCase):
         for invalid in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 OpenAIProxyServer(None, max_released_session_ids=invalid)
+
+
+class PyTRIOBackendTests(unittest.IsolatedAsyncioTestCase):
+    """The OpenAI façade preserves fixed PyTRIO sampling evidence."""
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, **kwargs
+        ):
+            del kwargs
+            values = []
+            for message in messages:
+                values.extend(ord(char) for char in message["content"])
+                values.append(1)
+            if add_generation_prompt:
+                values.extend((2, 3))
+            return values if tokenize else ""
+
+        def decode(self, tokens, *, skip_special_tokens=False):
+            return "".join(
+                "" if skip_special_tokens and token in {1, 2, 3} else chr(token)
+                for token in tokens
+            )
+
+    class SamplingClient:
+        def __init__(self, *, logprobs=True, output="answer"):
+            self.calls = []
+            self.logprobs = logprobs
+            self.output = output
+
+        async def sample_async(self, *, prompt, num_samples, sampling_params):
+            self.calls.append((prompt.to_ints(), num_samples, sampling_params))
+            tokens = [ord(char) for char in self.output] + [1]
+            reason = "stop"
+            if (
+                sampling_params.max_tokens is not None
+                and len(tokens) > sampling_params.max_tokens
+            ):
+                tokens = tokens[: sampling_params.max_tokens]
+                reason = "length"
+            return SimpleNamespace(
+                sequences=[
+                    SimpleNamespace(
+                        tokens=tokens,
+                        logprobs=([-0.1] * len(tokens) if self.logprobs else None),
+                        stop_reason=reason,
+                    )
+                ],
+                input_tokens=len(prompt.to_ints()),
+                output_tokens=len(tokens),
+            )
+
+    @classmethod
+    def snapshot(cls, *, logprobs=True, output="answer"):
+        tokenizer = cls.Tokenizer()
+        client = cls.SamplingClient(logprobs=logprobs, output=output)
+        sampler = PyTRIOAgentSampler(client, tokenizer)
+        snapshot = SamplingSnapshot(
+            "pytrio-snapshot", sampler, tokenizer, policy_version=7
+        )
+        return snapshot, client
+
+    @staticmethod
+    def context(snapshot_id="pytrio-snapshot", policy_version=7):
+        return ExecutionContext(
+            rollout_id="pytrio-rollout",
+            episode_id="pytrio-episode",
+            group_id="pytrio-group",
+            sample_index=0,
+            group_size=1,
+            snapshot_id=snapshot_id,
+            policy_version=policy_version,
+            resource_owner="test",
+        )
+
+    async def test_snapshot_backend_forwards_sampling_and_preserves_raw_arrays(self):
+        snapshot, sampling_client = self.snapshot()
+        backend = PyTRIOBackend(snapshot, model="fake-model", max_tokens=12)
+        adapter = OpenAIClient(backend=backend)
+        session = OpenAISession(context=self.context(), training=True)
+        response = await adapter.create_chat_completion(
+            messages=[{"role": "user", "content": "hello"}],
+            session=session,
+            max_tokens=8,
+            seed=13,
+            temperature=1,
+            top_p=1.0,
+        )
+        prompt, count, params = sampling_client.calls[0]
+        self.assertEqual(prompt, [*map(ord, "hello"), 1, 2, 3])
+        self.assertEqual(count, 1)
+        self.assertEqual(params.max_tokens, 8)
+        self.assertEqual(params.seed, 13)
+        self.assertEqual(params.temperature, 1)
+        self.assertEqual(params.top_p, 1)
+        interaction = session.interactions[0]
+        self.assertEqual(interaction.input_ids, tuple(prompt))
+        self.assertEqual(interaction.output_ids, tuple(ord(c) for c in "answer") + (1,))
+        self.assertEqual(interaction.logprobs, (-0.1,) * len(interaction.output_ids))
+        self.assertEqual(interaction.stop_reason, "stop")
+        self.assertEqual(interaction.sampling_source, "pytrio")
+        self.assertEqual(response["choices"][0]["message"]["content"], "answer")
+        session.finish()
+        exported = session.export_trajectory()
+        self.assertEqual(exported.interactions[0]["sampling_source"], "pytrio")
+        self.assertEqual(exported.interactions[0]["input_ids"], prompt)
+
+    async def test_responses_input_uses_same_snapshot_backend(self):
+        snapshot, sampling_client = self.snapshot(output="response")
+        adapter = OpenAIClient(backend=PyTRIOBackend(snapshot, model="fake-model"))
+        session = OpenAISession(context=self.context(), training=True)
+        response = await adapter.create_response(
+            input="question", session=session, max_output_tokens=16
+        )
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(sampling_client.calls[0][0], [*map(ord, "question"), 1, 2, 3])
+
+    async def test_agent_uses_bound_backend_without_changing_session_provenance(self):
+        snapshot, _ = self.snapshot(output="final")
+        context = self.context()
+        agent = Agent(
+            name="pytrio-agent",
+            instructions="Answer briefly.",
+            model="fake-model",
+            client=OpenAIClient(backend=PyTRIOBackend(snapshot, model="fake-model")),
+        )
+        result = await agent.run("question", context=context, training=True)
+        self.assertEqual(result.text, "final")
+        self.assertEqual(result.session.status, "completed")
+        self.assertEqual(result.session.context, context)
+        self.assertEqual(
+            result.session.interactions[0].sampling_source,
+            "pytrio",
+        )
+
+    async def test_proxy_factory_can_supply_collector_session_for_pytrio_backend(self):
+        snapshot, sampling_client = self.snapshot(output="proxy")
+        context = self.context()
+        proxy = OpenAIProxyServer(
+            backend=PyTRIOBackend(snapshot, model="fake-model"),
+            session_factory=lambda session_id: OpenAISession(
+                context=context, training=True, session_id=session_id
+            ),
+        )
+        response = await proxy.chat_completions(
+            {
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "question"}],
+            },
+            session_id="proxy-session",
+        )
+        self.assertEqual(response["choices"][0]["message"]["content"], "proxy")
+        self.assertEqual(len(sampling_client.calls), 1)
+        proxy.finish_session("proxy-session")
+        self.assertEqual(
+            proxy.sessions["proxy-session"].interactions[0].sampling_source,
+            "pytrio",
+        )
+
+    async def test_training_parameters_model_and_snapshot_version_are_strict(self):
+        snapshot, sampling_client = self.snapshot()
+        backend = PyTRIOBackend(snapshot, model="bound-model")
+        cases = (
+            {"model": "other"},
+            {"temperature": 0.7},
+            {"top_p": 0.9},
+            {"stream": True},
+            {"n": 2},
+            {"stop": "different"},
+        )
+        for options in cases:
+            session = OpenAISession(context=self.context(), training=True)
+            adapter = OpenAIClient(backend=backend)
+            prevalidated = options.get("stream") or options.get("n", 1) != 1
+            expected_error = ValueError if prevalidated else AgentContractError
+            with self.subTest(options=options), self.assertRaises(expected_error):
+                await adapter.create_chat_completion(
+                    messages=[{"role": "user", "content": "x"}],
+                    session=session,
+                    **options,
+                )
+            self.assertEqual(session.status, "open" if prevalidated else "failed")
+        mismatch = OpenAISession(
+            context=self.context(snapshot_id="other"), training=True
+        )
+        with self.assertRaises(AgentContractError):
+            await OpenAIClient(backend=backend).create_chat_completion(
+                messages=[{"role": "user", "content": "x"}], session=mismatch
+            )
+        self.assertEqual(sampling_client.calls, [])
+
+    async def test_missing_logprobs_and_truncation_remain_explicit_failures(self):
+        snapshot, _ = self.snapshot(logprobs=False)
+        session = OpenAISession(context=self.context(), training=True)
+        with self.assertRaises(AgentContractError):
+            await OpenAIClient(
+                backend=PyTRIOBackend(snapshot, model="fake-model")
+            ).create_chat_completion(
+                messages=[{"role": "user", "content": "x"}], session=session
+            )
+        self.assertEqual(session.status, "failed")
+        self.assertIsNone(session.interactions[0].output_ids)
+
+        snapshot, _ = self.snapshot(output="long-output")
+        session = OpenAISession(context=self.context(), training=True)
+        response = await OpenAIClient(
+            backend=PyTRIOBackend(snapshot, model="fake-model")
+        ).create_chat_completion(
+            messages=[{"role": "user", "content": "x"}],
+            session=session,
+            max_tokens=2,
+        )
+        self.assertEqual(response["choices"][0]["finish_reason"], "length")
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(session.interactions[0].stop_reason, "length")
+        self.assertEqual(len(session.interactions[0].output_ids), 2)
 
 
 @unittest.skipUnless(

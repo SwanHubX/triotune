@@ -1,4 +1,12 @@
-"""Parse and format OpenAI native tool-call messages."""
+"""Parse native OpenAI tool calls and format their observations.
+
+Chat Completions and Responses expose different wire representations for the
+same logical action.  The parser normalizes both forms into ``AgentAction`` and
+``ToolCall`` records while preserving provider call IDs; the formatters perform
+the inverse operation for tool results.  This module does not execute tools,
+retry requests, or assign rewards, which keeps protocol parsing independent of
+session and training lifecycle decisions.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +19,24 @@ from ...types import ActionParseError, AgentAction, ToolCall, ToolResult
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from either an SDK model object or a plain mapping."""
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
 
 
 class OpenAINativeActionParser:
-    """Convert Chat Completions or Responses output into ``AgentAction``."""
+    """Convert completed OpenAI responses into provider-neutral actions.
+
+    Exactly one response choice is accepted for Chat Completions, while
+    Responses items are scanned in order so reasoning, message, and function
+    call items retain their original sequence.  Incomplete responses are
+    rejected before an action can reach the tool executor because their token
+    evidence cannot represent a completed decision.
+    """
 
     def parse_chat_completion(self, response: Any) -> AgentAction:
+        """Parse one Chat Completions choice and preserve native call IDs."""
         choices = _value(response, "choices", ())
         if not choices:
             raise ActionParseError("OpenAI chat completion has no choices.")
@@ -53,6 +70,7 @@ class OpenAINativeActionParser:
         return AgentAction(assistant, final_text=content)
 
     def parse_response(self, response: Any) -> AgentAction:
+        """Parse Responses output items into text or ordered function calls."""
         if _value(response, "status", "completed") != "completed":
             raise ActionParseError("OpenAI response is not completed.")
         output = _value(response, "output", ()) or ()
@@ -120,6 +138,7 @@ class OpenAINativeActionParser:
 
     @staticmethod
     def _tool_call(item: Any, index: int) -> ToolCall:
+        """Validate and normalize one Chat Completions function call."""
         if _value(item, "type", "function") != "function":
             raise ActionParseError("Only OpenAI function tools are supported.")
         function = _value(item, "function", {})
@@ -151,6 +170,7 @@ class OpenAINativeActionParser:
 
     @staticmethod
     def _raw_chat_call(item: Any, index: int) -> dict[str, Any]:
+        """Re-encode a parsed call for the next Chat Completions request."""
         function = _value(item, "function", {})
         return {
             "id": str(_value(item, "id", index)),
@@ -167,9 +187,10 @@ class OpenAINativeActionParser:
 
 
 class OpenAIChatObservationFormatter:
-    """Format tool results as Chat Completions ``tool`` messages."""
+    """Format ordered tool results as Chat Completions ``tool`` messages."""
 
     def format(self, results: Sequence[ToolResult]) -> list[dict[str, Any]]:
+        """Attach each observation to its original provider call ID."""
         return [
             {
                 "role": "tool",
@@ -181,9 +202,10 @@ class OpenAIChatObservationFormatter:
 
 
 class OpenAIResponsesObservationFormatter:
-    """Format tool results as Responses function-call outputs."""
+    """Format ordered tool results as Responses function-call outputs."""
 
     def format(self, results: Sequence[ToolResult]) -> list[dict[str, Any]]:
+        """Return continuation items accepted by the Responses endpoint."""
         return [
             {
                 "type": "function_call_output",

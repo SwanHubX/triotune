@@ -129,8 +129,16 @@ calls; no alternative candidate allocator is used. This SDK facade is not yet
 an `EpisodeExecutor`: the example records external API evidence for a candidate,
 not model actions sampled from PyTRIO. Snapshot validation checks identity only
 and never invokes its sampler or selects its weights. Export always retains
-`trainable=False`, even when `training_context=True`. A later sampling backend
-and exact-token exporter are still required before external SDK runs enter PPO.
+`trainable=False`, even when `training_context=True`. To sample through the
+current policy instead of an external provider, construct
+`PyTRIOBackend(snapshot, model=...)` and pass it to `OpenAIClient(backend=...)`.
+The backend requires a training session whose snapshot and policy version match,
+enforces temperature/top-p equal to one, and records exact prompt IDs, output
+IDs, behavior logprobs, stop reason, and `sampling_source="pytrio"`. It reuses
+the snapshot's `PyTRIOAgentSampler`, so the existing `call_async()` and trainer
+owned sampler lifecycle remain authoritative. The API trace remains separate
+from PPO `RolloutExport`; an exporter still must convert these records into the
+existing episode/trajectory contract before training.
 
 Sessions start with status `open`. `Agent.run()` automatically finishes them
 as `completed`, `failed`, or `cancelled`, including tool failures and turn-limit
@@ -152,9 +160,11 @@ Every request allocates a request ID and a child `ExecutionContext` before SDK
 execution. API and tool code can read `current_execution_context()`. Context
 is task-local, including sync tools dispatched to worker threads. The trace
 records local request IDs, provider request IDs, completion IDs, messages,
-tool calls/results, usage, available logprobs, status and latency. Native tool
-call IDs are preserved in observations. Responses continuation retains all
-output items, including reasoning items, before appending function outputs.
+tool calls/results, usage, available logprobs, status and latency. A PyTRIO
+backend additionally records exact `input_ids`, `output_ids`, aligned behavior
+`logprobs`, `stop_reason`, and `sampling_source`. Native tool call IDs are
+preserved in observations. Responses continuation retains all output items,
+including reasoning items, before appending function outputs.
 
 Each child context changes only interaction/parent identity from the root;
 candidate fields stay unchanged across API calls and local tools. Agent execution
@@ -233,6 +243,10 @@ Existing PyTRIO agent training and its exact-token exporter remain unchanged.
 `OpenAIProxyServer(adapter).create_app()` returns an ASGI application exposing
 `POST /v1/chat/completions` and `POST /v1/responses`. It forwards API requests;
 the high-level `Agent` is responsible for executing local tools.
+When the adapter uses `PyTRIOBackend`, provide a `session_factory` that returns
+the collector's training `OpenAISession(context=..., training=True)` for each
+session ID. The default proxy session factory creates inference sessions and is
+therefore intentionally rejected by the training-only PyTRIO backend.
 
 Requests can use `X-Triotune-Session-Id`; generated session and local request
 IDs are returned in `X-Triotune-Session-Id` and `X-Client-Request-Id` response

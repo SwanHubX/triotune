@@ -1,10 +1,19 @@
-"""Optional local ASGI routes for recorded OpenAI SDK requests."""
+"""Expose optional local ASGI routes over the session-aware OpenAI client.
+
+The proxy is deliberately an embedding adapter rather than a public server: it
+forwards two non-streaming endpoints, keeps sessions in a bounded in-memory
+registry, and returns identity headers that let callers continue or release a
+trace.  Authentication, process supervision, durable storage, and policy
+allocation remain responsibilities of the host application.
+"""
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
+from .backend import OpenAIBackend
 from .client import OpenAIClient
 from .session import OpenAISession
 
@@ -17,26 +26,41 @@ class OpenAIProxyServer:
     the generated session and request IDs are returned as response headers.
     Session traces are available to the embedding application via ``sessions``.
     The injected SDK client retains its caller-owned resource lifecycle.
+    A ``session_factory`` can provide collector-bound training sessions when a
+    PyTRIO backend is used; the default factory creates inference sessions.
     """
 
     def __init__(
         self,
-        client: OpenAIClient,
+        client: OpenAIClient | None = None,
         *,
+        backend: OpenAIBackend | None = None,
+        session_factory: Callable[[str | None], OpenAISession] | None = None,
         max_sessions: int = 1024,
         max_released_session_ids: int = 1024,
     ):
+        """Configure transport/backend selection and bounded session storage.
+
+        ``session_factory`` is the injection point for collector-owned training
+        sessions.  Without it, newly allocated sessions are inference records;
+        this prevents an HTTP session ID from being mistaken for a rollout or
+        policy snapshot identity.
+        """
         if type(max_sessions) is not int or max_sessions < 1:
             raise ValueError("max_sessions must be a positive integer.")
         if type(max_released_session_ids) is not int or max_released_session_ids < 1:
             raise ValueError("max_released_session_ids must be a positive integer.")
-        self.client = client
+        if client is not None and backend is not None:
+            raise ValueError("Choose either an OpenAI client or a backend.")
+        self.client = OpenAIClient(backend=backend) if backend is not None else client
+        self.session_factory = session_factory
         self.max_sessions = max_sessions
         self.max_released_session_ids = max_released_session_ids
         self.sessions: dict[str, OpenAISession] = {}
         self._released_session_ids: OrderedDict[str, None] = OrderedDict()
 
     def _session(self, session_id):
+        """Resolve or allocate one session while enforcing capacity and tombstones."""
         if session_id is not None and (not session_id or len(session_id) > 128):
             raise ValueError("Session IDs must contain 1 to 128 characters.")
         if session_id in self._released_session_ids:
@@ -47,12 +71,25 @@ class OpenAIProxyServer:
             raise ValueError(
                 "Session capacity reached; release a completed session first."
             )
-        session = OpenAISession(session_id=session_id)
+        session = (
+            self.session_factory(session_id)
+            if self.session_factory is not None
+            else OpenAISession(session_id=session_id)
+        )
+        if not isinstance(session, OpenAISession):
+            raise TypeError("session_factory must return an OpenAISession.")
+        if session_id is not None and session.session_id != session_id:
+            raise ValueError("session_factory must preserve the requested session ID.")
         self.sessions[session.session_id] = session
         return session
 
     def release_session(self, session_id: str) -> OpenAISession:
-        """Transfer a completed trace out of the server's bounded registry."""
+        """Transfer a completed trace out of the bounded registry.
+
+        Release first freezes the session, then records a bounded tombstone so
+        a late retry cannot silently append to the released trace.  The trace
+        object returned to the caller remains exportable for diagnostics.
+        """
         session = self.sessions[session_id]
         session.release()
         # Tombstones reject late retries within a bounded FIFO retention
@@ -65,7 +102,7 @@ class OpenAIProxyServer:
     def finish_session(
         self, session_id: str, status: str = "completed", *, error: str | None = None
     ) -> None:
-        """Seal an idle session before delayed rewards, export or release.
+        """Seal an idle session before delayed rewards, export, or release.
 
         Successful HTTP requests leave the session open for continuation.
         The embedding application decides when its external agent has ended;
@@ -76,6 +113,7 @@ class OpenAIProxyServer:
     async def chat_completions(
         self, payload: dict[str, Any], *, session_id=None, parent_interaction_id=None
     ) -> Any:
+        """Forward one Chat Completions payload through a session registry entry."""
         return (
             await self._request(
                 self.client.create_chat_completion,
@@ -88,6 +126,7 @@ class OpenAIProxyServer:
     async def responses(
         self, payload: dict[str, Any], *, session_id=None, parent_interaction_id=None
     ) -> Any:
+        """Forward one Responses payload through a session registry entry."""
         return (
             await self._request(
                 self.client.create_response, payload, session_id, parent_interaction_id
@@ -115,7 +154,13 @@ class OpenAIProxyServer:
         session=None,
         is_new=None,
     ):
-        """Share allocation cleanup between Python handlers and ASGI routes."""
+        """Share allocation and cleanup rules between direct and HTTP handlers.
+
+        Payload identity fields are rejected because headers and handler
+        arguments are the trusted source of session and parent IDs.  A backend
+        failure after interaction allocation is preserved in the session; only
+        an empty session created for a preflight validation error is reclaimed.
+        """
         if session is None:
             is_new = session_id not in self.sessions
             session = self._session(session_id)
@@ -155,7 +200,13 @@ class OpenAIProxyServer:
         return headers
 
     def create_app(self):
-        """Build an optional FastAPI application without launching a server."""
+        """Build an optional FastAPI ASGI app without launching a server.
+
+        The nested forwarding handler translates local validation failures into
+        400 responses, preserves upstream HTTP status classes, and always
+        includes the identity headers that the caller needs to inspect or
+        release a failed request.
+        """
         from fastapi import FastAPI, Header, HTTPException
         from fastapi.responses import JSONResponse
         from openai import APIConnectionError, APIStatusError, APITimeoutError
@@ -163,6 +214,7 @@ class OpenAIProxyServer:
         app = FastAPI()
 
         async def forward(endpoint, payload, session_id, parent_interaction_id):
+            """Execute one route request while retaining its precise identity."""
             # Select one session here and pass it explicitly. A shared client
             # is never mutated, so independent HTTP requests cannot mix traces.
             session, request_count = None, 0

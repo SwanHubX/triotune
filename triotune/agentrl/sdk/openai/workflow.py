@@ -1,4 +1,11 @@
-"""Workflow façade for collecting OpenAI agent sessions."""
+"""Small workflow façade for context-bound OpenAI agent executions.
+
+The workflow does not allocate rollout identities, refresh policies, or invoke
+the PyTRIO sampler.  A collector supplies those objects and this façade checks
+their relationship before delegating to ``Agent``.  Keeping reward submission
+and trace export as explicit methods also makes the delayed lifecycle visible
+to callers instead of hiding it inside a request callback.
+"""
 
 from __future__ import annotations
 
@@ -11,9 +18,10 @@ from .session import OpenAISession
 
 
 class OpenAIWorkflow:
-    """Run one or more agents while preserving each session independently."""
+    """Run an agent while preserving collector identity and session isolation."""
 
     def __init__(self, agent: Agent):
+        """Bind an already configured agent; no network or sampler starts here."""
         self.agent = agent
 
     async def run(
@@ -31,6 +39,11 @@ class OpenAIWorkflow:
         Snapshot validation checks provenance only. This external OpenAI
         workflow does not invoke the snapshot sampler, implement EpisodeExecutor
         or produce a PPO RolloutExport. Its exported trace remains untrainable.
+
+        Supplying ``snapshot`` turns provenance checking on: the supplied root
+        context must carry the same snapshot ID and policy version, and the
+        delegated run is forced into training-session validation.  The snapshot
+        object itself is never mutated or refreshed by this façade.
         """
         if type(training) is not bool:
             raise AgentContractError("training must be boolean.")
@@ -61,7 +74,9 @@ class OpenAIWorkflow:
         )
 
     async def submit_reward(self, result: AgentRunResult, reward: Any, **kwargs) -> Any:
+        """Submit one delayed reward through the result's session owner."""
         return result.session.submit_reward(reward, **kwargs)
 
     def export_trajectory(self, result: AgentRunResult):
+        """Export a terminal result trace after session quiescence checks."""
         return result.export_trajectory()

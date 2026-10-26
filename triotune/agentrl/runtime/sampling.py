@@ -19,6 +19,11 @@ from ...api.client_api import call_async
 from ...utils.token_usage import compute_sample_tokens
 from ..types import AgentContractError, AgentSampler, Generation, validate_tokens
 
+# PPO behavior-policy log probabilities are only valid for the deterministic
+# sampling configuration used by the existing trainer contract.
+PPO_TEMPERATURE = 1.0
+PPO_TOP_P = 1.0
+
 
 class PyTRIOAgentSampler:
     """Adapt an existing immutable sampling client; never refresh it mid-episode.
@@ -41,6 +46,7 @@ class PyTRIOAgentSampler:
         parser and chat template, especially when stop markers are not returned.
         """
         self.client, self.tokenizer, self.stop = client, tokenizer, stop
+        self.sampling_source = "pytrio"
 
     async def generate(
         self, prompt_tokens: Sequence[int], *, max_tokens: int, seed: int | None = None
@@ -72,8 +78,8 @@ class PyTRIOAgentSampler:
             num_samples=1,
             sampling_params=trio.SamplingParams(
                 max_tokens=max_tokens,
-                temperature=1.0,
-                top_p=1.0,
+                temperature=PPO_TEMPERATURE,
+                top_p=PPO_TOP_P,
                 seed=seed,
                 stop=self.stop,
             ),

@@ -1,4 +1,12 @@
-"""Derive tool schemas and argument validation from Python annotations."""
+"""Derive OpenAI function schemas and strict argument validation.
+
+The decorator is the translation boundary between a Python callable and the
+JSON object accepted by an OpenAI function call.  Schema generation and
+runtime validation intentionally share the same annotation interpretation so
+that a value accepted locally is representable on the wire.  No coercion is
+performed: a string that looks like a number and a boolean that looks like an
+integer remain invalid for numeric annotations.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +21,13 @@ from ...runtime.tools import FunctionTool
 
 
 def _schema(annotation: Any) -> dict[str, Any]:
-    """Support JSON scalars, lists, string-keyed dictionaries and unions.
+    """Convert one supported Python annotation into a JSON Schema fragment.
+
+    The conversion is deliberately limited to values that can be carried by
+    OpenAI's JSON tool protocol.  ``Annotated`` metadata is transparent,
+    unions become ``anyOf`` branches, and optional values are represented by a
+    JSON ``null`` branch rather than a provider-specific nullable extension.
+    Dictionaries must have string keys because JSON object keys are strings.
 
     Unsupported annotations fail at registration. Optional values use JSON
     Schema null branches rather than the OpenAPI ``nullable`` extension.
@@ -50,7 +64,14 @@ def _schema(annotation: Any) -> dict[str, Any]:
 
 
 def _matches(value: Any, annotation: Any) -> bool:
-    """Validate recursively without coercing strings or booleans to numbers."""
+    """Check a runtime value against an annotation without changing it.
+
+    Validation recurses through lists, dictionaries, unions, literals, and
+    ``Annotated`` values.  Exact type checks preserve the distinction between
+    ``bool`` and ``int``; floats intentionally accept integer values because
+    JSON has one numeric representation while still rejecting non-finite
+    values.
+    """
     origin, args = get_origin(annotation), get_args(annotation)
     if annotation in (inspect.Signature.empty, Any):
         return True
@@ -81,14 +102,18 @@ def function_tool(
     description: str | None = None,
     retry_safe: bool = False,
 ):
-    """Register a synchronous or asynchronous function using its type hints.
+    """Return a ``FunctionTool`` wrapper for a sync or async Python function.
 
     The first docstring paragraph describes the function. Defaults remain
     optional parameters and are applied by Python at invocation. Positional
-    only and variadic parameters cannot represent JSON keyword arguments.
+    only and variadic parameters cannot represent JSON keyword arguments. The
+    returned wrapper retains the original callable and retry-safety declaration
+    while adding an OpenAI-compatible schema and a validator used immediately
+    before tool execution.
     """
 
     def decorate(target: Callable[..., Any]) -> FunctionTool:
+        """Inspect one callable once and freeze its public tool contract."""
         signature = inspect.signature(target)
         hints = get_type_hints(target, include_extras=True)
         parameters: dict[str, Any] = {
@@ -117,6 +142,13 @@ def function_tool(
             parameters["properties"][parameter.name] = schema
 
         def validate(arguments: dict[str, Any]) -> dict[str, Any]:
+            """Validate model-supplied keyword arguments before invocation.
+
+            ``Signature.bind`` enforces missing and unexpected parameters;
+            annotation checks then enforce the same types used to build the
+            advertised schema.  Returning a fresh dictionary prevents a tool
+            implementation from mutating the caller's decoded request.
+            """
             bound = signature.bind(**arguments)
             json.dumps(arguments, allow_nan=False)
             for key, value in bound.arguments.items():

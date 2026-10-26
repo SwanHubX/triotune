@@ -30,7 +30,14 @@ from .runtime.conversation import (
 from .runtime.runner import EpisodeRunner
 from .runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 from .runtime.tools import FunctionTool, FunctionToolExecutor
-from .sdk.openai import Agent, OpenAIClient, OpenAISession, function_tool
+from .sdk.openai import (
+    Agent,
+    ExternalOpenAIBackend,
+    OpenAIClient,
+    OpenAISession,
+    PyTRIOBackend,
+    function_tool,
+)
 from .training.evaluation import evaluation_metrics, paired_task_metrics
 from .training.loop import AgentTrainingLoop
 from .training.rewards import (
@@ -114,6 +121,7 @@ __all__ = [
     "FailureClassifier",
     "EpisodeStatus",
     "EpisodeTrajectoryBuilder",
+    "ExternalOpenAIBackend",
     "ExecutionContext",
     "FunctionTool",
     "FunctionToolExecutor",
@@ -128,6 +136,7 @@ __all__ = [
     "JsonlEpisodeLogger",
     "ObservationFormatter",
     "PyTRIOAgentSampler",
+    "PyTRIOBackend",
     "RetryEvent",
     "RetryPolicy",
     "RewardEvent",

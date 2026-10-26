@@ -1,4 +1,12 @@
-"""Session and request provenance for OpenAI agent calls."""
+"""Track OpenAI request lineage, evidence, rewards, and terminal lifecycle.
+
+An ``OpenAISession`` is the SDK-side owner of one logical conversation.  It
+keeps the public session ID separate from collector identity, allocates one
+child ``ExecutionContext`` per request, maps local/provider IDs, and validates
+all delayed reward targets before mutating state.  It is intentionally a trace
+and contract boundary: exporting an API trace does not fabricate a PPO
+trajectory when a provider did not return exact token evidence.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ from ...types import AgentContractError, AgentEvent, EpisodeScore, ExecutionCont
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
+    """Read one field from either an SDK response object or a JSON mapping."""
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
@@ -22,7 +31,14 @@ def _value(value: Any, name: str, default: Any = None) -> Any:
 
 @dataclass(slots=True)
 class OpenAIInteraction:
-    """One OpenAI request and its completion/tool evidence."""
+    """One request and all completion, sampling, tool, and reward evidence.
+
+    ``status`` describes request progress independently from the containing
+    session.  The request and response IDs are immutable lookup keys in normal
+    operation; session validation detects an adapter that rewrites them after
+    allocation.  PyTRIO fields remain optional so ordinary external provider
+    traces can be recorded without pretending that text was re-tokenized.
+    """
 
     request_id: str
     interaction_id: str
@@ -38,6 +54,13 @@ class OpenAIInteraction:
     input_tokens: int | None = None
     output_tokens: int | None = None
     logprobs: Any = None
+    # PyTRIO-backed requests retain original IDs instead of reconstructing them
+    # from decoded response text, which would invalidate behavior-policy data.
+    input_ids: tuple[int, ...] | None = None
+    output_ids: tuple[int, ...] | None = None
+    stop_reason: str | None = None
+    # The source distinguishes fixed-snapshot sampling from provider traces.
+    sampling_source: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     reward: Any = None
@@ -48,7 +71,7 @@ class OpenAIInteraction:
 
 @dataclass(frozen=True, slots=True)
 class OpenAITrajectoryExport:
-    """API trace export, not an exact-token PPO ``RolloutExport``.
+    """Serializable API trace export, not an exact-token PPO ``RolloutExport``.
 
     API usage and text logprobs do not establish the original prompt/action
     token IDs. This trace must not be re-tokenized into behavior-policy data.
@@ -62,7 +85,13 @@ class OpenAITrajectoryExport:
 
 
 class OpenAISession:
-    """Own one session ID and preserve request/interaction lineage."""
+    """Own one session ID and preserve request/interaction lineage.
+
+    Sessions begin ``open`` and become terminal only after all running work is
+    idle.  Completed sessions accept delayed rewards; failed or cancelled
+    sessions retain evidence for export but reject training labels.  Release
+    freezes writes while keeping read-only inspection available to the caller.
+    """
 
     def __init__(
         self,
@@ -177,14 +206,17 @@ class OpenAISession:
 
     @property
     def training(self) -> bool:
+        """Return whether this session was explicitly bound to training provenance."""
         return self._training
 
     @property
     def rollout_id(self) -> str:
+        """Expose the collector rollout identity, not the SDK session ID."""
         return self.context.rollout_id
 
     @property
     def group_id(self) -> str:
+        """Expose the collector group identity associated with this candidate."""
         return self.context.group_id
 
     def validate_identity(self, context: ExecutionContext | None = None) -> None:
@@ -275,6 +307,7 @@ class OpenAISession:
         return self._by_id[interaction_id]
 
     def _require_idle(self) -> None:
+        """Reject lifecycle operations while agent or request work is active."""
         self.validate_identity()
         if self.running or any(item.status == "running" for item in self.interactions):
             raise AgentContractError(
@@ -424,7 +457,13 @@ class OpenAISession:
         *,
         parent_interaction_id: str | None = None,
     ) -> OpenAIInteraction:
-        """Allocate request and child interaction identity before an API call."""
+        """Allocate request and child identity before backend execution.
+
+        Allocation precedes the network/backend call so failures still have a
+        stable request ID, context, and latency record.  A session permits only
+        one in-flight request; independent concurrent candidates must use
+        separate sessions.
+        """
         self.validate_identity()
         if self.status != "open" or self.released:
             raise AgentContractError(
@@ -463,7 +502,13 @@ class OpenAISession:
         return interaction
 
     def complete_request(self, interaction: OpenAIInteraction, response: Any) -> None:
-        """Capture IDs, usage and available token logprobs from a response."""
+        """Capture provider IDs, usage, logprobs, and optional raw token evidence.
+
+        The response may be an official SDK model or a JSON-compatible backend
+        result.  PyTRIO's private evidence envelope is validated against the
+        interaction context before it is stored, preventing stale snapshots or
+        misaligned logprobs from entering the trace.
+        """
         self.validate_identity()
         if (
             self._by_id.get(interaction.interaction_id) is not interaction
@@ -509,6 +554,53 @@ class OpenAISession:
         ]
         if response_logprobs:
             interaction.logprobs = response_logprobs
+        # The private evidence envelope is produced only by the fixed-snapshot
+        # backend; validating it here keeps transport adapters from claiming a
+        # different policy version or silently dropping behavior logprobs.
+        sampling = _value(response, "_triotune_sampling", None)
+        if sampling is not None:
+            if not isinstance(sampling, dict):
+                raise AgentContractError("Sampling evidence must be an object.")
+            input_ids = sampling.get("input_ids")
+            output_ids = sampling.get("output_ids")
+            logprobs = sampling.get("logprobs")
+            source = sampling.get("sampling_source")
+            stop_reason = sampling.get("stop_reason")
+            if (
+                not isinstance(input_ids, list)
+                or any(type(token) is not int or token < 0 for token in input_ids)
+                or not input_ids
+                or not isinstance(output_ids, list)
+                or any(type(token) is not int or token < 0 for token in output_ids)
+                or not output_ids
+                or not isinstance(logprobs, list)
+                or len(logprobs) != len(output_ids)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in logprobs
+                )
+                or not isinstance(stop_reason, str)
+                or not stop_reason
+                or not isinstance(source, str)
+                or not source
+            ):
+                raise AgentContractError(
+                    "Sampling evidence must contain aligned token IDs and logprobs."
+                )
+            if (
+                sampling.get("snapshot_id") != interaction.context.snapshot_id
+                or sampling.get("policy_version") != interaction.context.policy_version
+            ):
+                raise AgentContractError(
+                    "Sampling evidence does not match the interaction snapshot."
+                )
+            interaction.input_ids = tuple(input_ids)
+            interaction.output_ids = tuple(output_ids)
+            interaction.logprobs = tuple(float(value) for value in logprobs)
+            interaction.stop_reason = stop_reason
+            interaction.sampling_source = source
         interaction.status = _value(response, "status", "completed") or "completed"
         if choices and _value(choices[0], "finish_reason") in {
             "length",
@@ -532,7 +624,7 @@ class OpenAISession:
             self.finish("cancelled" if interaction.status == "cancelled" else "failed")
 
     def record_tool_results(self, interaction: OpenAIInteraction, results) -> None:
-        """Append results only to a completed API request in the open session."""
+        """Append tool observations only to this session's completed request."""
         self.validate_identity()
         if (
             self.status != "open"
@@ -707,7 +799,12 @@ class OpenAISession:
     def export_trajectory(
         self, *, metadata: dict[str, Any] | None = None
     ) -> OpenAITrajectoryExport:
-        """Export API evidence without fabricating token IDs or PPO logprobs."""
+        """Export terminal API evidence without fabricating PPO token data.
+
+        Caller metadata is merged for diagnostics, but trusted identity fields,
+        status, release state, and ``trainable=False`` are written last so an
+        exporter cannot relabel another candidate or opt an API trace into PPO.
+        """
         self._require_idle()
         if self.status == "open":
             raise AgentContractError("Finish or abort the session before export.")
@@ -738,6 +835,7 @@ class OpenAISession:
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
+        """Convert SDK models and dataclasses into finite JSON-safe evidence."""
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
         if isinstance(value, (list, tuple)):

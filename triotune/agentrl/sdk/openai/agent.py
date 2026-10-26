@@ -1,4 +1,12 @@
-"""Inline OpenAI agent execution using the existing local tool executor."""
+"""Run an OpenAI conversation and execute locally registered tools.
+
+``Agent`` is intentionally an orchestration façade rather than a model
+runtime.  It delegates transport and request identity to ``OpenAIClient``,
+delegates schema validation and invocation to ``FunctionToolExecutor``, and
+delegates lineage, lifecycle, and delayed reward rules to ``OpenAISession``.
+This separation lets the same loop use an external OpenAI client or a fixed
+PyTRIO backend without changing tool semantics.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +35,14 @@ from .session import OpenAISession, OpenAITrajectoryExport
 
 @dataclass(frozen=True, slots=True)
 class AgentRunResult:
-    """Final text and its request trace; API evidence is not PPO token data."""
+    """Return the final action text together with its owned session trace.
+
+    ``response`` is the provider-native final response and is retained for
+    callers that need usage or provider-specific fields.  ``session`` remains
+    the authoritative source for interaction IDs, tool evidence, status, and
+    delayed rewards.  Exporting this result produces the SDK trace format, not
+    an automatically trainable PPO rollout.
+    """
 
     text: str
     session: OpenAISession
@@ -35,9 +50,11 @@ class AgentRunResult:
 
     @property
     def session_id(self) -> str:
+        """Expose the conversation ID without conflating it with rollout IDs."""
         return self.session.session_id
 
     def export_trajectory(self) -> OpenAITrajectoryExport:
+        """Export the terminal session after lifecycle validation."""
         return self.session.export_trajectory()
 
 
@@ -49,6 +66,12 @@ class Agent:
     retain their ``retry_safe`` metadata; this loop never retries side effects.
     The optional tool timeout bounds awaiting a tool, but Python cannot stop a
     synchronous worker thread that has already started.
+
+    Chat Completions continuation messages preserve assistant tool-call IDs;
+    Responses continuation preserves every output item, including reasoning
+    items, before appending function results.  The enclosing execution context
+    is installed around API and tool calls and restored even when cancellation
+    or cleanup raises.
     """
 
     def __init__(
@@ -63,6 +86,7 @@ class Agent:
         api: str = "chat_completions",
         tool_timeout: float = 10.0,
     ) -> None:
+        """Validate static agent configuration and construct protocol helpers."""
         if (
             not isinstance(name, str)
             or not name.strip()
@@ -99,6 +123,11 @@ class Agent:
         Chat messages echo native tool call IDs. Responses echoes every output
         item, including reasoning items, before appending function-call outputs.
         This preserves the API's required continuation state for reasoning models.
+
+        ``context`` and ``training`` are provenance controls, not model-facing
+        request options.  A supplied training session must already be bound to
+        the collector's root context; the method refuses identity overrides in
+        ``request_options`` so a model or caller cannot rewrite ownership.
         """
         if {
             "messages",
@@ -268,10 +297,13 @@ class Agent:
                 _execution_context.reset(root_token)
 
     async def close(self):
+        """Release resources owned by the configured client or backend."""
         await self.client.close()
 
     async def __aenter__(self):
+        """Enter an async context without starting a conversation."""
         return self
 
     async def __aexit__(self, exc_type, exc, traceback):
+        """Close the client when leaving the surrounding async context."""
         await self.close()
