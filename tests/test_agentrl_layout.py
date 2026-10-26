@@ -16,7 +16,7 @@ class AgentRLLayoutTests(unittest.TestCase):
     def test_root_contains_only_shared_configuration_contracts_and_exports(self):
         self.assertEqual(
             {path.name for path in PACKAGE.glob("*.py")},
-            {"__init__.py", "config.py", "contracts.py"},
+            {"__init__.py", "config.py", "types.py"},
         )
         self.assertEqual(
             {path.parent.name for path in PACKAGE.glob("*/__init__.py")},
@@ -27,7 +27,7 @@ class AgentRLLayoutTests(unittest.TestCase):
     def test_public_exports_resolve_to_functional_modules(self):
         modules = {
             "config": ("AgentConfig", "AgentEvaluationConfig", "RetryPolicy"),
-            "contracts": (
+            "types": (
                 "Generation",
                 "AgentTurn",
                 "EpisodeResult",

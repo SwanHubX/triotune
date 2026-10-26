@@ -20,7 +20,7 @@ from ...utils.token_usage import (
     SampleUsageCallback,
     compute_sample_tokens,
 )
-from .contracts import Trajectory
+from .trajectory import Trajectory
 
 
 def _reward_result(value):

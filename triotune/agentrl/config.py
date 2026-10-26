@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .contracts import EpisodeLimits
+from .types import EpisodeLimits
 
 
 def positive_int(value: Any, name: str, *, minimum: int = 1) -> None:

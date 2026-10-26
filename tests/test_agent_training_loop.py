@@ -78,6 +78,8 @@ class AgentTrainingTests(unittest.IsolatedAsyncioTestCase):
         await trainer.step(batch.trajectories)
         second = await trainer.create_sampling_snapshot()
         self.assertNotEqual(first.snapshot_id, second.snapshot_id)
+        self.assertEqual(first.policy_version, 0)
+        self.assertEqual(second.policy_version, 1)
         self.assertEqual(client.snapshots[0].version, 0)
         self.assertEqual(client.snapshots[1].version, 1)
         await trainer.close()

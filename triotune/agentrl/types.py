@@ -1,4 +1,4 @@
-"""Define the data and adapter contracts shared by agent RL components.
+"""Typed execution records and replaceable interfaces for Agent RL.
 
 Execution adapters exchange original generations, parsed actions, tool results,
 and scored episodes through these types. The PPO-specific conversion happens
@@ -8,8 +8,8 @@ independent of optimizer details.
 Protocols describe replaceable behavior through structural typing: adapters
 implement the documented methods without inheriting from a framework base
 class. Dataclasses carry execution records; their validation protects token
-alignment, reward finiteness, and the distinction between model and system
-failures before a record can reach the training boundary.
+alignment, reward finiteness, provenance, and the distinction between model
+and system failures before a record can reach the training boundary.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from ..trainer.ppo.contracts import Trajectory
+    from ..trainer.ppo.trajectory import Trajectory
     from .runtime.sampling import SamplingSnapshot
 
 
@@ -279,9 +279,11 @@ class EpisodeScore:
 class EpisodeResult:
     """Accumulate the auditable result of one task execution.
 
-    ``episode_id`` identifies one attempt, ``group_id`` connects attempts of
-    the same task for relative-reward training, and ``snapshot_id`` records
-    which fixed sampling policy was supplied. ``is_eval`` labels provenance
+    ``episode_id`` identifies one attempt, ``rollout_id`` identifies the
+    logical task execution, ``group_id`` connects candidates for relative
+    reward training, and ``snapshot_id`` records the concrete sampler. The
+    optional ``policy_version`` makes the model generation explicit without
+    requiring consumers to parse snapshot IDs. ``is_eval`` labels provenance
     without selecting a different execution path. ``error`` retains the reason
     for abnormal termination; system failures normally have no score.
     """
@@ -299,6 +301,42 @@ class EpisodeResult:
     sample_index: int = 0
     retries: list[RetryEvent] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    # ``rollout_id`` identifies the logical task execution that may later be
+    # exported into one or more physical training rows. It is intentionally
+    # separate from ``episode_id`` (one sampled attempt) and ``group_id``
+    # (the PPO-relative comparison group). Appending the field preserves the
+    # positional constructor shape used by earlier callers.
+    rollout_id: str | None = None
+    # The snapshot's policy version is carried with the episode so later
+    # exporters and trainers can reject stale or mixed-policy data explicitly.
+    policy_version: int | str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate identity fields before tools or scorers observe a record.
+
+        Candidate identity is part of the execution contract. A scorer that
+        compares candidates must never receive a missing or negative index, and
+        a later exporter must not silently attach a row to another snapshot.
+        Optional values remain accepted for hand-built legacy records.
+        """
+        for name in ("episode_id", "group_id", "snapshot_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise AgentContractError(f"{name} must be a nonempty string.")
+        if self.rollout_id is not None and (
+            not isinstance(self.rollout_id, str) or not self.rollout_id
+        ):
+            raise AgentContractError("rollout_id must be a nonempty string or None.")
+        if type(self.sample_index) is not int or self.sample_index < 0:
+            raise AgentContractError("sample_index must be a nonnegative integer.")
+        if self.policy_version is not None and (
+            isinstance(self.policy_version, bool)
+            or not isinstance(self.policy_version, (int, str))
+            or (isinstance(self.policy_version, str) and not self.policy_version)
+        ):
+            raise AgentContractError(
+                "policy_version must be a nonempty integer/string or None."
+            )
 
     @property
     def trainable(self) -> bool:
@@ -455,7 +493,9 @@ class EpisodeExecutor(Protocol):
     """Replace the complete agent loop while retaining collection and training.
 
     An SDK adapter implements ``run`` and returns a complete EpisodeResult with
-    original token data. The collector also needs ``limits.max_turns`` to
+    original token data. Identity arguments are supplied before execution so
+    tools and scorers can make candidate-aware decisions. The collector also
+    needs ``limits.max_turns`` to
     allocate seed ranges and ``trajectory_builder`` to validate/export records.
     Implementations must preserve the supplied snapshot and propagate asyncio
     cancellation rather than converting cancellation into a task reward.
@@ -470,6 +510,8 @@ class EpisodeExecutor(Protocol):
         snapshot: SamplingSnapshot,
         *,
         group_id: str,
+        rollout_id: str | None = None,
+        sample_index: int = 0,
         seed: int | None = None,
         is_eval: bool = False,
     ) -> EpisodeResult: ...

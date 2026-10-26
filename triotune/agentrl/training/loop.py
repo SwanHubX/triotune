@@ -39,7 +39,7 @@ def filter_agent_groups(trajectories):
 
 
 if TYPE_CHECKING:
-    from ...trainer.ppo.contracts import PPOState
+    from ...trainer.ppo.trajectory import PPOState
     from ...trainer.rl_trainer import PPOTrainer
 
 

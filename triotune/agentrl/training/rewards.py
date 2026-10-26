@@ -14,7 +14,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from ..contracts import AgentContractError, EpisodeScore, EpisodeScorer
+from ..types import AgentContractError, EpisodeScore, EpisodeScorer
 
 
 def validate_process_rewards(episode, rewards) -> None:

@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..contracts import ToolActionError, ToolCall, ToolResult, ToolSystemError
+from ..types import ToolActionError, ToolCall, ToolResult, ToolSystemError
 
 
 @dataclass(frozen=True, slots=True)

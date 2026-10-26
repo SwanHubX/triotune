@@ -12,7 +12,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from ...utils.datums import materialize_datum
-from .contracts import PreparedBatch, Trajectory
+from .trajectory import PreparedBatch, Trajectory
 
 IGNORE_INDEX = -100
 

@@ -13,7 +13,7 @@ and optimization remain behind the existing PyTRIO/trainer boundaries.
 """
 
 from .config import AgentConfig, AgentEvaluationConfig, RetryPolicy
-from .contracts import (
+from .types import (
     ActionParseError,
     ActionParser,
     AgentAction,
@@ -65,8 +65,8 @@ from .training.rewards import (
     TurnRewardScorer,
 )
 
-# Keep adapter contracts and their default implementations available through
-# one stable import surface. Runtime state remains owned by the objects callers
+# Keep adapter types and their default implementations available through one
+# stable import surface. Runtime state remains owned by the objects callers
 # construct; importing the package does not start clients or execute tools.
 __all__ = [
     "ActionParseError",

@@ -14,6 +14,12 @@ triotune.agentrl connects tool-using agents to the existing PPOTrainer. It suppo
 4. Assign outcome and optional process rewards, then call trainer.step() to update the policy.
 5. Refresh the snapshot for the next batch. Evaluate through the same execution and scoring logic.
 
+Each episode receives provenance before execution: `rollout_id` identifies a logical task,
+`episode_id` identifies one candidate attempt, `group_id` identifies the relative-reward group,
+`sample_index` identifies the candidate position, and `snapshot_id`/`policy_version` identify
+the sampling policy. The exporter carries these fields into each PPO `Trajectory` for scoring,
+diagnostics, and mixed-policy checks.
+
 Recoverable model action errors become observations or scored failures. Infrastructure failures never become zero-reward training examples. Retries are bounded, and tool retries require an explicit declaration that repeated execution is safe.
 
 ## Modules
@@ -21,7 +27,7 @@ Recoverable model action errors become observations or scored failures. Infrastr
 | Location | Responsibility |
 |---|---|
 | config.py | Agent limits, retries, evaluation settings and adapter composition |
-| contracts.py | Execution protocols, episode records and data validation |
+| types.py | Execution records, protocols and boundary validation |
 | runtime/ | Conversation rendering, episode execution, sampling and tools |
 | rollout/ | Grouped collection and exact-token trajectory construction |
 | training/ | Training loop, reward composition and evaluation metrics |

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from ...api.cli_args import NormConfig, PPOConfig
-from .contracts import PreparedBatch, Trajectory
+from .trajectory import PreparedBatch, Trajectory
 from .gae import compute_gae
 
 

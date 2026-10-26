@@ -1,7 +1,7 @@
 """Run the bounded model-action-observation loop for one agent episode.
 
 The runner coordinates rendering, sampling, parsing, tools, and terminal
-scoring through their contracts. It records what happened before deciding
+scoring through their interfaces. It records what happened before deciding
 whether the outcome is a model failure or an infrastructure failure. Group
 collection, persistent logging, trajectory export, and optimizer updates remain
 the responsibility of their respective orchestration layers.
@@ -20,7 +20,7 @@ from uuid import uuid4
 from pytrio import PyTrioError
 
 from ..config import RetryPolicy
-from ..contracts import (
+from ..types import (
     SYSTEM_STATUSES,
     ActionParseError,
     ActionParser,
@@ -110,6 +110,8 @@ class EpisodeRunner:
         snapshot: SamplingSnapshot,
         *,
         group_id: str,
+        rollout_id: str | None = None,
+        sample_index: int = 0,
         seed: int | None = None,
         is_eval: bool = False,
     ) -> EpisodeResult:
@@ -119,6 +121,9 @@ class EpisodeRunner:
             row: Task input plus optional ground truth used only by the scorer.
             snapshot: Fixed policy and tokenizer for every generated turn.
             group_id: Collector-owned identity shared by attempts of one task.
+            rollout_id: Identity of the logical task execution. It may later
+                produce more than one physical training row.
+            sample_index: Candidate index within the logical rollout group.
             seed: First turn's seed; following turns increment this value.
             is_eval: Provenance flag stored in the returned episode.
 
@@ -128,7 +133,20 @@ class EpisodeRunner:
         """
         from .conversation import ChatTemplateRenderer
 
-        episode = EpisodeResult(uuid4().hex, group_id, snapshot.snapshot_id, is_eval)
+        if rollout_id is None:
+            # Direct runner callers historically supplied only ``group_id``.
+            # Using it as the fallback keeps those integrations valid while
+            # making the distinction explicit for collector-owned executions.
+            rollout_id = group_id
+        episode = EpisodeResult(
+            uuid4().hex,
+            group_id,
+            snapshot.snapshot_id,
+            is_eval,
+            rollout_id=rollout_id,
+            policy_version=snapshot.policy_version,
+            sample_index=sample_index,
+        )
         episode.task_id = str(row["task_id"]) if "task_id" in row else None
         started = time.perf_counter()
         try:

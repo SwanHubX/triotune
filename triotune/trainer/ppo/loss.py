@@ -8,7 +8,7 @@ No model parameters or full vocabulary logits are downloaded.
 from collections import defaultdict
 
 from ...api.cli_args import PPOConfig
-from .contracts import PreparedBatch
+from .trajectory import PreparedBatch
 from .datum import IGNORE_INDEX
 
 

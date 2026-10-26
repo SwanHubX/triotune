@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..contracts import AgentTurn, EpisodeResult, EpisodeScore, Generation, ToolResult
+from ..types import AgentTurn, EpisodeResult, EpisodeScore, Generation, ToolResult
 from ..rollout.trajectory import EpisodeTrajectoryBuilder
 from ..runtime.conversation import (
     ChatTemplateRenderer,

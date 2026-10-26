@@ -42,7 +42,7 @@ triotune/
     ├── sft/
     │   └── state.py
     ├── opd/
-    │   ├── contracts.py      # 阶段数据契约、trainer 状态与 step 结果
+    │   ├── contracts.py      # OPD 阶段数据与执行协议
     │   ├── execution.py      # 不可变执行计划与并发事务
     │   ├── rollout.py        # 学生 on-policy 采样
     │   ├── teacher_phase.py  # 路由固定 teacher 并聚合 token score
@@ -50,6 +50,7 @@ triotune/
     │   ├── datum.py          # next-token 对齐与 prompt mask
     │   └── targets.py        # teacher score 到训练 target 的转换
     └── ppo/                  # PPO-family 算法组件
+        └── trajectory.py     # PPO 轨迹、准备批次和 trainer 状态
 ```
 
 | 模块 | 职责 |

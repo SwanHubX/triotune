@@ -8,8 +8,8 @@ markers remain visible as context but are excluded from policy optimization.
 
 from __future__ import annotations
 
-from ...trainer.ppo.contracts import Trajectory
-from ..contracts import AgentContractError, EpisodeResult
+from ...trainer.ppo.trajectory import Trajectory
+from ..types import AgentContractError, EpisodeResult
 
 
 class EpisodeTrajectoryBuilder:
@@ -96,4 +96,9 @@ class EpisodeTrajectoryBuilder:
             token_rewards=process_rewards if score.process_rewards else None,
             truncated=episode.status in {"max_turns", "token_limit", "context_limit"},
             reward_components={**score.components, "success": float(score.success)},
+            rollout_id=episode.rollout_id,
+            episode_id=episode.episode_id,
+            sample_index=episode.sample_index,
+            snapshot_id=episode.snapshot_id,
+            policy_version=episode.policy_version,
         )

@@ -28,7 +28,7 @@ from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
-from .ppo.contracts import PPOState, Trajectory
+from .ppo.trajectory import PPOState, Trajectory, validate_policy_versions
 from .ppo.critic import Critic, PyTRIOCritic
 from .ppo.rollout import (
     filter_informative_groups,
@@ -243,6 +243,7 @@ class PPOTrainer:
             f"step-{self.state.global_step}-{uuid4().hex}",
             PyTRIOAgentSampler(self._sampling, self._tokenizer, stop=stop),
             self._tokenizer,
+            policy_version=self.state.global_step,
         )
 
     async def publish_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
@@ -267,6 +268,9 @@ class PPOTrainer:
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
         await self.initialize()
+        # Validate provenance before reference scoring or critic work. The
+        # actor repeats this check as a defense for callers using it directly.
+        validate_policy_versions(trajectories)
         initial_actor_tokens = self._actor.train_tokens
         initial_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
         start = time.perf_counter()

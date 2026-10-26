@@ -18,7 +18,7 @@ from ...api.cli_args import (
     PPOCriticConfig,
     PPORolloutConfig,
 )
-from .contracts import PPOState, PreparedBatch, Trajectory
+from .trajectory import PPOState, PreparedBatch, Trajectory, validate_policy_versions
 from .critic import Critic, PyTRIOCritic, value_loss
 from .gae import compute_gae, compute_token_level_gae, compute_turn_level_gae
 
@@ -77,6 +77,7 @@ __all__ = [
     "PreparedBatch",
     "PPORolloutConfig",
     "Trajectory",
+    "validate_policy_versions",
     "compute_gae",
     "compute_token_level_gae",
     "compute_turn_level_gae",

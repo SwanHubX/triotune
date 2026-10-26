@@ -24,6 +24,7 @@ from triotune.agentrl import (
     ToolCall,
     ToolSystemError,
 )
+from triotune.agentrl import EpisodeScore
 
 
 def snapshot(*, output=None, failure=None):
@@ -35,6 +36,37 @@ def snapshot(*, output=None, failure=None):
 
 
 class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_identity_is_available_during_scoring(self):
+        policy, _ = snapshot()
+        observed = []
+
+        class IdentityScorer:
+            async def score(self, row, episode):
+                observed.append(
+                    (
+                        episode.rollout_id,
+                        episode.group_id,
+                        episode.sample_index,
+                        episode.snapshot_id,
+                        episode.policy_version,
+                    )
+                )
+                return EpisodeScore(0.0, False)
+
+        workflow = calculator_workflow()
+        workflow.runner.scorer = IdentityScorer()
+        batch = await workflow.collect(
+            calculator_rows()[:1], policy, n_samples=3, strict=False
+        )
+
+        self.assertEqual([item[2] for item in observed], [0, 1, 2])
+        self.assertEqual(len({item[0] for item in observed}), 1)
+        self.assertEqual(len({item[1] for item in observed}), 1)
+        self.assertNotEqual(observed[0][0], observed[0][1])
+        self.assertEqual({item[3] for item in observed}, {"snapshot-0"})
+        self.assertEqual({item[4] for item in observed}, {None})
+        self.assertEqual([e.sample_index for e in batch.episodes], [0, 1, 2])
+
     async def test_wrong_answer_is_a_valid_zero_reward_episode(self):
         policy, _ = snapshot(output='{"final":"99"}')
         batch = await calculator_workflow().collect(calculator_rows()[:1], policy)
@@ -56,6 +88,11 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
             for trajectory in batch.trajectories:
                 self.assertEqual(set(trajectory.turn_ids), {0, -1, 1})
                 self.assertEqual(trajectory.reward, 1)
+                self.assertNotEqual(trajectory.rollout_id, trajectory.group_id)
+                self.assertEqual(trajectory.snapshot_id, "snapshot-0")
+                self.assertEqual(trajectory.policy_version, None)
+                self.assertEqual(trajectory.episode_id is not None, True)
+                self.assertIn(trajectory.sample_index, (0, 1))
             self.assertEqual(len({e.group_id for e in batch.episodes}), 1)
             records = [
                 json.loads(line) for line in logger.path.read_text().splitlines()

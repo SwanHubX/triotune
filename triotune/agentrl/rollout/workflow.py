@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from ...trainer.ppo.contracts import Trajectory
+from ...trainer.ppo.trajectory import Trajectory
 from ...trainer.ppo.rollout import gather_cancel_on_error
-from ..contracts import (
+from ..types import (
     SYSTEM_STATUSES,
     AgentContractError,
     EpisodeExecutor,
@@ -189,12 +189,18 @@ class AgentRolloutWorkflow:
 
         async def run(row, row_index, sample_index):
             async with semaphore:
+                group_id = f"{namespace}:{row_index}"
+                rollout_id = f"{namespace}:rollout:{row_index}"
                 # Reserve max_turns consecutive seeds for each attempt, leaving
                 # room for the runner's per-turn increments without overlap.
                 episode = await self.runner.run(
                     copy.deepcopy(row),
                     snapshot,
-                    group_id=f"{namespace}:{row_index}",
+                    group_id=group_id,
+                    # Assign identity before execution so tools and scorers
+                    # can use candidate-specific data while the episode runs.
+                    rollout_id=rollout_id,
+                    sample_index=sample_index,
                     seed=None
                     if seed is None
                     else seed
@@ -202,7 +208,6 @@ class AgentRolloutWorkflow:
                     * self.runner.limits.max_turns,
                     is_eval=is_eval,
                 )
-                episode.sample_index = sample_index
                 if episode.task_id is None:
                     episode.task_id = f"row-{row_index}"
                 trajectory = None

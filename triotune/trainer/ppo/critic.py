@@ -17,7 +17,7 @@ from ...api.client_api import call_async, optimizer_params
 from ...utils.checkpoint import save_checkpoint_async
 from ...utils.datums import materialize_datum
 from ...utils.token_usage import compute_train_tokens
-from .contracts import Trajectory
+from .trajectory import Trajectory
 from .datum import IGNORE_INDEX
 
 

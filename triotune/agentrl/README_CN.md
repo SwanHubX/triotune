@@ -14,6 +14,11 @@ triotune.agentrl 将使用工具的智能体接入现有 PPOTrainer，支持同�
 4. 分配结果奖励和可选的过程奖励，再调用 trainer.step() 更新策略。
 5. 为下一批任务刷新快照，并通过相同的执行与评分逻辑进行评估。
 
+每个 Agent episode 在开始执行前就获得固定来源信息：`rollout_id` 标识逻辑任务，
+`episode_id` 标识一次候选尝试，`group_id` 标识相对奖励组，`sample_index` 标识候选位置，
+`snapshot_id` 和 `policy_version` 标识采样策略。这些字段会随导出的 `Trajectory` 进入 PPO，
+便于评分、诊断和检查混合策略数据。
+
 可恢复的模型动作错误会成为观察或被评分的失败。基础设施故障不会成为零奖励训练样本。重试次数有上限，工具重试还需要显式声明重复执行安全。
 
 ## 模块
@@ -21,7 +26,7 @@ triotune.agentrl 将使用工具的智能体接入现有 PPOTrainer，支持同�
 | 位置 | 职责 |
 |---|---|
 | config.py | Agent 限制、重试、评估设置和适配器组装 |
-| contracts.py | 执行协议、episode 记录和数据校验 |
+| types.py | 执行记录、替换协议和边界校验 |
 | runtime/ | 对话渲染、episode 执行、采样和工具 |
 | rollout/ | 分组采集和原始 token 轨迹构造 |
 | training/ | 训练循环、奖励组合和评估指标 |

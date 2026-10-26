@@ -13,7 +13,7 @@ from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
 from ...utils.token_usage import compute_train_tokens
 from .advantages import prepare_advantages
-from .contracts import PreparedBatch, Trajectory
+from .trajectory import PreparedBatch, Trajectory, validate_policy_versions
 from .datum import batch_datums, build_datum, completion_logprobs
 from .loss import make_loss_fn
 
@@ -133,6 +133,7 @@ class PPOActor:
                 raise ValueError(
                     "One group_id must identify one identical tokenized prompt."
                 )
+        validate_policy_versions(trajectories)
         proximal = None
         if config.recompute_logprob or config.use_decoupled_loss:
             datums = [build_datum(t) for t in trajectories]

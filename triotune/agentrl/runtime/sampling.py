@@ -17,7 +17,7 @@ import pytrio as trio
 
 from ...api.client_api import call_async
 from ...utils.token_usage import compute_sample_tokens
-from ..contracts import AgentContractError, AgentSampler, Generation, validate_tokens
+from ..types import AgentContractError, AgentSampler, Generation, validate_tokens
 
 
 class PyTRIOAgentSampler:
@@ -133,7 +133,19 @@ class SamplingSnapshot:
     snapshot_id: str
     sampler: AgentSampler
     tokenizer: Any
+    # ``policy_version`` is deliberately separate from ``snapshot_id``. The
+    # latter identifies one exported sampler instance, while this value lets
+    # training code compare policy generations without parsing an opaque ID.
+    policy_version: int | str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot_id, str) or not self.snapshot_id:
             raise ValueError("snapshot_id must be a nonempty string.")
+        if self.policy_version is not None and (
+            isinstance(self.policy_version, bool)
+            or not isinstance(self.policy_version, (int, str))
+            or (isinstance(self.policy_version, str) and not self.policy_version)
+        ):
+            raise ValueError(
+                "policy_version must be a nonempty integer/string or None."
+            )

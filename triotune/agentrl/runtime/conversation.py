@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any
 
-from ..contracts import (
+from ..types import (
     ActionParseError,
     AgentAction,
     AgentContractError,

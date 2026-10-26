@@ -1,11 +1,39 @@
-"""PPO data contracts shared by rollout, actor, critic, and PyTRIO datums."""
+"""Trajectory and prepared-batch records shared by the PPO pipeline.
+
+The module owns the token-aligned trajectory data that flows from rollout to
+advantage preparation, actor/critic updates, and PyTRIO datums. Validation
+remains here so every producer and consumer observes the same token, reward,
+grouping, and provenance invariants.
+"""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Real
+
+
+def validate_policy_versions(trajectories: Sequence["Trajectory"]) -> None:
+    """Reject a batch that combines known and unknown policy provenance.
+
+    Behavior log probabilities are meaningful only relative to the policy that
+    sampled them. Agent workflows attach a version to every exported row;
+    direct legacy callers may omit provenance, but an update must not silently
+    mix those two modes or combine two different versions.
+    """
+    versions = set()
+    has_unversioned = False
+    for trajectory in trajectories:
+        version = trajectory.policy_version
+        if version is None:
+            has_unversioned = True
+        else:
+            versions.add(version)
+    if len(versions) > 1 or (versions and has_unversioned):
+        raise ValueError(
+            "One PPO update must use one policy_version for every trajectory."
+        )
 
 
 @dataclass(slots=True)
@@ -13,7 +41,9 @@ class Trajectory:
     """One unpadded prompt/completion sample and its aligned training fields.
 
     Auxiliary arrays describe completion tokens; ``values`` additionally holds
-    one final bootstrap prediction for critic-based PPO.
+    one final bootstrap prediction for critic-based PPO. Optional provenance
+    fields are carried alongside the numerical arrays so a custom workflow can
+    audit which logical rollout, attempt, and policy produced a training row.
     """
 
     prompt_tokens: list[int]
@@ -28,6 +58,15 @@ class Trajectory:
     token_rewards: list[float] | None = None
     turn_ids: list[int] | None = None
     reward_components: dict[str, float] = field(default_factory=dict)
+    # Provenance is optional for legacy callers that construct trajectories
+    # directly. Agent rollouts populate these fields before PPO sees the data,
+    # which lets diagnostics distinguish one logical rollout from its physical
+    # training rows without changing the loss input shape.
+    rollout_id: str | None = None
+    episode_id: str | None = None
+    sample_index: int | None = None
+    snapshot_id: str | None = None
+    policy_version: int | str | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt_tokens or not self.completion_tokens:
@@ -58,6 +97,20 @@ class Trajectory:
             raise ValueError(
                 "group_id must be a nonempty string identifying the prompt group."
             )
+        for name in ("rollout_id", "episode_id", "snapshot_id"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a nonempty string or None.")
+        if self.sample_index is not None and (
+            type(self.sample_index) is not int or self.sample_index < 0
+        ):
+            raise ValueError("sample_index must be a nonnegative integer or None.")
+        if self.policy_version is not None and (
+            isinstance(self.policy_version, bool)
+            or not isinstance(self.policy_version, (int, str))
+            or (isinstance(self.policy_version, str) and not self.policy_version)
+        ):
+            raise ValueError("policy_version must be a nonempty integer/string or None.")
         if not math.isfinite(self.reward):
             raise ValueError("reward must be finite.")
         if not isinstance(self.reward_components, Mapping):
