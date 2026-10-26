@@ -5,6 +5,7 @@ import importlib.util
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from triotune.agentrl import FunctionToolExecutor
 from triotune.agentrl.sdk.openai import (
@@ -18,6 +19,7 @@ from triotune.agentrl.sdk.openai import (
 )
 from triotune.agentrl.types import (
     ActionParseError,
+    AgentContractError,
     ToolCall,
     ToolResult,
     current_execution_context,
@@ -43,10 +45,12 @@ class _FakeChat:
                 choices=[
                     SimpleNamespace(
                         message=SimpleNamespace(
+                            role="assistant",
                             content=None,
                             tool_calls=[
                                 SimpleNamespace(
                                     id="call-1",
+                                    type="function",
                                     function=SimpleNamespace(
                                         name="add", arguments='{"a": 2, "b": 3}'
                                     ),
@@ -62,13 +66,94 @@ class _FakeChat:
             usage=SimpleNamespace(prompt_tokens=8, completion_tokens=3),
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content="5", tool_calls=[]), logprobs=None
+                    message=SimpleNamespace(
+                        role="assistant", content="5", tool_calls=[]
+                    ),
+                    logprobs=None,
                 )
             ],
         )
 
 
 class OpenAISDKTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_headers_leave_no_active_request_or_caller_mutation(self):
+        fake = _FakeChat()
+        adapter = OpenAIClient(
+            SimpleNamespace(chat=SimpleNamespace(completions=fake)), model="fake"
+        )
+        session = OpenAISession()
+        for headers in ([], "invalid", 3, {3: "value"}, {"key": None}, {"": "value"}):
+            with self.subTest(headers=headers), self.assertRaises(ValueError):
+                await adapter.create_chat_completion(
+                    messages=[], session=session, extra_headers=headers
+                )
+            self.assertEqual(session.interactions, [])
+            self.assertIsNone(current_execution_context())
+        self.assertEqual(fake.calls, [])
+        # No request was registered, so the owner can abort and release the
+        # empty session rather than inheriting an unfinishable running record.
+        session.finish("failed", error="invalid configuration")
+        session.export_trajectory()
+        session.release()
+
+        headers = {"x-client-request-id": "caller", "custom": "value"}
+        session = OpenAISession()
+        await adapter.create_chat_completion(
+            messages=[], session=session, extra_headers=headers
+        )
+        self.assertEqual(headers, {"x-client-request-id": "caller", "custom": "value"})
+        self.assertEqual(
+            fake.calls[0]["extra_headers"]["X-Client-Request-Id"],
+            session.interactions[0].request_id,
+        )
+
+    async def test_preparation_failure_after_registration_finalizes_and_preserves_error(
+        self,
+    ):
+        class BrokenPayload(dict):
+            def __setitem__(self, key, value):
+                if key == "extra_headers":
+                    raise RuntimeError("header preparation failed")
+                return super().__setitem__(key, value)
+
+        fake = _FakeChat()
+        adapter = OpenAIClient(
+            SimpleNamespace(chat=SimpleNamespace(completions=fake)), model="fake"
+        )
+        session = OpenAISession()
+        with self.assertRaisesRegex(RuntimeError, "header preparation failed"):
+            await adapter._create(
+                "/v1/chat/completions",
+                fake.create,
+                session,
+                BrokenPayload(model="fake", messages=[]),
+            )
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(session.interactions[0].status, "failed")
+        self.assertEqual(len(session.export_trajectory().interactions), 1)
+        session.release()
+        self.assertEqual(fake.calls, [])
+        self.assertIsNone(current_execution_context())
+
+        session = OpenAISession()
+        with (
+            patch.object(session, "finish", side_effect=ValueError("cleanup failed")),
+            self.assertRaisesRegex(
+                RuntimeError, "header preparation failed"
+            ) as failure,
+        ):
+            await adapter._create(
+                "/v1/chat/completions",
+                fake.create,
+                session,
+                BrokenPayload(model="fake", messages=[]),
+            )
+        self.assertIn("cleanup failed", failure.exception.__notes__[0])
+        self.assertEqual(session.interactions[0].status, "failed")
+        self.assertIsNone(current_execution_context())
+        session.finish("failed")
+        session.release()
+
     async def test_typed_tool_schema_and_validation(self):
         self.assertEqual(add.parameters["properties"]["a"]["type"], "number")
         self.assertEqual(add.description, "Add two numbers.")
@@ -119,6 +204,7 @@ class OpenAISDKTests(unittest.IsolatedAsyncioTestCase):
         result.session.submit_reward(1.0)
         exported = result.export_trajectory()
         self.assertEqual(result.text, "5")
+        self.assertEqual(session.status, "completed")
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(len(session.interactions), 2)
         self.assertEqual(
@@ -199,6 +285,9 @@ class OpenAISDKTests(unittest.IsolatedAsyncioTestCase):
         from dataclasses import asdict
 
         session = OpenAISession()
+        interaction = session.start_request("/v1/chat/completions", {"messages": []})
+        session.complete_request(interaction, {"id": "completed", "choices": []})
+        session.finish()
         session.submit_reward(1, submission_id="outcome")
         session.submit_reward(1, submission_id="outcome")
         self.assertEqual(len(session.rewards), 1)
@@ -208,6 +297,527 @@ class OpenAISDKTests(unittest.IsolatedAsyncioTestCase):
         exported = session.export_trajectory()
         self.assertFalse(exported.metadata["trainable"])
         json.dumps(asdict(exported), allow_nan=False)
+
+
+class SessionContractTests(unittest.TestCase):
+    """Reward targeting and lifecycle rules work without optional SDK packages."""
+
+    @staticmethod
+    def record(
+        session,
+        *,
+        payload=None,
+        endpoint="/v1/chat/completions",
+        output=None,
+        parent=None,
+    ):
+        payload = (
+            payload
+            if payload is not None
+            else {"messages": [{"role": "user", "content": "question"}]}
+        )
+        interaction = session.start_request(
+            endpoint, payload, parent_interaction_id=parent
+        )
+        response = {"id": f"response-{len(session.interactions)}"}
+        if endpoint == "/v1/chat/completions":
+            response["choices"] = [
+                {"message": {"role": "assistant", "content": output or "answer"}}
+            ]
+        else:
+            response.update(
+                status="completed",
+                output=output
+                or [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "answer"}],
+                    }
+                ],
+            )
+        session.complete_request(interaction, response)
+        return interaction
+
+    def test_reward_assignments_bind_positions_and_trajectory_scope(self):
+        from triotune.agentrl import RewardAssignment
+
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        for target, position in (("interaction", 0), ("turn", 0), ("token", (0, 2))):
+            assignment = RewardAssignment(
+                target, 3, position=position, mode="advantage", source="prm"
+            )
+            session.submit_reward(assignment)
+            self.assertEqual(
+                first.reward["position"],
+                list(position) if isinstance(position, tuple) else position,
+            )
+            self.assertEqual(first.reward["mode"], "advantage")
+            self.assertIsNone(second.reward)
+            self.assertEqual(session.events[-1].context, first.context)
+        trajectory = RewardAssignment("trajectory", 1, source="outcome")
+        session.submit_reward(trajectory)
+        self.assertIsNone(second.reward)
+        self.assertEqual(len(first.reward_submissions), 3)
+        self.assertEqual(session.events[-1].context, session.context)
+        self.assertEqual(len(session.rewards), 4)
+
+    def test_episode_score_dispatches_nested_targets_and_preserves_original_once(self):
+        from triotune.agentrl import EpisodeScore, RewardAssignment
+
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        score = EpisodeScore(
+            4,
+            True,
+            {"accuracy": 1},
+            {0: (0.25, -0.5)},
+            (
+                RewardAssignment("interaction", 5, position=0, source="judge"),
+                RewardAssignment(
+                    "turn",
+                    2,
+                    position=1,
+                    source="prm",
+                    mode="advantage",
+                    aggregation="mean",
+                    discount=0.9,
+                ),
+                RewardAssignment("trajectory", 3, source="bonus"),
+            ),
+        )
+        session.submit_reward(score, submission_id="score")
+        session.submit_reward(score, submission_id="score")
+        self.assertEqual(session.rewards, [score])
+        self.assertEqual(len(first.reward_submissions), 3)
+        self.assertEqual(first.reward["value"], 5)
+        self.assertEqual(first.reward["position"], 0)
+        self.assertEqual(first.reward_submissions[0]["position"], [0, 0])
+        self.assertEqual(first.reward_submissions[1]["value"], -0.5)
+        self.assertEqual(
+            second.reward_submissions, [session._jsonable(score.assignments[1])]
+        )
+        event = session.events[-1]
+        self.assertEqual(event.context, session.context)
+        self.assertEqual(
+            event.details["bindings"][0],
+            {
+                "interaction_id": None,
+                "reward": {"reward": 4, "success": True, "components": {"accuracy": 1}},
+            },
+        )
+        self.assertIsNone(event.details["bindings"][-1]["interaction_id"])
+        exported = session.export_trajectory()
+        self.assertFalse(exported.metadata["trainable"])
+        self.assertEqual(len(exported.rewards), 1)
+        # Mutating caller-owned score containers cannot change the recorded
+        # score, interaction views or the idempotency comparison snapshot.
+        score.components["accuracy"] = 0
+        self.assertEqual(session.rewards[0].components["accuracy"], 1)
+        with self.assertRaisesRegex(AgentContractError, "submission_id"):
+            session.submit_reward(score, submission_id="score")
+
+    def test_episode_score_nested_validation_is_atomic(self):
+        from triotune.agentrl import EpisodeScore, RewardAssignment
+
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        valid = RewardAssignment("interaction", 1, position=0)
+        for score in (
+            EpisodeScore(2, False, process_rewards={0: (1,), 8: ()}),
+            EpisodeScore(
+                2, False, assignments=(valid, RewardAssignment("turn", 2, position=8))
+            ),
+            EpisodeScore(
+                2, False, assignments=(valid, RewardAssignment("interaction", 2))
+            ),
+            EpisodeScore(2, False, assignments=(valid, RewardAssignment("token", 2))),
+        ):
+            before = len(session.events)
+            with self.assertRaises(AgentContractError):
+                session.submit_reward(score, submission_id="atomic")
+            self.assertEqual(session.rewards, [])
+            self.assertEqual(first.reward_submissions, [])
+            self.assertEqual(second.reward_submissions, [])
+            self.assertEqual(len(session.events), before)
+        score = EpisodeScore(2, True, assignments=(valid,))
+        with self.assertRaises(AgentContractError):
+            session.submit_reward(score, response_id=second.response_id)
+        session.submit_reward(score, submission_id="atomic")
+        self.assertEqual(len(session.rewards), 1)
+        self.assertEqual(first.reward["value"], 1)
+        self.assertIsNone(second.reward)
+
+    def test_episode_score_outcome_stays_session_scoped(self):
+        from triotune.agentrl import EpisodeScore
+
+        session = OpenAISession()
+        first = self.record(session)
+        session.finish()
+        session.submit_reward(EpisodeScore(2, True, {"accuracy": 1}))
+        self.assertIsNone(first.reward)
+        self.assertEqual(first.reward_submissions, [])
+        self.assertEqual(session.rewards[0].reward, 2)
+
+    def test_id_maps_resolve_and_rewards_accept_all_reference_types(self):
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        self.assertEqual(
+            session.request_to_interaction[first.request_id], first.interaction_id
+        )
+        self.assertEqual(
+            session.response_to_interaction[first.response_id], first.interaction_id
+        )
+        for reference in (
+            {"interaction_id": first.interaction_id},
+            {"request_id": first.request_id},
+            {"response_id": first.response_id},
+        ):
+            self.assertIs(session.get_interaction(**reference), first)
+            session.submit_reward(2, **reference)
+            self.assertEqual(first.reward, 2)
+            self.assertIsNone(second.reward)
+        session.submit_reward(4)
+        self.assertEqual(second.reward, 4)
+
+    def test_invalid_reward_targets_are_atomic(self):
+        from triotune.agentrl import RewardAssignment
+
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        cases = (
+            (RewardAssignment("interaction", 1, position=9), {}),
+            (RewardAssignment("token", 1, position=(9, 0)), {}),
+            (RewardAssignment("turn", 1), {}),
+            (
+                RewardAssignment("interaction", 1, position=0),
+                {"response_id": second.response_id},
+            ),
+            (
+                RewardAssignment("trajectory", 1),
+                {"interaction_id": first.interaction_id},
+            ),
+            (1, {"response_id": "foreign-response"}),
+            (1, {"request_id": "foreign-request"}),
+            (1, {"request_id": first.request_id, "response_id": first.response_id}),
+        )
+        for reward, reference in cases:
+            with (
+                self.subTest(reward=reward, reference=reference),
+                self.assertRaises(AgentContractError),
+            ):
+                session.submit_reward(reward, submission_id="invalid", **reference)
+        self.assertEqual(session.rewards, [])
+        self.assertIsNone(first.reward)
+        self.assertIsNone(second.reward)
+
+    def test_submission_id_compares_payload_and_resolved_target(self):
+        from triotune.agentrl import RewardAssignment
+
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        session.finish()
+        assignment = RewardAssignment("interaction", 1, source="score")
+        session.submit_reward(
+            assignment, submission_id="score", request_id=first.request_id
+        )
+        event_count = len(session.events)
+        session.submit_reward(
+            assignment, submission_id="score", response_id=first.response_id
+        )
+        self.assertEqual(len(session.events), event_count)
+        for changed, target in (
+            (RewardAssignment("interaction", 2, source="score"), first),
+            (RewardAssignment("interaction", 1, source="other"), first),
+            (
+                RewardAssignment("interaction", 1, source="score", mode="advantage"),
+                first,
+            ),
+            (assignment, second),
+        ):
+            with (
+                self.subTest(changed=changed, target=target.interaction_id),
+                self.assertRaisesRegex(AgentContractError, "submission_id"),
+            ):
+                session.submit_reward(
+                    changed, submission_id="score", interaction_id=target.interaction_id
+                )
+        self.assertEqual(len(session.rewards), 1)
+        self.assertEqual(len(first.reward_submissions), 1)
+        self.assertIsNone(second.reward)
+
+    def test_prefix_lineage_distinguishes_unrelated_and_repeated_requests(self):
+        session = OpenAISession()
+        first = self.record(session)
+        repeated = self.record(session)
+        unrelated = self.record(
+            session, payload={"messages": [{"role": "user", "content": "other"}]}
+        )
+        self.assertIsNone(repeated.parent_interaction_id)
+        self.assertIsNone(unrelated.parent_interaction_id)
+        # The other question has a unique matching prefix even though it is
+        # not required to be the most recently recorded interaction.
+        self.record(session)
+        child_messages = unrelated.request["messages"] + [
+            unrelated.response["choices"][0]["message"],
+            {"role": "user", "content": "continue"},
+        ]
+        child = self.record(session, payload={"messages": child_messages})
+        self.assertEqual(child.parent_interaction_id, unrelated.interaction_id)
+        self.assertNotEqual(child.parent_interaction_id, first.interaction_id)
+        grandchild = self.record(
+            session,
+            payload={
+                "messages": child_messages + [child.response["choices"][0]["message"]]
+            },
+        )
+        self.assertEqual(grandchild.parent_interaction_id, child.interaction_id)
+
+    def test_ambiguous_prefix_requires_explicit_parent(self):
+        session = OpenAISession()
+        first, second = self.record(session), self.record(session)
+        child_payload = {
+            "messages": first.request["messages"]
+            + [first.response["choices"][0]["message"]]
+        }
+        with self.assertRaisesRegex(AgentContractError, "Ambiguous"):
+            session.start_request("/v1/chat/completions", child_payload)
+        child = self.record(
+            session, payload=child_payload, parent=second.interaction_id
+        )
+        self.assertEqual(child.parent_interaction_id, second.interaction_id)
+        with self.assertRaises(AgentContractError):
+            session.start_request(
+                "/v1/chat/completions", child_payload, parent_interaction_id="foreign"
+            )
+
+    def test_responses_lineage_accepts_full_prefix_or_previous_response_id(self):
+        session = OpenAISession()
+        first = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={"input": "question"},
+        )
+        child = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={
+                "input": [{"role": "user", "content": "question"}]
+                + first.response["output"]
+            },
+        )
+        self.assertEqual(child.parent_interaction_id, first.interaction_id)
+        explicit = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={
+                "previous_response_id": first.response_id,
+                "input": [{"role": "user", "content": "branch"}],
+            },
+        )
+        self.assertEqual(explicit.parent_interaction_id, first.interaction_id)
+        for payload, parent in (
+            ({"previous_response_id": "foreign", "input": []}, None),
+            (
+                {"previous_response_id": first.response_id, "input": []},
+                child.interaction_id,
+            ),
+        ):
+            with self.assertRaises(AgentContractError):
+                session.start_request(
+                    "/v1/responses", payload, parent_interaction_id=parent
+                )
+
+    def test_responses_delta_history_requires_explicit_parent(self):
+        session = OpenAISession()
+        root = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={"input": [{"role": "user", "content": "root"}]},
+        )
+        delta = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={
+                "previous_response_id": root.response_id,
+                "input": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        self.assertEqual(delta.parent_interaction_id, root.interaction_id)
+        partial = {"input": delta.request["input"] + delta.response["output"]}
+        unrelated = self.record(session, endpoint="/v1/responses", payload=partial)
+        self.assertIsNone(unrelated.parent_interaction_id)
+        # A valid root prefix may still resolve to that root, but the delta
+        # candidate is never selected without an explicit reference.
+        full = {
+            "input": root.request["input"] + root.response["output"] + partial["input"]
+        }
+        inferred = self.record(session, endpoint="/v1/responses", payload=full)
+        self.assertEqual(inferred.parent_interaction_id, root.interaction_id)
+        explicit = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload=partial,
+            parent=delta.interaction_id,
+        )
+        self.assertEqual(explicit.parent_interaction_id, delta.interaction_id)
+        by_response = self.record(
+            session,
+            endpoint="/v1/responses",
+            payload={"previous_response_id": delta.response_id, "input": "next"},
+        )
+        self.assertEqual(by_response.parent_interaction_id, delta.interaction_id)
+
+    def test_response_mapping_rejects_foreign_and_duplicate_completion(self):
+        session, foreign = OpenAISession(), OpenAISession()
+        first = self.record(session)
+        with self.assertRaises(AgentContractError):
+            foreign.complete_request(first, {"id": "foreign"})
+        second = session.start_request("/v1/chat/completions", {"messages": []})
+        with self.assertRaisesRegex(AgentContractError, "unique"):
+            session.complete_request(second, {"id": first.response_id})
+        self.assertEqual(
+            session.response_to_interaction[first.response_id], first.interaction_id
+        )
+        self.assertIsNone(second.response_id)
+        session.complete_request(second, {"id": "distinct", "choices": []})
+
+    def test_terminal_sessions_reject_late_tool_results(self):
+        session, foreign = OpenAISession(), OpenAISession()
+        interaction = self.record(session)
+        result = ToolResult("call", "add", "3")
+        with self.assertRaises(AgentContractError):
+            foreign.record_tool_results(interaction, [result])
+        session.record_tool_results(interaction, [result])
+        session.finish()
+        session.release()
+        with self.assertRaises(AgentContractError):
+            session.record_tool_results(interaction, [result])
+        self.assertEqual(len(interaction.tool_results), 1)
+
+    def test_lifecycle_blocks_inflight_work_and_open_exports(self):
+        session = OpenAISession()
+        interaction = session.start_request("/v1/chat/completions", {"messages": []})
+        for operation in (
+            session.finish,
+            session.export_trajectory,
+            session.release,
+            lambda: session.submit_reward(1),
+        ):
+            with self.assertRaisesRegex(AgentContractError, "active"):
+                operation()
+        session.complete_request(interaction, {"id": "done", "choices": []})
+        with self.assertRaises(AgentContractError):
+            session.export_trajectory()
+        session.running = True
+        with self.assertRaises(AgentContractError):
+            session.finish()
+        session.running = False
+        session.finish()
+        event_count = len(session.events)
+        session.finish()
+        self.assertEqual(len(session.events), event_count)
+        session.submit_reward(1)
+        session.release()
+        self.assertTrue(session.export_trajectory().metadata["released"])
+        for operation in (
+            lambda: session.finish("failed"),
+            lambda: session.submit_reward(2),
+            lambda: session.start_request("/v1/chat/completions", {}),
+        ):
+            with self.assertRaises(AgentContractError):
+                operation()
+
+    def test_failed_and_cancelled_sessions_keep_partial_evidence_without_rewards(self):
+        for status in ("failed", "cancelled"):
+            session = OpenAISession()
+            self.record(session)
+            session.finish(status, error="stopped")
+            exported = session.export_trajectory()
+            self.assertEqual(exported.metadata["status"], status)
+            self.assertEqual(exported.metadata["error"], "stopped")
+            self.assertEqual(len(exported.interactions), 1)
+            with self.assertRaises(AgentContractError):
+                session.submit_reward(1)
+            with self.assertRaises(AgentContractError):
+                session.finish()
+            session.release()
+            self.assertTrue(session.released)
+
+
+class ProxyAllocationTests(unittest.IsolatedAsyncioTestCase):
+    """Direct handlers share the same capacity cleanup as the HTTP routes."""
+
+    async def test_invalid_requests_reclaim_only_new_empty_sessions(self):
+        async def create(**kwargs):
+            return {
+                "id": "done",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            }
+
+        adapter = OpenAIClient(
+            SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+                responses=SimpleNamespace(create=create),
+            ),
+            model="fake",
+        )
+        proxy = OpenAIProxyServer(adapter, max_sessions=1)
+        for handler, payload in (
+            (proxy.chat_completions, {"messages": [], "stream": True}),
+            (proxy.responses, {"input": [], "background": True}),
+            (proxy.chat_completions, {"messages": [], "n": 2}),
+            (proxy.responses, {"input": [], "extra_headers": []}),
+            (proxy.chat_completions, {}),
+            (proxy.responses, {"input": [], "session": "invalid"}),
+        ):
+            with (
+                self.subTest(payload=payload),
+                self.assertRaises((ValueError, TypeError)),
+            ):
+                await handler(payload, session_id="correctable")
+            self.assertEqual(proxy.sessions, {})
+            self.assertEqual(len(proxy._released_session_ids), 0)
+        await proxy.chat_completions({"messages": []}, session_id="valid")
+        existing = proxy.sessions["valid"]
+        with self.assertRaises(ValueError):
+            await proxy.responses({"input": [], "stream": True}, session_id="valid")
+        self.assertIs(proxy.sessions["valid"], existing)
+        self.assertEqual(len(existing.interactions), 1)
+        self.assertEqual(existing.status, "open")
+        proxy.finish_session("valid")
+        proxy.release_session("valid")
+
+    async def test_released_id_retention_is_bounded_fifo(self):
+        proxy = OpenAIProxyServer(None, max_sessions=1, max_released_session_ids=2)
+        old_trace = None
+        for name in ("one", "two", "three"):
+            session = proxy._session(name)
+            SessionContractTests.record(session)
+            proxy.finish_session(name)
+            released = proxy.release_session(name)
+            if name == "one":
+                old_trace = released
+            self.assertLessEqual(len(proxy._released_session_ids), 2)
+            self.assertEqual(proxy.sessions, {})
+        self.assertEqual(list(proxy._released_session_ids), ["two", "three"])
+        for name in ("two", "three"):
+            with self.assertRaisesRegex(ValueError, "released"):
+                proxy._session(name)
+        fresh = proxy._session("one")
+        self.assertIsNot(fresh, old_trace)
+        self.assertEqual(fresh.status, "open")
+        self.assertTrue(old_trace.released)
+        self.assertTrue(old_trace.export_trajectory().metadata["released"])
+        for invalid in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                OpenAIProxyServer(None, max_released_session_ids=invalid)
 
 
 @unittest.skipUnless(
@@ -229,6 +839,12 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
             self.contexts.append(current_execution_context())
             payload = json.loads(request.content)
             self.requests.append((request, payload))
+            if self.mode in {"connection_error", "timeout"}:
+                from openai import APIConnectionError, APITimeoutError
+
+                if self.mode == "timeout":
+                    raise APITimeoutError(request=request)
+                raise APIConnectionError(request=request)
             if self.mode == "error":
                 return httpx.Response(
                     503, json={"error": {"message": "offline", "type": "server_error"}}
@@ -423,6 +1039,13 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
                 session.interactions[0].status,
                 "cancelled" if mode == "cancel" else "failed",
             )
+            self.assertEqual(
+                session.status, "cancelled" if mode == "cancel" else "failed"
+            )
+            self.assertEqual(len(session.export_trajectory().interactions), 1)
+            with self.assertRaises(AgentContractError):
+                session.submit_reward(1)
+            session.release()
             self.assertIsNone(current_execution_context())
 
     async def test_streaming_and_multiple_choices_fail_before_http(self):
@@ -444,6 +1067,8 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
             await agent.run("2+3", session=session)
         self.assertEqual(len(session.interactions[0].tool_results), 1)
         self.assertFalse(session.running)
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(len(session.export_trajectory().interactions), 1)
         await agent.close()
         self.assertFalse(self.sdk.is_closed())
 
@@ -471,6 +1096,10 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await agent.run("2+3", session=session)
             self.assertFalse(session.running)
+            self.assertEqual(session.status, "cancelled" if cancelled else "failed")
+            self.assertEqual(
+                session.export_trajectory().metadata["status"], session.status
+            )
             self.assertEqual(
                 session.interactions[-1].status,
                 "cancelled" if cancelled else "tool_failure",
@@ -545,8 +1174,15 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             proxy.sessions["session-a"].interactions[0].endpoint, "/v1/chat/completions"
         )
+        proxy.finish_session("session-a")
+        session = proxy.sessions["session-a"]
+        session.submit_reward(1, response_id="chat_tool")
+        self.assertEqual(len(session.export_trajectory().interactions), 1)
         proxy.release_session("session-a")
         self.assertNotIn("session-a", proxy.sessions)
+        self.assertTrue(session.released)
+        with self.assertRaisesRegex(ValueError, "released"):
+            proxy._session("session-a")
 
     @unittest.skipUnless(
         importlib.util.find_spec("fastapi"),
@@ -577,3 +1213,229 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(proxy.sessions["a"].interactions[-1].status, "failed")
             with self.assertRaisesRegex(ValueError, "capacity"):
                 proxy._session("b")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fastapi"),
+        "Install triotune[openai-proxy] for HTTP routes.",
+    )
+    async def test_proxy_failure_responses_expose_releasable_session_identity(self):
+        import httpx
+
+        proxy = OpenAIProxyServer(self.adapter, max_sessions=1)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.create_app()),
+            base_url="http://proxy",
+        ) as client:
+            for mode, status in (
+                ("error", 503),
+                ("connection_error", 502),
+                ("timeout", 504),
+            ):
+                self.mode = mode
+                for endpoint, payload in (
+                    (
+                        "/v1/chat/completions",
+                        {
+                            "model": "fake",
+                            "messages": [{"role": "user", "content": "question"}],
+                        },
+                    ),
+                    ("/v1/responses", {"model": "fake", "input": "question"}),
+                ):
+                    with self.subTest(mode=mode, endpoint=endpoint):
+                        failed = await client.post(endpoint, json=payload)
+                        self.assertEqual(failed.status_code, status)
+                        session_id = failed.headers["X-Triotune-Session-Id"]
+                        session = proxy.sessions[session_id]
+                        self.assertEqual(session.status, "failed")
+                        interaction = session.get_interaction(
+                            request_id=failed.headers["X-Client-Request-Id"]
+                        )
+                        self.assertEqual(
+                            interaction.interaction_id,
+                            failed.headers["X-Triotune-Interaction-Id"],
+                        )
+                        self.assertEqual(
+                            failed.headers["X-Request-Id"], interaction.request_id
+                        )
+                        self.assertEqual(
+                            len(session.export_trajectory().interactions), 1
+                        )
+                        proxy.release_session(session_id)
+                        self.assertEqual(proxy.sessions, {})
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fastapi"),
+        "Install triotune[openai-proxy] for HTTP routes.",
+    )
+    async def test_proxy_http_validation_reclaims_capacity_without_stale_request_ids(
+        self,
+    ):
+        import httpx
+
+        proxy = OpenAIProxyServer(self.adapter, max_sessions=1)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.create_app()),
+            base_url="http://proxy",
+        ) as client:
+            for endpoint, payload in (
+                (
+                    "/v1/chat/completions",
+                    {"model": "fake", "messages": [], "stream": True},
+                ),
+                ("/v1/responses", {"model": "fake", "input": [], "background": True}),
+                ("/v1/chat/completions", {"model": "fake"}),
+                (
+                    "/v1/responses",
+                    {"model": "fake", "input": [], "previous_response_id": "unknown"},
+                ),
+            ):
+                invalid = await client.post(endpoint, json=payload)
+                self.assertEqual(invalid.status_code, 400)
+                self.assertEqual(proxy.sessions, {})
+                self.assertNotIn("X-Client-Request-Id", invalid.headers)
+            headers = {"X-Triotune-Session-Id": "retained"}
+            payload = {
+                "model": "fake",
+                "messages": [{"role": "user", "content": "question"}],
+            }
+            valid = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
+            self.assertEqual(valid.status_code, 200)
+            invalid = await client.post(
+                "/v1/chat/completions",
+                json={**payload, "stream": True},
+                headers=headers,
+            )
+            self.assertEqual(invalid.status_code, 400)
+            self.assertEqual(invalid.headers["X-Triotune-Session-Id"], "retained")
+            self.assertNotIn("X-Client-Request-Id", invalid.headers)
+            self.assertNotIn("X-Triotune-Interaction-Id", invalid.headers)
+            self.assertEqual(len(proxy.sessions["retained"].interactions), 1)
+            self.assertEqual(proxy.sessions["retained"].status, "open")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fastapi"),
+        "Install triotune[openai-proxy] for HTTP routes.",
+    )
+    async def test_proxy_parent_header_and_terminal_session_are_enforced(self):
+        import httpx
+
+        proxy = OpenAIProxyServer(self.adapter)
+        headers = {"X-Triotune-Session-Id": "branch"}
+        payload = {
+            "model": "fake",
+            "messages": [{"role": "user", "content": "question"}],
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.create_app()),
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
+            self.assertEqual(first.status_code, 200)
+            parent = first.headers["X-Triotune-Interaction-Id"]
+            # Use a different completion ID and unrelated input to exercise
+            # explicit association independently from inferred message prefixes.
+            child_payload = {
+                "model": "fake",
+                "messages": [
+                    {"role": "user", "content": "other"},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "3"},
+                ],
+            }
+            child = await client.post(
+                "/v1/chat/completions",
+                json=child_payload,
+                headers={**headers, "X-Triotune-Parent-Interaction-Id": parent},
+            )
+            self.assertEqual(child.status_code, 200)
+            session = proxy.sessions["branch"]
+            self.assertEqual(session.interactions[1].parent_interaction_id, parent)
+            proxy.finish_session("branch")
+            before = len(self.requests)
+            late = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
+            self.assertEqual(late.status_code, 400)
+            self.assertEqual(len(self.requests), before)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fastapi"),
+        "Install triotune[openai-proxy] for HTTP routes.",
+    )
+    async def test_proxy_unexpected_sdk_failure_retains_identity_and_diagnostics(self):
+        import httpx
+
+        async def create(**kwargs):
+            raise RuntimeError("internal diagnostic")
+
+        adapter = OpenAIClient(
+            SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            ),
+            model="fake",
+        )
+        proxy = OpenAIProxyServer(adapter)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.create_app()),
+            base_url="http://proxy",
+        ) as client:
+            failed = await client.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(failed.status_code, 500)
+        self.assertNotIn("internal diagnostic", failed.text)
+        session_id = failed.headers["X-Triotune-Session-Id"]
+        session = proxy.sessions[session_id]
+        interaction = session.get_interaction(
+            request_id=failed.headers["X-Client-Request-Id"]
+        )
+        self.assertIn("internal diagnostic", interaction.error)
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(
+            session.export_trajectory().interactions[0]["request_id"],
+            interaction.request_id,
+        )
+        proxy.release_session(session_id)
+        self.assertEqual(proxy.sessions, {})
+
+    async def test_proxy_cannot_finish_export_or_release_inflight_request(self):
+        started, unblock = asyncio.Event(), asyncio.Event()
+
+        async def create(**kwargs):
+            started.set()
+            await unblock.wait()
+            return {
+                "id": "done",
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            }
+
+        adapter = OpenAIClient(
+            SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            ),
+            model="fake",
+        )
+        proxy = OpenAIProxyServer(adapter)
+        task = asyncio.create_task(
+            proxy.chat_completions(
+                {"messages": [{"role": "user", "content": "x"}]}, session_id="busy"
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            for operation in (
+                lambda: proxy.finish_session("busy"),
+                lambda: proxy.release_session("busy"),
+                proxy.sessions["busy"].export_trajectory,
+            ):
+                with self.assertRaises(AgentContractError):
+                    operation()
+            self.assertIn("busy", proxy.sessions)
+        finally:
+            unblock.set()
+            await task
+        proxy.finish_session("busy")
+        proxy.release_session("busy")
+        self.assertNotIn("busy", proxy.sessions)

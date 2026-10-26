@@ -53,6 +53,12 @@ if __name__ == "__main__":
 to `Agent`. Injected SDK clients are closed by their caller. Internally created
 clients are closed by `Agent.close()` or its async context manager.
 
+`extra_headers` must be a mapping of nonempty string keys to string values.
+The adapter validates and copies headers before registering a request; invalid
+configuration leaves no active interaction. Once a request is registered, all
+preparation and SDK failures use the same failure/cancellation cleanup path.
+Cleanup errors are attached to the original exception without replacing it.
+
 The decorator derives an object schema from the function signature and a
 description from the first docstring paragraph. It accepts sync/async functions,
 JSON scalar types, `list[T]`, `dict[str, T]`, unions, `Literal`, and optional
@@ -73,6 +79,22 @@ can instead be passed explicitly with rollout/group/sample/snapshot/policy
 identity. Concurrent runs require separate sessions; an already used session
 cannot start another independent agent conversation.
 
+Sessions start with status `open`. `Agent.run()` automatically finishes them
+as `completed`, `failed`, or `cancelled`, including tool failures and turn-limit
+exits. Successful direct client/proxy requests leave a session open for
+continuation. The embedding application calls `session.finish()` or
+`proxy.finish_session(session_id)` after its external agent finishes. Transport
+failures and cancellation automatically terminate direct-client sessions.
+Repeating the same finish status is idempotent; changing a terminal outcome or
+starting another request after termination is rejected.
+
+Rewards require a completed, unreleased session. Export and release require a
+terminal session with no request or agent work in flight. Failed and cancelled
+sessions retain their partial trace for export but reject reward submission.
+Release freezes writes; the returned session can still export its trace for
+inspection. Released proxy session IDs cannot be reused while retained in the
+bounded released-ID cache described below.
+
 Every request allocates a request ID and a child `ExecutionContext` before SDK
 execution. API and tool code can read `current_execution_context()`. Context
 is task-local, including sync tools dispatched to worker threads. The trace
@@ -81,9 +103,57 @@ tool calls/results, usage, available logprobs, status and latency. Native tool
 call IDs are preserved in observations. Responses continuation retains all
 output items, including reasoning items, before appending function outputs.
 
+`session.get_interaction(request_id=...)` resolves a local request ID, and
+`session.get_interaction(response_id=...)` resolves a provider completion or
+response ID. `request_to_interaction` and `response_to_interaction` expose these
+session-local indexes. Provider HTTP request IDs remain separate trace fields.
+
+Parent identity is inferred only when a new request contains an earlier
+request's messages and its actual output as a prefix. The longest unique
+prefix wins; unrelated questions and repeated prompts are independent roots.
+Ambiguous prefixes require an explicit `parent_interaction_id` in client calls,
+or `X-Triotune-Parent-Interaction-Id` in proxy requests. Responses can also
+reference a known response through `previous_response_id`. Unknown, conflicting,
+cross-session or unfinished parents are rejected.
+
+A candidate request that used `previous_response_id` contains only incremental
+input; its local input/output is not a verified full conversation prefix. Such
+candidates are excluded from automatic parent inference. To continue from one,
+use its `previous_response_id` or an explicit parent interaction ID. Other
+candidates with complete matching history can still be inferred normally.
+
 Delayed finite scalar rewards, `EpisodeScore` and `RewardAssignment` submissions
-are recorded in the session. Reusing a `submission_id` does not append a second
-reward. Export returns a JSON-serializable `OpenAITrajectoryExport` API trace.
+are recorded in the session. Structured trajectory rewards remain session
+scoped. Interaction/turn positions are zero-based request indexes; token
+positions retain `(request_index, token_offset)` without constructing token
+arrays. A targeted submission can alternatively specify `interaction_id`,
+`request_id`, or `response_id`. If both a position and ID are supplied, they
+must resolve to the same interaction. Non-trajectory assignments need a position
+or ID; token assignments always need a token offset. Legacy scalar submissions
+default to the final interaction.
+
+`EpisodeScore` is a session-scoped submission and cannot be redirected by an
+explicit interaction/request/response ID. Its outcome (`reward`, `success`,
+`components`) stays at session scope. Each `process_rewards` vector is mapped
+to token contributions at `(request_index, token_offset)`, and each nested
+assignment uses the same target resolver as a top-level `RewardAssignment`.
+Reward versus advantage mode, source, aggregation and discount are preserved;
+the SDK neither applies GAE nor propagates reward backwards.
+
+Every target is validated before any reward, event or submission ID is stored.
+If one nested target is invalid, the whole score is rejected. The original
+score is copied into the session's `rewards` exactly once; interaction bindings
+and event `bindings` describe its contributions rather than additional scores
+to add to that original. Idempotency compares the original payload together
+with all resolved bindings, so a conflicting retry cannot partially overwrite
+an earlier score. These API traces remain separate from PPO aggregation.
+Each interaction retains all of its `reward_submissions` and exposes its latest
+one through `reward`; these trace fields do not perform PPO reward aggregation.
+
+Reusing a `submission_id` with the same content and resolved target is idempotent.
+Reusing it with different content or a different target raises a contract error
+without changing stored rewards. Export returns a JSON-serializable
+`OpenAITrajectoryExport` API trace, including terminal status and error details.
 It is **not** a PPO `RolloutExport`: standard API responses do not provide exact
 prompt/output token IDs and complete behavior logprobs for every generated tool
 argument. Missing values stay missing. Trace metadata therefore reports
@@ -99,9 +169,29 @@ the high-level `Agent` is responsible for executing local tools.
 
 Requests can use `X-Triotune-Session-Id`; generated session and local request
 IDs are returned in `X-Triotune-Session-Id` and `X-Client-Request-Id` response
-headers. The embedding application can inspect `proxy.sessions` and call
-`release_session(id)` after exporting its trace. Session storage is bounded by
+headers. `X-Triotune-Interaction-Id` exposes the corresponding interaction ID.
+The embedding application can inspect `proxy.sessions`, call `finish_session(id)`
+once its agent has ended, submit rewards, export the trace, then call
+`release_session(id)`. Session trace storage is bounded by
 `max_sessions` (default 1024). One session cannot have concurrent requests.
+
+Validation failures that occur before a request is registered reclaim only a
+newly created empty session, including its capacity slot. Corrected retries
+may reuse that ID. Existing sessions and any registered request evidence are
+preserved. HTTP errors return `X-Triotune-Session-Id` once a session was allocated;
+if the call registered an interaction, its request and interaction identity
+headers are also returned. Rejected continuations never return a preceding
+interaction's IDs. Upstream HTTP status codes are preserved; connection failures,
+timeouts and unexpected SDK failures return 502, 504 and 500 respectively. The
+original exception remains in the failed interaction trace.
+
+Released-ID retention is bounded separately by `max_released_session_ids`
+(default 1024, positive integer). The oldest released ID is evicted first when
+that limit is exceeded. Late retries using retained IDs are rejected; after
+eviction, the same string can create a fresh session and must not be treated
+as continuation of the old one. Old released trace objects remain read-only.
+Applications requiring permanent ID uniqueness must enforce it outside this
+in-memory adapter. No unbounded released-ID history is kept.
 Streaming, multiple chat choices, background Responses, subprocess execution,
 multimodal agents and public server deployment are outside this initial adapter.
 

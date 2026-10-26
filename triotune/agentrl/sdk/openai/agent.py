@@ -116,6 +116,7 @@ class Agent:
         if self.api == "chat_completions":
             items.insert(0, {"role": "system", "content": self.instructions})
         session.running = True
+        terminal_status, terminal_error = "completed", None
         try:
             for _ in range(self.max_turns):
                 kwargs = {"session": session, "model": self.model, **request_options}
@@ -189,6 +190,10 @@ class Agent:
                 "OpenAI agent exceeded max_turns without a final answer."
             )
         except BaseException as exc:
+            terminal_status = (
+                "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            )
+            terminal_error = f"{type(exc).__name__}: {exc}"
             session.events.append(
                 AgentEvent(
                     context=session.context,
@@ -201,6 +206,7 @@ class Agent:
             raise
         finally:
             session.running = False
+            session.finish(terminal_status, error=terminal_error)
 
     async def close(self):
         await self.client.close()
