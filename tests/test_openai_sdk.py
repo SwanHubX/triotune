@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import unittest
+from dataclasses import FrozenInstanceError, asdict, replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,11 +16,13 @@ from triotune.agentrl.sdk.openai import (
     OpenAINativeActionParser,
     OpenAIProxyServer,
     OpenAISession,
+    OpenAIWorkflow,
     function_tool,
 )
 from triotune.agentrl.types import (
     ActionParseError,
     AgentContractError,
+    ExecutionContext,
     ToolCall,
     ToolResult,
     current_execution_context,
@@ -688,6 +691,26 @@ class SessionContractTests(unittest.TestCase):
         self.assertIsNone(second.response_id)
         session.complete_request(second, {"id": "distinct", "choices": []})
 
+    def test_identity_maps_reject_unallocated_aliases_and_cross_endpoint_parents(self):
+        session = OpenAISession()
+        chat = self.record(session, endpoint="/v1/chat/completions")
+        session.request_to_interaction["forged-request"] = chat.interaction_id
+        with self.assertRaisesRegex(AgentContractError, "mappings"):
+            session.get_interaction(request_id="forged-request")
+
+        session.request_to_interaction.pop("forged-request")
+        session.response_to_interaction["forged-response"] = chat.interaction_id
+        with self.assertRaisesRegex(AgentContractError, "mappings"):
+            session.get_interaction(response_id="forged-response")
+
+        session.response_to_interaction.pop("forged-response")
+        with self.assertRaisesRegex(AgentContractError, "same API endpoint"):
+            session.start_request(
+                "/v1/responses",
+                {"input": []},
+                parent_interaction_id=chat.interaction_id,
+            )
+
     def test_terminal_sessions_reject_late_tool_results(self):
         session, foreign = OpenAISession(), OpenAISession()
         interaction = self.record(session)
@@ -749,6 +772,527 @@ class SessionContractTests(unittest.TestCase):
                 session.finish()
             session.release()
             self.assertTrue(session.released)
+
+
+class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
+    """Collector provenance survives API calls, local tools and trace export."""
+
+    @staticmethod
+    def context(index=0):
+        return ExecutionContext(
+            rollout_id=f"rollout-{index}",
+            episode_id=f"episode-{index}",
+            group_id="collector-group",
+            sample_index=index,
+            group_size=4,
+            snapshot_id="snapshot-3",
+            policy_version=3,
+            task_id="task",
+            resource_owner="collector",
+        )
+
+    @staticmethod
+    def adapter(observed):
+        async def create(**kwargs):
+            before = current_execution_context()
+            await asyncio.sleep(0)
+            observed.append((before, current_execution_context()))
+            responses = "input" in kwargs
+            items = kwargs["input"] if responses else kwargs["messages"]
+            final = any(
+                item.get("type") == "function_call_output" or item.get("role") == "tool"
+                for item in items
+            )
+            identity = f"response-{before.interaction_id}"
+            if responses:
+                return {
+                    "id": identity,
+                    "status": "completed",
+                    "output": (
+                        [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "5"}],
+                            }
+                        ]
+                        if final
+                        else [
+                            {
+                                "type": "function_call",
+                                "call_id": "call",
+                                "name": "add",
+                                "arguments": '{"a":2,"b":3}',
+                            }
+                        ]
+                    ),
+                }
+            return {
+                "id": identity,
+                "choices": [
+                    {
+                        "message": (
+                            {"role": "assistant", "content": "5"}
+                            if final
+                            else {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "type": "function",
+                                        "id": "call",
+                                        "function": {
+                                            "name": "add",
+                                            "arguments": '{"a":2,"b":3}',
+                                        },
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ],
+            }
+
+        return OpenAIClient(
+            SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+                responses=SimpleNamespace(create=create),
+            ),
+            model="fake",
+        )
+
+    def test_session_preserves_complete_context_and_separates_ids(self):
+        context = self.context(2)
+        session = OpenAISession(
+            context=context, training=True, session_id="sdk-session"
+        )
+        self.assertIs(session.context, context)
+        self.assertTrue(session.training)
+        self.assertEqual(session.rollout_id, context.rollout_id)
+        self.assertEqual(session.group_id, context.group_id)
+        self.assertNotIn(
+            session.session_id,
+            (context.rollout_id, context.episode_id, context.snapshot_id),
+        )
+        for field, value in (
+            ("context", replace(context, group_id="other")),
+            ("session_id", "other"),
+            ("rollout_id", "other"),
+            ("group_id", "other"),
+            ("training", False),
+        ):
+            with self.subTest(field=field), self.assertRaises(AttributeError):
+                setattr(session, field, value)
+        with self.assertRaises(FrozenInstanceError):
+            session.context.sample_index = 99
+        inference = OpenAISession()
+        ids = (
+            inference.session_id,
+            inference.context.episode_id,
+            inference.rollout_id,
+            inference.context.snapshot_id,
+        )
+        self.assertEqual(len(set(ids)), 4)
+        legacy = OpenAISession(
+            rollout_id="legacy",
+            group_id="g",
+            sample_index=2,
+            snapshot_id="s",
+            policy_version="label",
+        )
+        self.assertEqual(
+            (
+                legacy.rollout_id,
+                legacy.group_id,
+                legacy.context.sample_index,
+                legacy.context.snapshot_id,
+                legacy.context.policy_version,
+            ),
+            ("legacy", "g", 2, "s", "label"),
+        )
+
+    def test_training_context_rejects_missing_identity_and_conflicting_overrides(self):
+        context = self.context(1)
+        with self.assertRaises(AgentContractError):
+            OpenAISession(
+                training=True, rollout_id="manual", snapshot_id="s", policy_version=3
+            )
+        for kwargs in (
+            {"context": replace(context, policy_version=None), "training": True},
+            {"context": replace(context, interaction_id="child")},
+            {"context": {}},
+            {"training": 1},
+            {"session_id": ""},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(AgentContractError):
+                OpenAISession(**kwargs)
+        for field, value in (
+            ("rollout_id", "changed"),
+            ("group_id", "changed"),
+            ("sample_index", 0),
+            ("sample_index", True),
+            ("snapshot_id", "changed"),
+            ("policy_version", 4),
+            ("resource_owner", "changed"),
+        ):
+            with self.subTest(field=field), self.assertRaises(AgentContractError):
+                OpenAISession(context=context, **{field: value})
+        matched = OpenAISession(
+            context=context, training=True, sample_index=1, policy_version=3
+        )
+        self.assertIs(matched.context, context)
+
+    async def test_concurrent_candidate_contexts_reach_sync_and_async_tools(self):
+        def make_tool(tool_contexts, asynchronous):
+            def sync_add(a: float, b: float):
+                tool_contexts.append(current_execution_context())
+                return a + b
+
+            async def async_add(a: float, b: float):
+                before = current_execution_context()
+                await asyncio.sleep(0)
+                self.assertEqual(current_execution_context(), before)
+                tool_contexts.append(before)
+                return a + b
+
+            return function_tool(async_add if asynchronous else sync_add, name="add")
+
+        for api in ("chat_completions", "responses"):
+            for asynchronous in (False, True):
+                api_contexts, tool_contexts = [], []
+                tool = make_tool(tool_contexts, asynchronous)
+                agent = Agent(
+                    name="calc",
+                    instructions="Use add.",
+                    tools=[tool],
+                    client=self.adapter(api_contexts),
+                    api=api,
+                )
+                contexts = [self.context(i) for i in range(3)]
+                workflow = OpenAIWorkflow(agent)
+                results = await asyncio.gather(
+                    *(
+                        workflow.run("2+3", context=context, training=True)
+                        for context in contexts
+                    )
+                )
+                self.assertEqual(len({result.session_id for result in results}), 3)
+                self.assertEqual(len(api_contexts), 6)
+                self.assertTrue(all(left == right for left, right in api_contexts))
+                for result, context in zip(results, contexts, strict=True):
+                    self.assertIs(result.session.context, context)
+                    first, second = result.session.interactions
+                    self.assertIsNone(first.parent_interaction_id)
+                    self.assertEqual(second.parent_interaction_id, first.interaction_id)
+                    for interaction in (first, second):
+                        self.assertEqual(
+                            replace(
+                                interaction.context,
+                                interaction_id=None,
+                                parent_interaction_id=None,
+                            ),
+                            context,
+                        )
+                    self.assertIn(first.context, tool_contexts)
+                    self.assertTrue(
+                        all(
+                            event.context == context
+                            or event.context in (first.context, second.context)
+                            for event in result.session.events
+                        )
+                    )
+                    await workflow.submit_reward(result, 1, submission_id="outcome")
+                    trace = workflow.export_trajectory(result)
+                    self.assertEqual(trace.metadata["context"], asdict(context))
+                    self.assertEqual(trace.metadata["episode_id"], context.episode_id)
+                    self.assertEqual(trace.metadata["group_size"], 4)
+                    self.assertEqual(trace.logical_rollout_id, context.rollout_id)
+                    self.assertTrue(trace.metadata["training_context"])
+                    self.assertFalse(trace.metadata["trainable"])
+                self.assertIsNone(current_execution_context())
+
+    async def test_conflicting_context_and_identity_options_fail_before_sdk_call(self):
+        observed = []
+        agent = Agent(
+            name="calc",
+            instructions="Use add.",
+            tools=[add],
+            client=self.adapter(observed),
+        )
+        context = self.context()
+        for field, value in (
+            ("rollout_id", "other"),
+            ("episode_id", "other"),
+            ("group_id", "other"),
+            ("sample_index", 1),
+            ("snapshot_id", "other"),
+            ("policy_version", 4),
+            ("group_size", 9),
+            ("task_id", "other"),
+            ("resource_owner", "other"),
+        ):
+            altered = replace(context, **{field: value})
+            session = OpenAISession(context=context, training=True)
+            with self.subTest(field=field), self.assertRaises(AgentContractError):
+                await agent.run("2+3", context=altered, session=session, training=True)
+            self.assertEqual(session.interactions, [])
+        for field in ("rollout_id", "snapshot_id", "policy_version", "sample_index"):
+            with self.subTest(option=field), self.assertRaises(ValueError):
+                await agent.run(
+                    "2+3", context=context, training=True, **{field: "override"}
+                )
+        with self.assertRaises(AgentContractError):
+            await agent.run("2+3", training=True)
+        with self.assertRaises(AgentContractError):
+            await agent.run(
+                "2+3",
+                context=context,
+                session=OpenAISession(context=context),
+                training=True,
+            )
+        self.assertEqual(observed, [])
+
+    async def test_workflow_snapshot_checks_provenance_without_sampling(self):
+        from unittest.mock import AsyncMock
+
+        from triotune.agentrl.runtime.sampling import SamplingSnapshot
+
+        observed = []
+        sampler = SimpleNamespace(
+            generate=AsyncMock(
+                side_effect=AssertionError(
+                    "External API traces must not sample PyTRIO."
+                )
+            )
+        )
+        snapshot = SamplingSnapshot("snapshot-3", sampler, object(), policy_version=3)
+        workflow = OpenAIWorkflow(
+            Agent(
+                name="calc",
+                instructions="Use add.",
+                tools=[add],
+                client=self.adapter(observed),
+            )
+        )
+        context = self.context()
+        for altered in (
+            replace(context, snapshot_id="other"),
+            replace(context, policy_version=4),
+            None,
+        ):
+            with self.subTest(altered=altered), self.assertRaises(AgentContractError):
+                await workflow.run("2+3", context=altered, snapshot=snapshot)
+        self.assertEqual(observed, [])
+        result = await workflow.run("2+3", context=context, snapshot=snapshot)
+        self.assertTrue(result.session.training)
+        self.assertFalse(result.export_trajectory().metadata["trainable"])
+        sampler.generate.assert_not_awaited()
+        session = OpenAISession(context=context, training=True)
+        result = await workflow.run("2+3", session=session, snapshot=snapshot)
+        self.assertIs(result.session, session)
+
+    async def test_existing_collector_identity_reaches_sdk_and_ppo_datums(self):
+        from recipes.calculator_agent import calculator_rows, calculator_workflow
+        from test_agent_episode_runner import snapshot
+
+        from triotune import PPOConfig
+        from triotune.trainer.ppo import prepare_advantages, validate_policy_versions
+        from triotune.trainer.ppo.datum import batch_datums
+
+        policy, _ = snapshot()
+        policy = replace(policy, policy_version=3)
+        api_contexts, sdk_results, log_contexts = [], [], []
+        sdk = OpenAIWorkflow(
+            Agent(
+                name="judge",
+                instructions="Use add.",
+                tools=[add],
+                client=self.adapter(api_contexts),
+            )
+        )
+
+        class Logger:
+            async def write(self, episode):
+                log_contexts.append((current_execution_context(), episode.context))
+
+        collector = calculator_workflow(logger=Logger())
+        original = collector.runner.scorer
+
+        class Scorer:
+            async def score(self, row, episode):
+                context = current_execution_context()
+                self_context = episode.context
+                result = await sdk.run("2+3", context=self_context, snapshot=policy)
+                # The nested SDK call must restore the enclosing scorer's
+                # collector context before the original reward is computed.
+                if current_execution_context() != context:
+                    raise AssertionError("SDK leaked interaction context into scoring.")
+                score = await original.score(row, episode)
+                await sdk.submit_reward(result, score, submission_id="outcome")
+                sdk_results.append(result)
+                return score
+
+        collector.runner.scorer = Scorer()
+        batch = await collector.collect(calculator_rows()[:1], policy, n_samples=3)
+        self.assertEqual(len(batch.trajectories), 3)
+        self.assertEqual(len(sdk_results), 3)
+        episodes = {episode.rollout_id: episode for episode in batch.episodes}
+        self.assertEqual(
+            sorted(result.session.context.sample_index for result in sdk_results),
+            [0, 1, 2],
+        )
+        for result in sdk_results:
+            episode = episodes[result.session.rollout_id]
+            self.assertIs(result.session.context, episode.context)
+            self.assertEqual(result.session.context.group_size, 3)
+            self.assertEqual(result.session.context.snapshot_id, policy.snapshot_id)
+            self.assertEqual(result.session.context.policy_version, 3)
+            self.assertNotEqual(result.session_id, episode.episode_id)
+            self.assertFalse(result.export_trajectory().metadata["trainable"])
+        self.assertTrue(all(actual == expected for actual, expected in log_contexts))
+        validate_policy_versions(batch.trajectories, current_version=3)
+        prepared = prepare_advantages(
+            batch.trajectories, PPOConfig.for_algorithm("reinforce", adv_norm=None)
+        )
+        datums = batch_datums(prepared)
+        self.assertEqual(len(datums), 3)
+        self.assertEqual(
+            {item["rollout_id"] for item in datums.provenance}, set(episodes)
+        )
+        self.assertEqual({item["policy_version"] for item in datums.provenance}, {3})
+        self.assertIsNone(current_execution_context())
+        await collector.close()
+
+    def test_interaction_context_tampering_is_rejected_at_each_boundary(self):
+        context = self.context()
+        session = OpenAISession(context=context, training=True)
+        interaction = SessionContractTests.record(session)
+        original = interaction.context
+        for field, value in (
+            ("rollout_id", "other"),
+            ("episode_id", "other"),
+            ("group_id", "other"),
+            ("sample_index", 1),
+            ("snapshot_id", "other"),
+            ("policy_version", 4),
+            ("task_id", "other"),
+            ("resource_owner", "other"),
+        ):
+            interaction.context = replace(original, **{field: value})
+            for operation in (
+                lambda: session.start_request("/v1/chat/completions", {}),
+                lambda: session.record_tool_results(interaction, []),
+                session.finish,
+            ):
+                with self.subTest(field=field), self.assertRaises(AgentContractError):
+                    operation()
+        interaction.context = original
+        session.finish()
+        interaction.context = replace(original, policy_version=4)
+        with self.assertRaises(AgentContractError):
+            session.export_trajectory()
+        interaction.context = original
+        self.assertEqual(session.export_trajectory().metadata["policy_version"], 3)
+
+    def test_event_context_tampering_is_rejected_before_export(self):
+        context = self.context()
+        session = OpenAISession(context=context, training=True)
+        SessionContractTests.record(session)
+        event = session.events[0]
+        object.__setattr__(event, "context", replace(context, rollout_id="forged"))
+        with self.assertRaisesRegex(AgentContractError, "event provenance"):
+            session.export_trajectory()
+        object.__setattr__(event, "context", context)
+        session.finish()
+        self.assertEqual(
+            session.export_trajectory().metadata["context"]["rollout_id"], "rollout-0"
+        )
+
+    async def test_api_and_tool_failures_restore_enclosing_context(self):
+        from triotune.agentrl.types import _execution_context
+
+        enclosing = replace(self.context(3), rollout_id="enclosing")
+        token = _execution_context.set(enclosing)
+        try:
+            for cancel in (False, True):
+
+                async def fail(**kwargs):
+                    self.assertEqual(
+                        current_execution_context().rollout_id, "rollout-0"
+                    )
+                    raise asyncio.CancelledError()
+
+                # API cancellation has the same provenance cleanup as transport
+                # failure; use a separate function for a normal exception.
+                async def error(**kwargs):
+                    raise ConnectionError("offline")
+
+                raw = SimpleNamespace(
+                    chat=SimpleNamespace(
+                        completions=SimpleNamespace(create=fail if cancel else error)
+                    )
+                )
+                agent = Agent(
+                    name="fail",
+                    instructions="Answer.",
+                    client=OpenAIClient(raw, model="fake"),
+                )
+                session = OpenAISession(context=self.context(), training=True)
+                with self.assertRaises(
+                    asyncio.CancelledError if cancel else ConnectionError
+                ):
+                    await agent.run("x", session=session, training=True)
+                self.assertEqual(current_execution_context(), enclosing)
+                self.assertEqual(session.status, "cancelled" if cancel else "failed")
+                self.assertEqual(
+                    session.export_trajectory().metadata["context"],
+                    asdict(self.context()),
+                )
+        finally:
+            _execution_context.reset(token)
+
+    async def test_tool_failure_and_cancellation_keep_candidate_identity(self):
+        from triotune.agentrl import ToolSystemError
+
+        def make_tool(cancel, observed):
+            @function_tool(name="add")
+            async def fail(a: float, b: float):
+                observed.append(current_execution_context())
+                if cancel:
+                    raise asyncio.CancelledError()
+                raise RuntimeError("tool failed")
+
+            return fail
+
+        for cancel in (False, True):
+            tool_contexts, api_contexts = [], []
+            context = self.context(1)
+            session = OpenAISession(context=context, training=True)
+            agent = Agent(
+                name="calc",
+                instructions="Use add.",
+                tools=[make_tool(cancel, tool_contexts)],
+                client=self.adapter(api_contexts),
+            )
+            with self.assertRaises(
+                asyncio.CancelledError if cancel else ToolSystemError
+            ):
+                await agent.run("2+3", session=session, training=True)
+            self.assertEqual(tool_contexts, [session.interactions[0].context])
+            self.assertEqual(
+                replace(
+                    tool_contexts[0], interaction_id=None, parent_interaction_id=None
+                ),
+                context,
+            )
+            self.assertEqual(session.status, "cancelled" if cancel else "failed")
+            trace = session.export_trajectory(
+                metadata={"context": {}, "sample_index": 99, "trainable": True}
+            )
+            self.assertEqual(trace.metadata["context"], asdict(context))
+            self.assertEqual(trace.metadata["sample_index"], 1)
+            self.assertFalse(trace.metadata["trainable"])
+            self.assertIsNone(current_execution_context())
 
 
 class ProxyAllocationTests(unittest.IsolatedAsyncioTestCase):
@@ -983,10 +1527,11 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
                 client=self.adapter,
                 api=api,
             )
+            context = SDKIdentityTests.context(1)
             result = (
-                await agent.run("2+3", logprobs=True)
+                await agent.run("2+3", logprobs=True, context=context, training=True)
                 if api == "chat_completions"
-                else await agent.run("2+3")
+                else await agent.run("2+3", context=context, training=True)
             )
             self.assertEqual(result.text, "5")
             first, second = result.session.interactions
@@ -996,6 +1541,14 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first.tool_results[0]["call_id"], "call-1")
             self.assertEqual(observed[-1], first.context)
             self.assertEqual(second.parent_interaction_id, first.interaction_id)
+            self.assertIs(result.session.context, context)
+            self.assertEqual(self.contexts[-1], second.context)
+            self.assertEqual(
+                replace(
+                    second.context, interaction_id=None, parent_interaction_id=None
+                ),
+                context,
+            )
             self.assertIsNotNone(second.logprobs)
             wire_request, wire = self.requests[-1]
             self.assertEqual(
@@ -1071,6 +1624,36 @@ class OfficialSDKTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.export_trajectory().interactions), 1)
         await agent.close()
         self.assertFalse(self.sdk.is_closed())
+
+    async def test_incomplete_response_is_exportable_but_not_successful(self):
+        async def create(**kwargs):
+            return {
+                "id": "incomplete",
+                "status": "incomplete",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "partial"}],
+                    }
+                ],
+            }
+
+        agent = Agent(
+            name="incomplete",
+            instructions="Answer.",
+            api="responses",
+            client=OpenAIClient(
+                SimpleNamespace(responses=SimpleNamespace(create=create)),
+                model="fake",
+            ),
+        )
+        session = OpenAISession()
+        with self.assertRaises(ActionParseError):
+            await agent.run("question", session=session)
+        self.assertEqual(session.status, "failed")
+        self.assertIn("ActionParseError", session.error)
+        self.assertFalse(session.export_trajectory().metadata["trainable"])
 
     async def test_tool_timeout_and_cancellation_preserve_identity(self):
         def make_tool(cancelled):

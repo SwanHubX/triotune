@@ -68,37 +68,180 @@ class OpenAISession:
         self,
         *,
         session_id: str | None = None,
+        context: ExecutionContext | None = None,
+        training: bool = False,
         rollout_id: str | None = None,
         group_id: str | None = None,
-        sample_index: int = 0,
+        sample_index: int | None = None,
         snapshot_id: str | None = None,
         policy_version: int | str | None = None,
-        resource_owner: str = "openai-session",
+        resource_owner: str | None = None,
     ) -> None:
-        self.session_id = session_id or f"sess_{uuid4().hex}"
-        self.rollout_id = rollout_id or self.session_id
-        self.group_id = group_id or self.session_id
-        self.context = ExecutionContext(
-            rollout_id=self.rollout_id,
-            episode_id=self.session_id,
-            group_id=self.group_id,
-            sample_index=sample_index,
-            group_size=max(1, sample_index + 1),
-            snapshot_id=snapshot_id or self.session_id,
-            policy_version=policy_version,
-            resource_owner=resource_owner,
+        """Bind collector identity or create independently identified inference records.
+
+        Training provenance requires a complete root ExecutionContext with a
+        known policy version. Legacy scalar identity arguments remain useful
+        for inference; with a context they may only repeat its existing values.
+        Binding training provenance does not make external API traces trainable.
+        """
+        if type(training) is not bool:
+            raise AgentContractError("training must be boolean.")
+        if training and context is None:
+            raise AgentContractError(
+                "Training sessions require a collector ExecutionContext."
+            )
+        identity = {
+            "rollout_id": rollout_id,
+            "group_id": group_id,
+            "sample_index": sample_index,
+            "snapshot_id": snapshot_id,
+            "policy_version": policy_version,
+            "resource_owner": resource_owner,
+        }
+        if context is not None:
+            if not isinstance(context, ExecutionContext):
+                raise AgentContractError("context must be an ExecutionContext.")
+            context.__post_init__()
+            if (
+                context.interaction_id is not None
+                or context.parent_interaction_id is not None
+            ):
+                raise AgentContractError(
+                    "Session context must identify a root candidate."
+                )
+            if any(
+                value is not None
+                and (
+                    type(value) is not type(getattr(context, key))
+                    or value != getattr(context, key)
+                )
+                for key, value in identity.items()
+            ):
+                raise AgentContractError(
+                    "Session identity overrides conflict with ExecutionContext."
+                )
+            if training and context.policy_version is None:
+                raise AgentContractError(
+                    "Training sessions require a known policy_version."
+                )
+        else:
+            index = sample_index if sample_index is not None else 0
+            context = ExecutionContext(
+                rollout_id=rollout_id
+                if rollout_id is not None
+                else f"rollout_{uuid4().hex}",
+                episode_id=f"episode_{uuid4().hex}",
+                group_id=group_id if group_id is not None else f"group_{uuid4().hex}",
+                sample_index=index,
+                group_size=max(1, index + 1),
+                snapshot_id=snapshot_id
+                if snapshot_id is not None
+                else f"external_{uuid4().hex}",
+                policy_version=policy_version,
+                resource_owner=resource_owner
+                if resource_owner is not None
+                else "openai-session",
+            )
+        if session_id is not None and (
+            not isinstance(session_id, str) or not session_id
+        ):
+            raise AgentContractError("session_id must be a nonempty string.")
+        self._session_id = (
+            session_id if session_id is not None else f"sess_{uuid4().hex}"
         )
+        self._context = context
+        self._identity = replace(context)
+        self._training = training
         self.interactions: list[OpenAIInteraction] = []
         self.rewards: list[Any] = []
         self.events: list[AgentEvent] = []
         self._reward_ids: dict[str, dict[str, Any]] = {}
         self._by_id: dict[str, OpenAIInteraction] = {}
+        self._interaction_contexts: dict[str, ExecutionContext] = {}
         self.request_to_interaction: dict[str, str] = {}
         self.response_to_interaction: dict[str, str] = {}
         self.status = "open"
         self.error: str | None = None
         self.released = False
         self.running = False
+
+    @property
+    def session_id(self) -> str:
+        """Return the SDK session identity, independent of candidate identity."""
+        return self._session_id
+
+    @property
+    def context(self) -> ExecutionContext:
+        """Return the immutable candidate identity supplied by the collector."""
+        return self._context
+
+    @property
+    def training(self) -> bool:
+        return self._training
+
+    @property
+    def rollout_id(self) -> str:
+        return self.context.rollout_id
+
+    @property
+    def group_id(self) -> str:
+        return self.context.group_id
+
+    def validate_identity(self, context: ExecutionContext | None = None) -> None:
+        """Reject changed provenance before API calls, tool evidence or export.
+
+        Interaction records remain mutable for results/status. Their context,
+        parent and lookup identities must still match the original allocation;
+        adapters cannot replace them with another candidate's otherwise valid
+        context. A snapshot of the root identity also detects replacements of
+        private attributes without relying on Python property setters alone.
+        """
+        if self.context != self._identity or (
+            context is not None and context != self._identity
+        ):
+            raise AgentContractError(
+                "Session identity differs from its ExecutionContext."
+            )
+        expected_requests: dict[str, str] = {}
+        expected_responses: dict[str, str] = {}
+        for item in self.interactions:
+            expected = self._interaction_contexts.get(item.interaction_id)
+            if (
+                expected is None
+                or item.context != expected
+                or item.parent_interaction_id != expected.parent_interaction_id
+                or self._by_id.get(item.interaction_id) is not item
+                or self.request_to_interaction.get(item.request_id)
+                != item.interaction_id
+                or (
+                    item.response_id is not None
+                    and self.response_to_interaction.get(item.response_id)
+                    != item.interaction_id
+                )
+            ):
+                raise AgentContractError(
+                    "Interaction identity differs from its allocated ExecutionContext."
+                )
+            expected_requests[item.request_id] = item.interaction_id
+            if item.response_id is not None:
+                expected_responses[item.response_id] = item.interaction_id
+        # Check the reverse lookup tables as well as each record.  Without this
+        # comparison, an adapter could add a second request/response alias for
+        # an existing interaction and later use that unallocated alias to move
+        # rewards or parent links across an otherwise valid session boundary.
+        if (
+            self.request_to_interaction != expected_requests
+            or self.response_to_interaction != expected_responses
+        ):
+            raise AgentContractError(
+                "Session request or response identity mappings were modified."
+            )
+        trusted_contexts = {self.context, *self._interaction_contexts.values()}
+        if any(
+            not isinstance(event, AgentEvent) or event.context not in trusted_contexts
+            for event in self.events
+        ):
+            raise AgentContractError("Session event provenance was modified.")
 
     def get_interaction(
         self,
@@ -113,6 +256,7 @@ class OpenAISession:
         response IDs are the provider's completion/response IDs. References
         from another session are never accepted as reward or parent targets.
         """
+        self.validate_identity()
         if (
             sum(
                 value is not None for value in (interaction_id, request_id, response_id)
@@ -131,6 +275,7 @@ class OpenAISession:
         return self._by_id[interaction_id]
 
     def _require_idle(self) -> None:
+        self.validate_identity()
         if self.running or any(item.status == "running" for item in self.interactions):
             raise AgentContractError(
                 "Session still has active agent work or a request in flight."
@@ -221,6 +366,10 @@ class OpenAISession:
         if parent is not None:
             if parent.status != "completed":
                 raise AgentContractError("Parent interaction must be completed.")
+            if parent.endpoint != endpoint:
+                raise AgentContractError(
+                    "Parent interaction must use the same API endpoint."
+                )
             return parent.interaction_id
         key = "messages" if endpoint == "/v1/chat/completions" else "input"
         child = self._normalized(payload.get(key, []))
@@ -276,6 +425,7 @@ class OpenAISession:
         parent_interaction_id: str | None = None,
     ) -> OpenAIInteraction:
         """Allocate request and child interaction identity before an API call."""
+        self.validate_identity()
         if self.status != "open" or self.released:
             raise AgentContractError(
                 "A terminal or released session cannot start requests."
@@ -301,6 +451,7 @@ class OpenAISession:
         )
         self.interactions.append(interaction)
         self._by_id[interaction_id] = interaction
+        self._interaction_contexts[interaction_id] = replace(interaction.context)
         self.request_to_interaction[interaction.request_id] = interaction_id
         self.events.append(
             AgentEvent(
@@ -313,6 +464,7 @@ class OpenAISession:
 
     def complete_request(self, interaction: OpenAIInteraction, response: Any) -> None:
         """Capture IDs, usage and available token logprobs from a response."""
+        self.validate_identity()
         if (
             self._by_id.get(interaction.interaction_id) is not interaction
             or interaction.status != "running"
@@ -381,6 +533,7 @@ class OpenAISession:
 
     def record_tool_results(self, interaction: OpenAIInteraction, results) -> None:
         """Append results only to a completed API request in the open session."""
+        self.validate_identity()
         if (
             self.status != "open"
             or self.released
@@ -566,10 +719,15 @@ class OpenAISession:
             metadata={
                 **(metadata or {}),
                 "group_id": self.group_id,
+                "episode_id": self.context.episode_id,
+                "group_size": self.context.group_size,
+                "task_id": self.context.task_id,
                 "sample_index": self.context.sample_index,
                 "snapshot_id": self.context.snapshot_id,
                 "policy_version": self.context.policy_version,
                 "resource_owner": self.context.resource_owner,
+                "context": asdict(self.context),
+                "training_context": self.training,
                 "trainable": False,
                 "status": self.status,
                 "error": self.error,

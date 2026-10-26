@@ -79,6 +79,59 @@ can instead be passed explicitly with rollout/group/sample/snapshot/policy
 identity. Concurrent runs require separate sessions; an already used session
 cannot start another independent agent conversation.
 
+`OpenAISession(context=collector_context, training=True)` binds the existing root
+`ExecutionContext` without rebuilding it. This preserves rollout, episode, group,
+sample index, group size, task, snapshot, policy version and resource owner.
+Training provenance requires a context with a known policy version; individual
+identity arguments cannot replace that requirement. Optional legacy identity
+arguments may repeat the context's values but conflicting overrides are rejected.
+An interaction context cannot be used as a session root.
+
+Session IDs are independent of candidate identity. Without a supplied context,
+the inference path generates separate session, episode, rollout, group and
+external snapshot IDs. Its external snapshot ID is a trace label, not evidence
+of a PyTRIO sampling snapshot. Read-only `session.context`, `session.session_id`,
+`session.rollout_id` and `session.group_id` properties prevent accidental identity
+replacement. To read episode, task or group-size fields, use `session.context`.
+Callers that previously treated session ID as episode or snapshot identity must
+use the corresponding context fields instead.
+
+Both `Agent.run(..., context=context, training=True)` and
+`OpenAIWorkflow.run(..., context=context, training=True)` accept collector context.
+An explicitly supplied session must match it and be created in training mode.
+`OpenAIWorkflow.run(..., context=context, snapshot=snapshot)` additionally checks
+snapshot ID and policy version against a `SamplingSnapshot` before making an API
+call, and enables training-context validation. No identity fields are forwarded
+as SDK generation options or taken from model tool arguments.
+
+```python
+from triotune.agentrl import ExecutionContext
+from triotune.agentrl.runtime.sampling import SamplingSnapshot
+from triotune.agentrl.sdk.openai import OpenAISession, OpenAIWorkflow
+
+
+async def record_candidate(
+    workflow: OpenAIWorkflow,
+    messages: list[dict],
+    context: ExecutionContext,
+    snapshot: SamplingSnapshot,
+):
+    # The existing collector supplies context and snapshot before execution.
+    session = OpenAISession(context=context, training=True)
+    result = await workflow.run(
+        messages, context=context, session=session, snapshot=snapshot
+    )
+    return result.export_trajectory()
+```
+
+The existing collector already creates the complete context before executor
+calls; no alternative candidate allocator is used. This SDK facade is not yet
+an `EpisodeExecutor`: the example records external API evidence for a candidate,
+not model actions sampled from PyTRIO. Snapshot validation checks identity only
+and never invokes its sampler or selects its weights. Export always retains
+`trainable=False`, even when `training_context=True`. A later sampling backend
+and exact-token exporter are still required before external SDK runs enter PPO.
+
 Sessions start with status `open`. `Agent.run()` automatically finishes them
 as `completed`, `failed`, or `cancelled`, including tool failures and turn-limit
 exits. Successful direct client/proxy requests leave a session open for
@@ -102,6 +155,20 @@ records local request IDs, provider request IDs, completion IDs, messages,
 tool calls/results, usage, available logprobs, status and latency. Native tool
 call IDs are preserved in observations. Responses continuation retains all
 output items, including reasoning items, before appending function outputs.
+
+Each child context changes only interaction/parent identity from the root;
+candidate fields stay unchanged across API calls and local tools. Agent execution
+restores the enclosing context after success, failure or cancellation. Session
+boundaries validate original root/interaction identities before requests, result
+recording, reward submission and export. Replacing a record's context or changing
+its parent/lookup identity is rejected. Export metadata includes the complete
+trusted root context and cannot override it with caller-provided metadata.
+Request and response lookup tables are checked in both directions, so forged
+aliases are rejected before they can redirect a reward or parent reference.
+Explicit parents must belong to the same API endpoint; Responses continuations
+should use `previous_response_id` or a complete validated history. A provider
+response that is not completed is retained as failed/cancelled evidence and is
+never treated as a successful candidate.
 
 `session.get_interaction(request_id=...)` resolves a local request ID, and
 `session.get_interaction(response_id=...)` resolves a provider completion or

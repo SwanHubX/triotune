@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...runtime.tools import FunctionToolExecutor
-from ...types import AgentEvent, ToolCallEvent, ToolResultEvent, _execution_context
+from ...types import (
+    AgentContractError,
+    AgentEvent,
+    ExecutionContext,
+    ToolCallEvent,
+    ToolResultEvent,
+    _execution_context,
+)
 from .client import OpenAIClient
 from .native import (
     OpenAIChatObservationFormatter,
@@ -83,6 +90,8 @@ class Agent:
         input: str | list[dict[str, Any]],
         *,
         session: OpenAISession | None = None,
+        context: ExecutionContext | None = None,
+        training: bool = False,
         **request_options: Any,
     ) -> AgentRunResult:
         """Run a fresh conversation in one isolated session until a final answer.
@@ -97,10 +106,37 @@ class Agent:
             "tools",
             "instructions",
             "previous_response_id",
+            "rollout_id",
+            "episode_id",
+            "group_id",
+            "sample_index",
+            "group_size",
+            "snapshot_id",
+            "policy_version",
+            "task_id",
+            "resource_owner",
+            "interaction_id",
+            "parent_interaction_id",
         }.intersection(request_options):
             raise ValueError("Conversation and tool fields are owned by Agent.run.")
-        session = session or OpenAISession()
-        if session.running or session.interactions:
+        if type(training) is not bool:
+            raise AgentContractError("training must be boolean.")
+        session = (
+            session
+            if session is not None
+            else OpenAISession(context=context, training=training)
+        )
+        session.validate_identity(context)
+        if training and not session.training:
+            raise AgentContractError(
+                "A training run requires a session bound in training mode."
+            )
+        if (
+            session.running
+            or session.interactions
+            or session.status != "open"
+            or session.released
+        ):
             raise ValueError(
                 "Agent.run requires an unused session for an independent conversation."
             )
@@ -116,7 +152,9 @@ class Agent:
         if self.api == "chat_completions":
             items.insert(0, {"role": "system", "content": self.instructions})
         session.running = True
+        root_token = _execution_context.set(session.context)
         terminal_status, terminal_error = "completed", None
+        failure = None
         try:
             for _ in range(self.max_turns):
                 kwargs = {"session": session, "model": self.model, **request_options}
@@ -143,6 +181,19 @@ class Agent:
                     formatter = OpenAIResponsesObservationFormatter()
                 interaction = session.interactions[-1]
                 if not action.tool_calls:
+                    if interaction.status != "completed":
+                        # A provider may return a text payload with a length,
+                        # cancellation, or other non-terminal status. Preserve
+                        # the partial response for diagnostics, but do not mark
+                        # the session as a successful training candidate.
+                        terminal_status = (
+                            "cancelled"
+                            if interaction.status == "cancelled"
+                            else "failed"
+                        )
+                        terminal_error = (
+                            f"OpenAI request ended with status {interaction.status!r}."
+                        )
                     return AgentRunResult(action.final_text or "", session, response)
                 if self.api == "chat_completions":
                     items.append(action.assistant_message)
@@ -190,6 +241,7 @@ class Agent:
                 "OpenAI agent exceeded max_turns without a final answer."
             )
         except BaseException as exc:
+            failure = exc
             terminal_status = (
                 "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             )
@@ -206,7 +258,14 @@ class Agent:
             raise
         finally:
             session.running = False
-            session.finish(terminal_status, error=terminal_error)
+            try:
+                session.finish(terminal_status, error=terminal_error)
+            except Exception as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(f"Session finalization also failed: {cleanup_error}")
+            finally:
+                _execution_context.reset(root_token)
 
     async def close(self):
         await self.client.close()
