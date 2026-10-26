@@ -169,11 +169,18 @@ class PPOActor:
         chunks = list(minibatches(batch, config.ppo_n_minibatches))
         metrics = []
         diagnostics = []
+        native_backend = config.loss_backend == "native" and not (
+            self.plan
+            and (
+                self.plan.loss_weight_policy is not None
+                or self.plan.objective is not None
+            )
+        )
         for _ in range(config.update_epochs):
             for chunk in chunks:
-                data = batch_datums(chunk, native=config.loss_backend == "native")
+                data = batch_datums(chunk, native=native_backend)
                 self.datum_provenance = data.provenance
-                if config.loss_backend == "native":
+                if native_backend:
                     result = await call_async(
                         self.client,
                         "forward_backward",
@@ -206,7 +213,7 @@ class PPOActor:
                         loss_fn=factory(chunk, config, diagnostics),
                     )
                 # PyTRIO custom loss submits a forward, then a forward_backward.
-                passes = 1 if config.loss_backend == "native" else 2
+                passes = 1 if native_backend else 2
                 self.train_tokens += passes * compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
@@ -215,7 +222,7 @@ class PPOActor:
                 )
                 self.optimizer_steps += 1
                 row = dict(result.metrics)
-                if config.loss_backend == "native":
+                if native_backend:
                     native = _native_policy_metrics(result, chunk, config)
                     diagnostics.append(
                         {

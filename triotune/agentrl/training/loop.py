@@ -33,7 +33,15 @@ def filter_agent_groups(trajectories):
     informative.update(
         t.group_id
         for t in trajectories
-        if t.token_rewards is not None and any(t.token_rewards)
+        if (
+            t.token_rewards is not None
+            and any(t.token_rewards)
+        )
+    )
+    informative.update(
+        t.group_id
+        for t in trajectories
+        if t.token_advantages is not None and any(t.token_advantages)
     )
     return [t for t in trajectories if t.group_id in informative]
 
@@ -306,7 +314,12 @@ class AgentTrainingLoop:
                 await trainer.close(state="crashed", error=str(exc))
             except Exception as cleanup_error:  # noqa: BLE001 -- retain the original training failure
                 exc.add_note(f"Reporter cleanup also failed: {cleanup_error}")
+            try:
+                await self.workflow.close()
+            except Exception as cleanup_error:  # noqa: BLE001 -- retain the original training failure
+                exc.add_note(f"Agent resource cleanup also failed: {cleanup_error}")
             raise
         else:
             await trainer.close()
+            await self.workflow.close()
         return trainer.state

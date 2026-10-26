@@ -30,7 +30,12 @@ from ...api.cli_args import (
 )
 from .trajectory import PPOState, PreparedBatch, Trajectory, validate_policy_versions
 from .critic import Critic, PyTRIOCritic, value_loss
-from .gae import compute_gae, compute_token_level_gae, compute_turn_level_gae
+from .gae import (
+    compute_gae,
+    compute_token_level_gae,
+    compute_trajectory_level_gae,
+    compute_turn_level_gae,
+)
 
 # Keep historical submodule imports working as identity aliases during migration.
 _advantages_module = importlib.import_module(".advantages", __name__)
@@ -98,6 +103,7 @@ __all__ = [
     "compute_gae",
     "compute_token_level_gae",
     "compute_turn_level_gae",
+    "compute_trajectory_level_gae",
     "normalize",
     "prepare_advantages",
     "value_loss",

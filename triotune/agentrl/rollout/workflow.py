@@ -193,6 +193,25 @@ class AgentRolloutWorkflow:
         self.shared_prefix_policy = shared_prefix_policy
         self.accept_sample = accept_sample
 
+    async def start(self) -> None:
+        """Start session-scoped scorer and tool resources."""
+        start = getattr(self.runner, "start", None)
+        if callable(start):
+            await start()
+
+    async def close(self) -> None:
+        """Close resources owned by the underlying episode runner."""
+        close = getattr(self.runner, "close", None)
+        if callable(close):
+            await close()
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.close()
+
     async def collect(
         self,
         rows: Sequence[Mapping[str, Any]],
@@ -234,6 +253,7 @@ class AgentRolloutWorkflow:
                     snapshot_id=snapshot.snapshot_id,
                     policy_version=snapshot.policy_version,
                     task_id=str(row.get("task_id", f"row-{row_index}")),
+                    resource_owner=getattr(self.runner, "resource_owner", "runner"),
                 )
                 # Reserve max_turns consecutive seeds for each attempt, leaving
                 # room for the runner's per-turn increments without overlap.

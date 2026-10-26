@@ -118,9 +118,12 @@ class PPOAlgorithmPlan:
             return method(rows, group_ids, config, masks)
         except TypeError:
             try:
-                return method(rows, group_ids, masks)
+                return method(rows, group_ids, config)
             except TypeError:
-                return method(rows, group_ids)
+                try:
+                    return method(rows, group_ids, masks)
+                except TypeError:
+                    return method(rows, group_ids)
 
     def row_weight(self, trajectory: Trajectory, mask: Sequence[bool]) -> float:
         policy = self.loss_weight_policy

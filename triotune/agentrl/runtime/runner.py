@@ -50,7 +50,7 @@ from ..types import (
     _execution_context,
     validate_tokens,
 )
-from ..training.rewards import RewardLedger
+from ..training.rewards import RewardAssignment, RewardLedger
 from .sampling import SamplingSnapshot
 
 
@@ -169,6 +169,7 @@ class EpisodeRunner:
             status, message = result, str(error)
         if not isinstance(status, str) or not status:
             raise AgentContractError("Failure classifier must return a status string.")
+        episode.export_metadata["system_failure"] = True
         return status, str(message)
 
     async def submit_reward(self, episode, score=None):
@@ -277,6 +278,35 @@ class EpisodeRunner:
                     else item
                     for item in result.assignments
                 )
+                if result.reward:
+                    assignments.append(
+                        RewardAssignment(
+                            target="interaction",
+                            value=result.reward,
+                            source="interaction_scorer",
+                            position=index,
+                        )
+                    )
+                for turn_index, values in result.process_rewards.items():
+                    if turn_index not in {0, index}:
+                        raise AgentContractError(
+                            "Interaction scorer process rewards must target its interaction."
+                        )
+                    if interaction.turn is None or len(values) != len(
+                        interaction.turn.generation.tokens
+                    ):
+                        raise AgentContractError(
+                            "Interaction scorer process rewards must align with output tokens."
+                        )
+                    for token_index, value in enumerate(values):
+                        assignments.append(
+                            RewardAssignment(
+                                target="token",
+                                value=value,
+                                source="interaction_scorer",
+                                position=(index, token_index),
+                            )
+                        )
                 interaction.reward = result.reward
                 continue
             if not isinstance(result, (tuple, list)):
@@ -335,12 +365,14 @@ class EpisodeRunner:
                 snapshot_id=snapshot.snapshot_id,
                 policy_version=snapshot.policy_version,
                 task_id=str(row["task_id"]) if "task_id" in row else None,
+                resource_owner=self.resource_owner,
             )
         if (
             context.group_id != group_id
             or context.sample_index != sample_index
             or context.snapshot_id != snapshot.snapshot_id
             or context.policy_version != snapshot.policy_version
+            or context.resource_owner != self.resource_owner
             or context.interaction_id is not None
             or rollout_id is not None
             and context.rollout_id != rollout_id

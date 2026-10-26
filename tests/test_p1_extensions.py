@@ -4,7 +4,12 @@ import unittest
 
 from triotune.agentrl import EpisodeScore, RewardAssignment, RewardLedger
 from triotune.agentrl.runtime.runner import EpisodeRunner
-from triotune.trainer.ppo import PPOAlgorithmPlan, Trajectory, prepare_advantages
+from triotune.trainer.ppo import (
+    PPOAlgorithmPlan,
+    Trajectory,
+    compute_trajectory_level_gae,
+    prepare_advantages,
+)
 from triotune import PPOConfig
 
 
@@ -28,6 +33,13 @@ class StructuredRewardTests(unittest.TestCase):
 
 
 class PPOPlanTests(unittest.TestCase):
+    def test_trajectory_estimator_is_public(self):
+        advantages, returns = compute_trajectory_level_gae(
+            [1.0, 2.0, 0.0], [0.5, 0.0, 0.0, 3.0], [True, True, False], truncated=True
+        )
+        self.assertEqual(advantages, [5.5, 5.5, 0.0])
+        self.assertEqual(returns, [6.0, 6.0, 0.0])
+
     def test_custom_row_weight_and_advantage_stage_are_public(self):
         trajectory = Trajectory([1], [2, 3], [-1.0, -1.0], 1.0, "g")
 

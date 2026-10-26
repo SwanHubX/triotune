@@ -14,7 +14,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
-from typing import Literal
+from typing import Literal, Protocol
 
 from ..types import AgentContractError, EpisodeScore, EpisodeScorer
 
@@ -22,6 +22,23 @@ from ..types import AgentContractError, EpisodeScore, EpisodeScorer
 RewardTarget = Literal["interaction", "turn", "token", "trajectory"]
 RewardMode = Literal["reward", "advantage"]
 RewardAggregation = Literal["sum", "mean", "last"]
+
+
+class RewardSubmitter(Protocol):
+    """Accept delayed structured assignments for one logical rollout."""
+
+    def submit(
+        self,
+        assignments,
+        *,
+        logical_rollout_id: str | None = None,
+    ) -> tuple["RewardAssignment", ...]: ...
+
+
+class RewardAggregator(Protocol):
+    """Fold accepted assignments into outcome, process and advantage signals."""
+
+    def aggregate(self): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,7 +338,11 @@ class ToolCostScorer:
         return EpisodeScore(
             0,
             False,
-            {"requested_calls": float(calls), "invalid_calls": float(errors)},
+            {
+                "requested_calls": float(calls),
+                "invalid_calls": float(errors),
+                "cost_penalty": float(sum(map(sum, process.values()))),
+            },
             process,
         )
 

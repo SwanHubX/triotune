@@ -901,7 +901,7 @@ class PPOActorConfig:
             GAE reward discount. One preserves undiscounted final-answer reward.
         gae_lambda (`float`, default `1.0`):
             GAE trace coefficient. One uses full Monte Carlo-style propagation.
-        gae_timestep_unit (`"token"` or `"turn"`, default `"token"`):
+        gae_timestep_unit (`"token"`, `"turn"` or `"trajectory"`, default `"token"`):
             Unit over which discount and lambda advance.
         kl_ctl (`float`, default `0.0`):
             Nonnegative coefficient for fixed-reference KL reward. Zero skips
@@ -1042,7 +1042,7 @@ class PPOActorConfig:
         ):
             raise ValueError("c_clip must be finite and > 1.")
         choices = {
-            "gae_timestep_unit": ("token", "turn"),
+            "gae_timestep_unit": ("token", "turn", "trajectory"),
             "kl_estimator": ("k1", "k2", "k3"),
             "loss_type": ("ppo", "sapo", "cispo"),
             "importance_sampling_level": ("token", "sequence"),
