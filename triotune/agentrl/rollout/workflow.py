@@ -19,6 +19,7 @@ from uuid import uuid4
 from ...trainer.ppo.rollout import gather_cancel_on_error
 from ...trainer.ppo.trajectory import Trajectory
 from ..runtime.sampling import SamplingSnapshot
+from ..training.rewards import aggregate_assignments
 from ..training.evaluation import evaluation_metrics
 from ..types import (
     SYSTEM_STATUSES,
@@ -27,6 +28,7 @@ from ..types import (
     EpisodeLogger,
     EpisodeResult,
     ExecutionContext,
+    SampleAcceptance,
     RolloutExport,
     _execution_context,
 )
@@ -118,6 +120,7 @@ class AgentRolloutBatch:
             "contract_error",
             "timeout",
             "cancelled",
+            "rejected",
         ):
             metrics[f"{prefix}/status/{status}"] = float(
                 sum(e.status == status for e in episodes)
@@ -165,6 +168,7 @@ class AgentRolloutWorkflow:
         logger: EpisodeLogger | None = None,
         min_usable_group_size: int | None = None,
         shared_prefix_policy: str = "deduplicate",
+        accept_sample: SampleAcceptance | None = None,
     ):
         """Bind a reusable episode executor, concurrency limit, and audit sink.
 
@@ -187,6 +191,7 @@ class AgentRolloutWorkflow:
             raise ValueError("shared_prefix_policy must be deduplicate or repeat.")
         self.min_usable_group_size = min_usable_group_size
         self.shared_prefix_policy = shared_prefix_policy
+        self.accept_sample = accept_sample
 
     async def collect(
         self,
@@ -289,6 +294,12 @@ class AgentRolloutWorkflow:
                                 group_id,
                             )
                         self._validate_export(exported, episode, context)
+                        if self.accept_sample is not None and not self.accept_sample(
+                            episode, exported
+                        ):
+                            episode.status = "rejected"
+                            episode.error = "Sample acceptance hook rejected the episode."
+                            exported = None
                     except (AgentContractError, ValueError, TypeError) as exc:
                         episode.status, episode.error, episode.score = (
                             "contract_error",
@@ -417,6 +428,11 @@ class AgentRolloutWorkflow:
             row.token_rewards = (
                 list(row.token_rewards) if row.token_rewards is not None else None
             )
+            row.token_advantages = (
+                list(row.token_advantages)
+                if row.token_advantages is not None
+                else None
+            )
             full_tokens = row.prompt_tokens + row.completion_tokens
             checked_contexts = set()
             for name in (
@@ -440,7 +456,8 @@ class AgentRolloutWorkflow:
                 )
             if not set(row.interaction_ids).issubset(source_turns):
                 raise AgentContractError("Fragment refers to an unknown interaction.")
-            if row.reward != episode.score.reward:
+            structured_outcome = aggregate_assignments(episode.score.assignments)[0]
+            if row.reward != episode.score.reward + structured_outcome:
                 raise AgentContractError(
                     "Fragments must share the scored candidate outcome."
                 )
@@ -492,6 +509,8 @@ class AgentRolloutWorkflow:
                                 row.turn_ids[i] = -1
                             if row.token_rewards is not None:
                                 row.token_rewards[i] = 0.0
+                            if row.token_advantages is not None:
+                                row.token_advantages[i] = 0.0
                     seen[key] = evidence
             if any(row.loss_mask):
                 row.__post_init__()

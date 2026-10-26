@@ -460,6 +460,7 @@ EpisodeStatus = Literal[
     "contract_error",
     "timeout",
     "cancelled",
+    "rejected",
 ]
 SYSTEM_STATUSES = frozenset(
     {
@@ -491,6 +492,10 @@ class EpisodeScore:
     success: bool
     components: dict[str, float] = field(default_factory=dict)
     process_rewards: dict[int, tuple[float, ...]] = field(default_factory=dict)
+    # Structured submissions are kept beside legacy fields so a scorer can
+    # describe outcome, process and direct-advantage semantics without making
+    # the execution layer understand PPO tensor shapes.
+    assignments: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.success) is not bool:
@@ -511,6 +516,16 @@ class EpisodeScore:
             for v in values
         ):
             raise AgentContractError("Rewards must be finite numeric scalars.")
+        if not isinstance(self.assignments, (tuple, list)):
+            raise AgentContractError("Reward assignments must be a sequence.")
+        for assignment in self.assignments:
+            if not hasattr(assignment, "target") or not hasattr(assignment, "value"):
+                raise AgentContractError("Reward assignments must expose target and value.")
+            if isinstance(assignment.value, bool) or not isinstance(
+                assignment.value, (int, float)
+            ) or not math.isfinite(float(assignment.value)):
+                raise AgentContractError("Reward assignment values must be finite scalars.")
+        object.__setattr__(self, "assignments", tuple(self.assignments))
 
 
 @dataclass(slots=True)
@@ -737,6 +752,27 @@ class EpisodeScorer(Protocol):
     async def score(
         self, row: Mapping[str, Any], episode: EpisodeResult
     ) -> EpisodeScore: ...
+
+
+class InteractionScorer(Protocol):
+    """Score one completed interaction without replacing episode outcome scoring."""
+
+    async def score(
+        self, row: Mapping[str, Any], episode: EpisodeResult, interaction: Interaction
+    ) -> Any: ...
+
+
+class FailureClassifier(Protocol):
+    """Map an adapter exception to a stable episode status and optional message."""
+
+    def classify(self, stage: str, error: BaseException, episode: EpisodeResult):
+        ...
+
+
+class SampleAcceptance(Protocol):
+    """Decide whether a scored execution may enter a training batch."""
+
+    def __call__(self, episode: EpisodeResult, export: RolloutExport | None) -> bool: ...
 
 
 class EpisodeLogger(Protocol):

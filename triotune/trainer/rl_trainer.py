@@ -28,6 +28,7 @@ from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
+from .ppo.advantages import PPOAlgorithmPlan
 from .ppo.critic import Critic, PyTRIOCritic
 from .ppo.rollout import (
     filter_informative_groups,
@@ -73,6 +74,8 @@ class PPOTrainer:
         tokenizer=None,
         reference_client=None,
         service_client=None,
+        algorithm_plan: PPOAlgorithmPlan | None = None,
+        plan: PPOAlgorithmPlan | None = None,
     ) -> None:
         """Create a lazy PPO trainer and validate actor/critic ownership.
 
@@ -123,6 +126,12 @@ class PPOTrainer:
         self._client, self._tokenizer = training_client, tokenizer
         self._reference, self._service = reference_client, service_client
         self._critic_client = critic_training_client
+        if algorithm_plan is not None and plan is not None:
+            raise ValueError("Supply either algorithm_plan or plan, not both.")
+        configured_plan = getattr(self.args, "algorithm_plan", None)
+        if sum(value is not None for value in (algorithm_plan, plan, configured_plan)) > 1:
+            raise ValueError("Supply only one PPO algorithm plan.")
+        self.algorithm_plan = algorithm_plan or plan or configured_plan
         self._owns_critic = self.args.use_critic and critic is None
         self._actor = None
         self._sampling = None
@@ -206,7 +215,7 @@ class PPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
-        self._actor = PPOActor(self._client, self.args)
+        self._actor = PPOActor(self._client, self.args, self.algorithm_plan)
 
     async def _references(self, trajectories):
         """Populate missing reference logprobs when KL control is enabled."""

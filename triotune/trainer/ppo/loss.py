@@ -69,6 +69,9 @@ def make_loss_fn(
                     advantages_for_rollout.sum() / denom,
                 )
         sums, counts, deltas, ratios, clipped, rejected = [], [], [], [], [], []
+        row_weights = batch.loss_weights or [1.0] * len(batch.trajectories)
+        if len(row_weights) != len(batch.trajectories):
+            raise ValueError("loss_weights must align with trajectories.")
         # Evaluate each trajectory independently so variable-length completion
         # masks remain aligned before the configured reduction is applied.
         for row_index, (t, adv, prox, mask, datum, full_lp) in enumerate(
@@ -159,7 +162,7 @@ def make_loss_fn(
                     terms = torch.minimum(terms, config.c_clip * advantage.abs())
             # Filter the numerator only; all reductions retain original counts.
             terms = (terms * correction).masked_fill(~keep, 0)
-            sums.append(terms.sum() + lp.sum() * 0)
+            sums.append(row_weights[row_index] * terms.sum() + lp.sum() * 0)
             deltas.append(delta.detach())
             ratios.append(ratio.detach())
             clipped.append(clip.detach())
@@ -167,7 +170,7 @@ def make_loss_fn(
         if not sum(counts):
             raise ValueError("Custom loss has no active action tokens.")
         active = [
-            (s, n, t.group_id, t.rollout_id or ("row", i))
+            (s, n, t.group_id, t.rollout_id or ("row", i), row_weights[i])
             for i, (s, n, t) in enumerate(
                 zip(sums, counts, batch.trajectories, strict=True)
             )
@@ -177,25 +180,33 @@ def make_loss_fn(
         # candidate. Splitting a long candidate into more rows cannot increase
         # its sequence weight. Token reductions retain their natural action
         # token weighting; masked shared prefixes contribute to neither count.
-        rollout_sums, rollout_counts = {}, defaultdict(int)
-        for s, n, _, rollout in active:
+        rollout_sums, rollout_counts = {}, defaultdict(float)
+        for s, n, _, rollout, weight in active:
             rollout_sums[rollout] = rollout_sums.get(rollout, 0) + s
-            rollout_counts[rollout] += n
+            rollout_counts[rollout] += n * weight
         zero = sum(sums) * 0
         if config.loss_aggregation == "token_mean":
-            objective = sum(sums) / sum(counts)
+            objective = sum(sums) / max(
+                sum(n * w for n, w in zip(counts, row_weights)), 1e-12
+            )
         elif config.loss_aggregation == "seq_mean":
             objective = (
-                sum(s / rollout_counts[key] for key, s in rollout_sums.items())
+                sum(
+                    s / max(rollout_counts[key], 1e-12)
+                    for key, s in rollout_sums.items()
+                )
                 / len(rollout_sums)
                 + zero
             )
         elif config.loss_aggregation == "prompt_mean":
             group_tokens = defaultdict(int)
-            for _, n, group, _ in active:
-                group_tokens[group] += n
+            for _, n, group, _, weight in active:
+                group_tokens[group] += n * weight
             objective = (
-                sum(s / group_tokens[group] for s, _, group, _ in active)
+                sum(
+                    s / max(group_tokens[group], 1e-12)
+                    for s, _, group, _, _ in active
+                )
                 / len(group_tokens)
                 * batch.prompt_mean_scale
                 + zero

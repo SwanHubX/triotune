@@ -13,8 +13,165 @@ import inspect
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
+from typing import Literal
 
 from ..types import AgentContractError, EpisodeScore, EpisodeScorer
+
+
+RewardTarget = Literal["interaction", "turn", "token", "trajectory"]
+RewardMode = Literal["reward", "advantage"]
+RewardAggregation = Literal["sum", "mean", "last"]
+
+
+@dataclass(frozen=True, slots=True)
+class RewardAssignment:
+    """One explicit contribution submitted by a scorer.
+
+    ``target`` describes the temporal object receiving the contribution and
+    ``mode`` determines whether it enters the return recurrence or is added
+    directly to the policy advantage.  ``position`` is optional because a
+    trajectory-level assignment needs no index; interaction, turn and token
+    assignments use it to retain their original location.  ``source`` is a
+    stable diagnostic name and is also the grouping key for aggregation.
+    """
+
+    target: RewardTarget
+    value: float
+    mode: RewardMode = "reward"
+    aggregation: RewardAggregation = "sum"
+    discount: float = 1.0
+    source: str = "scorer"
+    position: int | tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.target not in {"interaction", "turn", "token", "trajectory"}:
+            raise ValueError("RewardAssignment.target is invalid.")
+        if self.mode not in {"reward", "advantage"}:
+            raise ValueError("RewardAssignment.mode is invalid.")
+        if self.aggregation not in {"sum", "mean", "last"}:
+            raise ValueError("RewardAssignment.aggregation is invalid.")
+        if isinstance(self.value, bool) or not isinstance(self.value, Real):
+            raise TypeError("RewardAssignment.value must be numeric.")
+        if not math.isfinite(float(self.value)):
+            raise ValueError("RewardAssignment.value must be finite.")
+        if isinstance(self.discount, bool) or not isinstance(self.discount, Real):
+            raise TypeError("RewardAssignment.discount must be numeric.")
+        if not math.isfinite(float(self.discount)) or not 0 <= self.discount <= 1:
+            raise ValueError("RewardAssignment.discount must be in [0, 1].")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("RewardAssignment.source must be nonempty.")
+        if self.target == "trajectory" and self.position is not None:
+            raise ValueError("Trajectory assignments do not have a position.")
+        if self.target in {"interaction", "turn"} and self.position is not None and (
+            type(self.position) is not int or self.position < 0
+        ):
+            raise ValueError("Interaction and turn positions must be nonnegative integers.")
+        if self.target == "token" and self.position is not None and (
+            not isinstance(self.position, tuple)
+            or len(self.position) != 2
+            or any(type(value) is not int or value < 0 for value in self.position)
+        ):
+            raise ValueError("Token positions must be (turn, token) integer pairs.")
+
+
+def aggregate_assignments(
+    assignments: Sequence[RewardAssignment],
+) -> tuple[float, dict[int, tuple[float, ...]], dict[int, tuple[float, ...]]]:
+    """Fold submitted assignments into outcome, process and direct-advantage data.
+
+    Assignments are grouped by source, mode, target and position.  This makes
+    ``mean`` and ``last`` explicit and prevents a scorer retry from silently
+    adding the same logical submission twice when callers reuse the list.
+    """
+
+    groups: dict[tuple, list[RewardAssignment]] = {}
+    for assignment in assignments:
+        key = (
+            assignment.mode,
+            assignment.target,
+            assignment.source,
+            assignment.position,
+        )
+        groups.setdefault(key, []).append(assignment)
+
+    outcome = 0.0
+    process: dict[int, dict[int, float]] = {}
+    direct: dict[int, dict[int, float]] = {}
+    for (mode, target, _source, position), values in groups.items():
+        weighted = [float(item.value) * float(item.discount) for item in values]
+        if values[0].aggregation == "mean":
+            value = sum(weighted) / len(weighted)
+        elif values[0].aggregation == "last":
+            value = weighted[-1]
+        else:
+            value = sum(weighted)
+        if target == "trajectory":
+            if mode == "reward":
+                outcome += value
+            continue
+        if target == "token":
+            if not isinstance(position, tuple):
+                raise AgentContractError("Token assignments require a (turn, token) position.")
+            turn, token = position
+        else:
+            if type(position) is not int:
+                raise AgentContractError(f"{target.title()} assignments require a position.")
+            turn, token = position, -1
+        destination = direct if mode == "advantage" else process
+        row = destination.setdefault(turn, {})
+        row[token] = row.get(token, 0.0) + value
+
+    def vectors(source: dict[int, dict[int, float]]) -> dict[int, tuple[float, ...]]:
+        return {
+            turn: tuple(values[index] for index in sorted(values))
+            for turn, values in source.items()
+        }
+
+    return outcome, vectors(process), vectors(direct)
+
+
+class RewardLedger:
+    """Idempotent reward submission buffer for one logical rollout session.
+
+    A ledger accepts delayed scorer results and suppresses repeated trajectory
+    outcome submissions for the same logical rollout. Process and advantage
+    assignments remain position keyed, so independently scored interactions
+    can still contribute without multiplying the terminal outcome.
+    """
+
+    def __init__(self):
+        self._assignments: list[RewardAssignment] = []
+        self._trajectory_submissions: set[tuple[str, str, str]] = set()
+
+    def submit(
+        self,
+        assignments: RewardAssignment | Sequence[RewardAssignment],
+        *,
+        logical_rollout_id: str | None = None,
+    ) -> tuple[RewardAssignment, ...]:
+        values = (assignments,) if isinstance(assignments, RewardAssignment) else tuple(assignments)
+        accepted = []
+        for assignment in values:
+            if not isinstance(assignment, RewardAssignment):
+                raise TypeError("RewardLedger accepts RewardAssignment objects.")
+            if logical_rollout_id is not None and assignment.target == "trajectory":
+                key = (logical_rollout_id, assignment.source, assignment.mode)
+                if key in self._trajectory_submissions:
+                    continue
+                self._trajectory_submissions.add(key)
+            self._assignments.append(assignment)
+            accepted.append(assignment)
+        return tuple(accepted)
+
+    commit = submit
+
+    @property
+    def assignments(self) -> tuple[RewardAssignment, ...]:
+        return tuple(self._assignments)
+
+    def aggregate(self):
+        return aggregate_assignments(self._assignments)
 
 
 def validate_process_rewards(episode, rewards) -> None:
@@ -63,6 +220,7 @@ class CompositeScorer:
         validate_process_rewards(episode, base.process_rewards)
         reward = base.reward
         process = {i: list(values) for i, values in base.process_rewards.items()}
+        assignments = list(base.assignments)
         components = {
             f"outcome/{name}": value for name, value in base.components.items()
         }
@@ -85,8 +243,26 @@ class CompositeScorer:
             components[f"{term.name}/reward"] = term.weight * (
                 score.reward + sum(map(sum, score.process_rewards.values()))
             )
+            # Keep the source and target semantics supplied by the scorer while
+            # applying the composite term's numeric weight exactly once.
+            assignments.extend(
+                RewardAssignment(
+                    target=item.target,
+                    value=float(item.value) * term.weight,
+                    mode=item.mode,
+                    aggregation=item.aggregation,
+                    discount=item.discount,
+                    source=f"{term.name}/{item.source}",
+                    position=item.position,
+                )
+                for item in score.assignments
+            )
         return EpisodeScore(
-            reward, base.success, components, {i: tuple(v) for i, v in process.items()}
+            reward,
+            base.success,
+            components,
+            {i: tuple(v) for i, v in process.items()},
+            tuple(assignments),
         )
 
 

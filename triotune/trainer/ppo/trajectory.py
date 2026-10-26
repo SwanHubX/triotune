@@ -78,6 +78,10 @@ class Trajectory:
     reference_logprobs: list[float] | None = None
     values: list[float] | None = None
     token_rewards: list[float] | None = None
+    # Optional PRM/direct-advantage signal.  It is deliberately separate from
+    # token_rewards so critic returns never learn a value target from a signal
+    # that the caller declared to be an advantage.
+    token_advantages: list[float] | None = None
     turn_ids: list[int] | None = None
     reward_components: dict[str, float] = field(default_factory=dict)
     # Provenance is optional for legacy callers that construct trajectories
@@ -217,7 +221,13 @@ class Trajectory:
                 )
             components[name.strip()] = float(value)
         self.reward_components = components
-        for name in ("logprobs", "reference_logprobs", "values", "token_rewards"):
+        for name in (
+            "logprobs",
+            "reference_logprobs",
+            "values",
+            "token_rewards",
+            "token_advantages",
+        ):
             values = getattr(self, name)
             if values is not None and (
                 len(values) != n + int(name == "values")
@@ -262,6 +272,7 @@ class PreparedBatch:
     masks: list[list[bool]]
     proximal_logprobs: list[list[float]]
     prompt_mean_scale: float = 1.0
+    loss_weights: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)

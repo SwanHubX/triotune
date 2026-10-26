@@ -10,7 +10,17 @@ import importlib
 import sys
 
 from .actor import PPOActor
-from .advantages import normalize, prepare_advantages
+from .advantages import (
+    AdvantageEstimator,
+    LossWeightPolicy,
+    Objective,
+    PPOAlgorithmPlan,
+    RewardNormalizer,
+    RewardShaper,
+    ReturnEstimator,
+    normalize,
+    prepare_advantages,
+)
 from ...api.cli_args import (
     NormConfig,
     PPOActorConfig,
@@ -66,8 +76,11 @@ def __getattr__(name):
 
 __all__ = [
     "Critic",
+    "AdvantageEstimator",
+    "LossWeightPolicy",
     "NormConfig",
     "PPOActor",
+    "PPOAlgorithmPlan",
     "PPOActorConfig",
     "PPOConfig",
     "PPOCriticConfig",
@@ -77,6 +90,10 @@ __all__ = [
     "PreparedBatch",
     "PPORolloutConfig",
     "Trajectory",
+    "Objective",
+    "RewardNormalizer",
+    "RewardShaper",
+    "ReturnEstimator",
     "validate_policy_versions",
     "compute_gae",
     "compute_token_level_gae",

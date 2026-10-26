@@ -3,12 +3,134 @@
 import math
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 import numpy as np
 
 from ...api.cli_args import NormConfig, PPOConfig
 from .gae import compute_gae
 from .trajectory import PreparedBatch, Trajectory
+
+
+class RewardShaper(Protocol):
+    """Transform one logical trajectory outcome before normalization."""
+
+    def shape(self, trajectory: Trajectory, reward: float) -> float: ...
+
+    def shape_process(
+        self, trajectory: Trajectory, rewards: Sequence[float]
+    ) -> Sequence[float]: ...
+
+
+class RewardNormalizer(Protocol):
+    """Normalize candidate-level rewards with explicit group identities."""
+
+    def normalize(
+        self,
+        rows: Sequence[Sequence[float]],
+        group_ids: Sequence[str],
+        masks: Sequence[Sequence[bool]] | None = None,
+    ) -> list[list[float]]: ...
+
+
+class AdvantageEstimator(Protocol):
+    """Estimate token-aligned advantages and critic returns."""
+
+    def estimate(self, rewards, values, mask, **kwargs) -> tuple[list[float], list[float]]: ...
+
+
+class ReturnEstimator(Protocol):
+    """Estimate critic targets independently from policy advantages."""
+
+    def estimate(self, rewards, values, mask, **kwargs) -> list[float]: ...
+
+
+class LossWeightPolicy(Protocol):
+    """Assign a physical training-row weight before loss reduction."""
+
+    def weight(self, trajectory: Trajectory, mask: Sequence[bool]) -> float: ...
+
+
+class Objective(Protocol):
+    """Build a policy objective callback for one prepared batch."""
+
+    def make_loss(self, batch, config, diagnostics=None): ...
+
+
+class _DefaultRewardNormalizer:
+    def normalize(self, rows, group_ids, masks=None, config=None):
+        return normalize(rows, group_ids, config, masks)
+
+
+class _DefaultAdvantageEstimator:
+    def estimate(self, rewards, values, mask, **kwargs):
+        return compute_gae(rewards, values, mask, **kwargs)
+
+
+class _DefaultReturnEstimator:
+    def estimate(self, rewards, values, mask, **kwargs):
+        return compute_gae(rewards, values, mask, **kwargs)[1]
+
+
+@dataclass(slots=True)
+class PPOAlgorithmPlan:
+    """Public dependency-injection plan for PPO reward and objective stages."""
+
+    reward_shaper: Any | None = None
+    process_shaper: Any | None = None
+    normalizer: Any | None = None
+    advantage_estimator: Any | None = None
+    return_estimator: Any | None = None
+    loss_weight_policy: Any | None = None
+    objective: Any | None = None
+
+    def shape_reward(self, trajectory: Trajectory, reward: float) -> float:
+        shaper = self.reward_shaper
+        if shaper is None:
+            return reward
+        method = getattr(shaper, "shape", shaper)
+        try:
+            return float(method(trajectory, reward))
+        except TypeError:
+            return float(method(reward))
+
+    def shape_process(self, trajectory: Trajectory, rewards):
+        shaper = self.process_shaper
+        if shaper is None:
+            return rewards
+        method = getattr(shaper, "shape", shaper)
+        try:
+            values = method(trajectory, rewards)
+        except TypeError:
+            values = method(rewards)
+        values = list(values)
+        if len(values) != len(rewards) or any(not math.isfinite(float(v)) for v in values):
+            raise ValueError("Process shaper must return finite aligned rewards.")
+        return [float(value) for value in values]
+
+    def normalize_rewards(self, rows, group_ids, config, masks=None):
+        normalizer = self.normalizer
+        if normalizer is None:
+            return normalize(rows, group_ids, config, masks)
+        method = getattr(normalizer, "normalize", normalizer)
+        try:
+            return method(rows, group_ids, config, masks)
+        except TypeError:
+            try:
+                return method(rows, group_ids, masks)
+            except TypeError:
+                return method(rows, group_ids)
+
+    def row_weight(self, trajectory: Trajectory, mask: Sequence[bool]) -> float:
+        policy = self.loss_weight_policy
+        if policy is None:
+            return 1.0
+        method = getattr(policy, "weight", policy)
+        value = float(method(trajectory, mask))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("LossWeightPolicy must return a finite nonnegative weight.")
+        return value
 
 
 def normalize(
@@ -81,9 +203,15 @@ def normalize(
 
 
 def prepare_advantages(
-    trajectories: Sequence[Trajectory], config: PPOConfig
+    trajectories: Sequence[Trajectory],
+    config: PPOConfig,
+    plan: PPOAlgorithmPlan | None = None,
 ) -> PreparedBatch:
-    """Build frozen rewards, returns, and normalized advantages for one update."""
+    """Build frozen rewards, returns, and normalized advantages for one update.
+
+    ``plan`` is optional so existing PPO callers retain the historical
+    numerical path while custom algorithms can replace each stage independently.
+    """
 
     if not trajectories:
         raise ValueError("An update requires at least one trajectory.")
@@ -106,7 +234,7 @@ def prepare_advantages(
             if trajectory.rollout_id
             else ("row", index)
         )
-        reward = trajectory.reward
+        reward = plan.shape_reward(trajectory, trajectory.reward) if plan else trajectory.reward
         reference = (trajectory.group_id, reward)
         if key in references and references[key] != reference:
             raise ValueError(
@@ -133,7 +261,11 @@ def prepare_advantages(
         row_indices.append(reward_indices[key])
         masks.append(list(trajectory.loss_mask))
 
-    normalized = normalize(rewards, reward_groups, config.reward_norm)
+    normalized = (
+        plan.normalize_rewards(rewards, reward_groups, config.reward_norm)
+        if plan
+        else normalize(rewards, reward_groups, config.reward_norm)
+    )
     outcome_scores = [normalized[index] for index in row_indices]
     advantages, returns = [], []
     for trajectory, score, mask in zip(
@@ -154,6 +286,8 @@ def prepare_advantages(
             if trajectory.token_rewards is not None
             else [0.0] * len(mask)
         )
+        if plan:
+            task_rewards = plan.shape_process(trajectory, task_rewards)
         suppress_reward = config.mask_no_eos_with_zero and trajectory.truncated
         if suppress_reward:
             task_rewards = [0.0] * len(mask)
@@ -180,16 +314,47 @@ def prepare_advantages(
             if config.gae_timestep_unit == "token"
             else task_rewards
         )
-        adv, ret = compute_gae(
-            gae_rewards,
-            trajectory.values if config.use_critic else [0.0] * (len(mask) + 1),
-            mask,
-            discount=config.discount,
-            gae_lambda=config.gae_lambda,
-            truncated=trajectory.truncated,
-            timestep_unit=config.gae_timestep_unit,
-            turn_ids=trajectory.turn_ids,
-        )
+        estimator = plan.advantage_estimator if plan else None
+        if estimator is None:
+            adv, ret = compute_gae(
+                gae_rewards,
+                trajectory.values if config.use_critic else [0.0] * (len(mask) + 1),
+                mask,
+                discount=config.discount,
+                gae_lambda=config.gae_lambda,
+                truncated=trajectory.truncated,
+                timestep_unit=config.gae_timestep_unit,
+                turn_ids=trajectory.turn_ids,
+            )
+        else:
+            method = getattr(estimator, "estimate", estimator)
+            adv, ret = method(
+                gae_rewards,
+                trajectory.values if config.use_critic else [0.0] * (len(mask) + 1),
+                mask,
+                discount=config.discount,
+                gae_lambda=config.gae_lambda,
+                truncated=trajectory.truncated,
+                timestep_unit=config.gae_timestep_unit,
+                turn_ids=trajectory.turn_ids,
+            )
+        if plan and plan.return_estimator is not None:
+            method = getattr(plan.return_estimator, "estimate", plan.return_estimator)
+            ret = method(
+                gae_rewards,
+                trajectory.values if config.use_critic else [0.0] * (len(mask) + 1),
+                mask,
+                discount=config.discount,
+                gae_lambda=config.gae_lambda,
+                truncated=trajectory.truncated,
+                timestep_unit=config.gae_timestep_unit,
+                turn_ids=trajectory.turn_ids,
+            )
+        if trajectory.token_advantages is not None:
+            adv = [
+                value + direct
+                for value, direct in zip(adv, trajectory.token_advantages, strict=True)
+            ]
         if config.gae_timestep_unit == "turn":
             adv = [value + kl for value, kl in zip(adv, kl_rewards, strict=True)]
         advantages.append(adv)
@@ -199,10 +364,15 @@ def prepare_advantages(
             "All trajectories were masked; no policy update can be performed."
         )
     advantages = normalize(advantages, group_ids, config.adv_norm, masks)
+    weights = [
+        plan.row_weight(trajectory, mask) if plan else 1.0
+        for trajectory, mask in zip(trajectories, masks, strict=True)
+    ]
     return PreparedBatch(
         list(trajectories),
         advantages,
         returns,
         masks,
         [list(trajectory.logprobs) for trajectory in trajectories],
+        loss_weights=weights,
     )

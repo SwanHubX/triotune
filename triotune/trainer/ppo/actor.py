@@ -12,7 +12,7 @@ import numpy as np
 from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
 from ...utils.token_usage import compute_train_tokens
-from .advantages import prepare_advantages
+from .advantages import PPOAlgorithmPlan, prepare_advantages
 from .datum import batch_datums, build_datum, completion_logprobs
 from .loss import make_loss_fn
 from .trajectory import PreparedBatch, Trajectory, validate_policy_versions
@@ -103,6 +103,8 @@ def minibatches(batch: PreparedBatch, count: int):
                 )
             ]
         )
+        if batch.loss_weights:
+            chunk_batch.loss_weights = [batch.loss_weights[i] for i in indices]
         chunk_batch.prompt_mean_scale = count * len(chunk) / len(groups)
         yield chunk_batch
 
@@ -110,10 +112,11 @@ def minibatches(batch: PreparedBatch, count: int):
 class PPOActor:
     """Prepare frozen policy targets and execute actor updates through PyTRIO."""
 
-    def __init__(self, client, config: PPOConfig):
+    def __init__(self, client, config: PPOConfig, plan: PPOAlgorithmPlan | None = None):
         """Bind one remote training client and its immutable PPO configuration."""
 
         self.client, self.config = client, config
+        self.plan = plan or getattr(config, "algorithm_plan", None)
         self.optimizer_steps = 0
         self.train_tokens = 0
         self.datum_provenance: tuple[dict, ...] = ()
@@ -154,7 +157,7 @@ class PPOActor:
                 replace(t, logprobs=lp)
                 for t, lp in zip(trajectories, proximal, strict=True)
             ]
-        batch = prepare_advantages(trajectories, config)
+        batch = prepare_advantages(trajectories, config, self.plan)
         if proximal is not None:
             batch.proximal_logprobs = proximal
         return batch
@@ -188,11 +191,19 @@ class PPOActor:
                         auto_shift=False,
                     )
                 else:
+                    objective = self.plan.objective if self.plan else None
+                    factory = (
+                        getattr(objective, "make_loss", objective)
+                        if objective is not None
+                        else make_loss_fn
+                    )
+                    if not callable(factory):
+                        factory = make_loss_fn
                     result = await call_async(
                         self.client,
                         "forward_backward_custom",
                         data,
-                        loss_fn=make_loss_fn(chunk, config, diagnostics),
+                        loss_fn=factory(chunk, config, diagnostics),
                     )
                 # PyTRIO custom loss submits a forward, then a forward_backward.
                 passes = 1 if config.loss_backend == "native" else 2
@@ -232,7 +243,28 @@ class PPOActor:
                     float(sum(sum(mask) for mask in chunk.masks)),
                 )
                 row["_loss_weight"] = float(
-                    row["train/action_tokens"]
+                    (
+                        sum(
+                            weight * sum(mask)
+                            for weight, mask in zip(
+                                chunk.loss_weights or [1.0] * len(chunk.masks),
+                                chunk.masks,
+                                strict=True,
+                            )
+                        )
+                        if config.loss_aggregation == "token_mean"
+                        else sum(
+                            weight
+                            for weight, mask in zip(
+                                chunk.loss_weights or [1.0] * len(chunk.masks),
+                                chunk.masks,
+                                strict=True,
+                            )
+                            if any(mask)
+                        )
+                    )
+                    if self.plan and self.plan.loss_weight_policy is not None
+                    else row["train/action_tokens"]
                     if config.loss_aggregation == "token_mean"
                     else len({
                         t.rollout_id or ("row", i)

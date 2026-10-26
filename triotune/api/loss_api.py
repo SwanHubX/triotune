@@ -581,13 +581,20 @@ class LossInputDRO(PolicyLossInput):
 
 
 class Objective(Protocol):
-    """Remote loss execution shared by built-in and custom objectives."""
+    """Remote loss execution shared by built-in and custom objectives.
+
+    PPO's actor accepts a second, local ``make_loss`` capability when an
+    algorithm plan supplies a custom objective.  Keeping the method optional
+    here lets remote built-in objectives remain useful for SFT/GRPO adapters.
+    """
 
     def forward_backward(self, client: Any, datums: Sequence[Any]) -> Any: ...
 
     async def forward_backward_async(
         self, client: Any, datums: Sequence[Any]
     ) -> Any: ...
+
+    def make_loss(self, batch: Any, config: Any, diagnostics: Any = None) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -32,10 +32,13 @@ from ..types import (
     ConversationRenderer,
     EpisodeLimits,
     EpisodeResult,
+    EpisodeScore,
     EpisodeScorer,
+    FailureClassifier,
     ExecutionContext,
     GenerationEvent,
     Interaction,
+    InteractionScorer,
     ObservationFormatter,
     RetryEvent,
     RewardEvent,
@@ -47,6 +50,7 @@ from ..types import (
     _execution_context,
     validate_tokens,
 )
+from ..training.rewards import RewardLedger
 from .sampling import SamplingSnapshot
 
 
@@ -72,6 +76,13 @@ class EpisodeRunner:
         prompt_key: str = "messages",
         trajectory_builder: TrajectoryExporter | None = None,
         retry: RetryPolicy | None = None,
+        interaction_scorer: InteractionScorer | None = None,
+        failure_classifier: FailureClassifier | None = None,
+        scorer_timeout: float | None = None,
+        scorer_retry: RetryPolicy | None = None,
+        score_partial: bool = True,
+        reward_ledger: RewardLedger | None = None,
+        resource_owner: str = "runner",
     ):
         """Compose execution adapters and optional model-specific serialization.
 
@@ -81,16 +92,123 @@ class EpisodeRunner:
         by the collector to produce PPO trajectories.
         """
         self.parser, self.tools, self.scorer = parser, tools, scorer
+        self.interaction_scorer = interaction_scorer
+        self.failure_classifier = failure_classifier
         self.observations, self.renderer = observations, renderer
         self.limits, self.prompt_key = limits or EpisodeLimits(), prompt_key
         self.trajectory_builder = trajectory_builder or EpisodeTrajectoryBuilder()
         self.retry = retry or RetryPolicy()
+        # ``None`` follows the mutable runner retry policy for compatibility;
+        # callers can provide a separate policy for expensive PRM calls.
+        self.scorer_retry = scorer_retry
+        self.scorer_timeout = scorer_timeout
+        if scorer_timeout is not None and scorer_timeout <= 0:
+            raise ValueError("scorer_timeout must be positive when provided.")
+        if not isinstance(score_partial, bool):
+            raise ValueError("score_partial must be boolean.")
+        self.score_partial = score_partial
+        self.reward_ledger = reward_ledger or RewardLedger()
+        if not isinstance(resource_owner, str) or not resource_owner:
+            raise ValueError("resource_owner must be a nonempty string.")
+        self.resource_owner = resource_owner
+        self._resource_started = False
+        self._resource_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        """Start scorer/tool resources once for the runner's session."""
+        async with self._resource_lock:
+            if self._resource_started:
+                return
+            for resource in (self.tools, self.scorer, self.interaction_scorer):
+                if getattr(resource, "resource_owner", self.resource_owner) != self.resource_owner:
+                    continue
+                method = getattr(resource, "start", None)
+                if callable(method):
+                    result = method()
+                    if asyncio.iscoroutine(result):
+                        await result
+            self._resource_started = True
+
+    async def close(self) -> None:
+        """Release resources owned by this runner, preserving shared clients."""
+        async with self._resource_lock:
+            if not self._resource_started:
+                return
+            for resource in (
+                self.interaction_scorer,
+                self.scorer,
+                self.tools,
+            )[::-1]:
+                if getattr(resource, "resource_owner", self.resource_owner) != self.resource_owner:
+                    continue
+                method = getattr(resource, "close", None) or getattr(
+                    resource, "aclose", None
+                )
+                if callable(method):
+                    result = method()
+                    if asyncio.iscoroutine(result):
+                        await result
+            self._resource_started = False
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.close()
+
+    def _classify(self, stage, error, episode):
+        """Apply an optional failure hook while retaining built-in statuses."""
+        if self.failure_classifier is None:
+            return None
+        method = getattr(self.failure_classifier, "classify", self.failure_classifier)
+        result = method(stage, error, episode)
+        if isinstance(result, tuple):
+            status, message = result
+        else:
+            status, message = result, str(error)
+        if not isinstance(status, str) or not status:
+            raise AgentContractError("Failure classifier must return a status string.")
+        return status, str(message)
+
+    async def submit_reward(self, episode, score=None):
+        """Submit a delayed score exactly once and emit interaction evidence."""
+        if score is None and episode.export_metadata.get("reward_submitted"):
+            return episode.score
+        if score is None:
+            score = await self.scorer.score({}, episode)
+        score.__post_init__()
+        self.reward_ledger.submit(
+            score.assignments, logical_rollout_id=episode.rollout_id
+        )
+        episode.score = score
+        episode.export_metadata["reward_submitted"] = True
+        for index, interaction in enumerate(episode.interactions):
+            interaction.reward = score.reward if index == len(episode.interactions) - 1 else 0.0
+            interaction.process_rewards = score.process_rewards.get(index, ())
+            episode.events.append(
+                RewardEvent(
+                    context=interaction.context,
+                    reward=interaction.reward,
+                    process_rewards=interaction.process_rewards,
+                )
+            )
+        return score
 
     async def _operation(
-        self, episode, stage, turn, factory, *, timeout=None, retry_safe=True
+        self,
+        episode,
+        stage,
+        turn,
+        factory,
+        *,
+        timeout=None,
+        retry_safe=True,
+        retry_policy=None,
     ):
         """Retry transient transport errors within the existing episode deadline."""
-        for attempt in range(1, self.retry.max_attempts + 1):
+        policy = retry_policy or self.retry
+        for attempt in range(1, policy.max_attempts + 1):
             try:
                 if timeout is None:
                     return await factory()
@@ -103,7 +221,7 @@ class EpisodeRunner:
                 )
                 if not transient:
                     raise
-                again = retry_safe and attempt < self.retry.max_attempts
+                again = retry_safe and attempt < policy.max_attempts
                 episode.retries.append(
                     RetryEvent(
                         stage, turn, attempt, type(exc).__name__, str(exc), again
@@ -125,7 +243,53 @@ class EpisodeRunner:
                 )
                 if not again:
                     raise
-                await asyncio.sleep(self.retry.delay(attempt))
+                await asyncio.sleep(policy.delay(attempt))
+
+    async def _score_interactions(self, row, episode) -> None:
+        """Run optional interaction scorers with their own retry/deadline."""
+        if self.interaction_scorer is None:
+            return
+        assignments = []
+        for index, interaction in enumerate(episode.interactions):
+            method = getattr(self.interaction_scorer, "score", self.interaction_scorer)
+
+            async def score_one(method=method, interaction=interaction):
+                try:
+                    return await method(row, episode, interaction)
+                except TypeError:
+                    return await method(row, interaction)
+
+            result = await self._operation(
+                episode,
+                "interaction_scoring",
+                index,
+                score_one,
+                timeout=self.scorer_timeout,
+                retry_policy=self.scorer_retry or self.retry,
+            )
+            if result is None:
+                continue
+            if isinstance(result, EpisodeScore):
+                assignments.extend(
+                    replace(item, position=index)
+                    if item.target in {"interaction", "turn"}
+                    and item.position is None
+                    else item
+                    for item in result.assignments
+                )
+                interaction.reward = result.reward
+                continue
+            if not isinstance(result, (tuple, list)):
+                result = (result,)
+            for assignment in result:
+                if not hasattr(assignment, "target"):
+                    raise AgentContractError(
+                        "Interaction scorer must return RewardAssignment objects."
+                    )
+                if assignment.target in {"interaction", "turn"} and assignment.position is None:
+                    assignment = replace(assignment, position=index)
+                assignments.append(assignment)
+        episode.export_metadata["interaction_assignments"] = tuple(assignments)
 
     async def run(
         self,
@@ -158,6 +322,8 @@ class EpisodeRunner:
         escape so callers can stop collection without creating failed samples.
         """
         from .conversation import ChatTemplateRenderer
+
+        await self.start()
 
         if context is None:
             context = ExecutionContext(
@@ -217,7 +383,9 @@ class EpisodeRunner:
                 renderer = self.renderer or ChatTemplateRenderer(snapshot.tokenizer)
                 await self._execute(episode, messages, snapshot, renderer, seed)
                 _execution_context.set(context)
-                if episode.status not in SYSTEM_STATUSES:
+                if episode.status not in SYSTEM_STATUSES and (
+                    self.score_partial or episode.status == "completed"
+                ):
                     # Invalid actions and budget exits can still carry useful
                     # negative task signals. Infrastructure failures cannot.
                     try:
@@ -226,31 +394,34 @@ class EpisodeRunner:
                             "scoring",
                             len(episode.turns) - 1,
                             lambda: self.scorer.score(row, episode),
+                            timeout=self.scorer_timeout,
+                            retry_policy=self.scorer_retry or self.retry,
                         )
                         # Validate the scorer boundary even if it returns a custom object.
                         episode.score.__post_init__()
+                        await self._score_interactions(row, episode)
+                        interaction_assignments = episode.export_metadata.get(
+                            "interaction_assignments", ()
+                        )
+                        if interaction_assignments:
+                            episode.score = replace(
+                                episode.score,
+                                assignments=tuple(
+                                    episode.score.assignments
+                                ) + tuple(interaction_assignments),
+                            )
+                            episode.score.__post_init__()
                         if episode.status != "completed" and episode.score.success:
                             raise AgentContractError(
                                 "An unfinished episode cannot be scored successful."
                             )
-                        for index, interaction in enumerate(episode.interactions):
-                            interaction.reward = (
-                                episode.score.reward
-                                if index == len(episode.interactions) - 1
-                                else 0.0
-                            )
-                            interaction.process_rewards = (
-                                episode.score.process_rewards.get(index, ())
-                            )
-                            episode.events.append(
-                                RewardEvent(
-                                    context=interaction.context,
-                                    reward=interaction.reward,
-                                    process_rewards=interaction.process_rewards,
-                                )
-                            )
+                        await self.submit_reward(episode, episode.score)
                     except Exception as exc:  # noqa: BLE001 -- isolate arbitrary scorer implementations
-                        episode.status, episode.error = "scoring_failure", str(exc)
+                        classified = self._classify("scoring", exc, episode)
+                        episode.status, episode.error = classified or (
+                            "scoring_failure",
+                            str(exc),
+                        )
                         episode.score = None
         except asyncio.CancelledError:
             episode.status, episode.score = "cancelled", None
@@ -262,11 +433,14 @@ class EpisodeRunner:
             )
             episode.score = None
         except AgentContractError as exc:
-            episode.status, episode.error = "contract_error", str(exc)
+            classified = self._classify("contract", exc, episode)
+            episode.status, episode.error = classified or ("contract_error", str(exc))
         except ToolSystemError as exc:
-            episode.status, episode.error = "tool_failure", str(exc)
+            classified = self._classify("tool", exc, episode)
+            episode.status, episode.error = classified or ("tool_failure", str(exc))
         except Exception as exc:  # noqa: BLE001 -- preserve failed adapter episodes for audit
-            episode.status, episode.error = (
+            classified = self._classify("episode", exc, episode)
+            episode.status, episode.error = classified or (
                 "contract_error",
                 f"{type(exc).__name__}: {exc}",
             )
@@ -413,7 +587,11 @@ class EpisodeRunner:
         except (AgentContractError, TimeoutError):
             raise
         except Exception as exc:  # noqa: BLE001 -- classify sampling adapter failures
-            episode.status, episode.error = "sampling_failure", str(exc)
+            classified = self._classify("sampling", exc, episode)
+            episode.status, episode.error = classified or (
+                "sampling_failure",
+                str(exc),
+            )
             interaction.status = "sampling_failure"
             return
         generation.__post_init__()

@@ -1237,6 +1237,7 @@ class PPOConfig(BaseTrainerConfig):
         rollout=None,
         actor=None,
         critic=None,
+        algorithm_plan=None,
         **legacy: Any,
     ) -> None:
         self._init_common(
@@ -1275,6 +1276,9 @@ class PPOConfig(BaseTrainerConfig):
         object.__setattr__(
             self, "critic", _coerce_module(critic_values, PPOCriticConfig)
         )
+        # Runtime plugins are Python objects and intentionally stay outside
+        # YAML serialization; the trainer consumes this optional plan directly.
+        self.algorithm_plan = algorithm_plan
         self._apply_legacy(legacy)
         self.__post_init__()
 

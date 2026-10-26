@@ -14,6 +14,38 @@ from ...trainer.ppo.trajectory import Trajectory
 from ..types import AgentContractError, EpisodeResult, RolloutExport
 
 
+def _structured_reward_data(score):
+    """Aggregate structured submissions while retaining target positions."""
+    grouped = {}
+    for assignment in score.assignments:
+        key = (
+            assignment.mode,
+            assignment.target,
+            assignment.source,
+            assignment.position,
+        )
+        grouped.setdefault(key, []).append(assignment)
+    outcome = 0.0
+    process, direct = {}, {}
+    for (mode, target, _source, position), values in grouped.items():
+        weighted = [float(item.value) * float(item.discount) for item in values]
+        aggregation = values[0].aggregation
+        value = (
+            sum(weighted) / len(weighted)
+            if aggregation == "mean"
+            else weighted[-1]
+            if aggregation == "last"
+            else sum(weighted)
+        )
+        if target == "trajectory":
+            if mode == "reward":
+                outcome += value
+            continue
+        target_map = direct if mode == "advantage" else process
+        target_map[(target, position)] = target_map.get((target, position), 0.0) + value
+    return outcome, process, direct
+
+
 class EpisodeTrajectoryBuilder:
     """Preserve action tokens verbatim and mask added observations/template gaps.
 
@@ -70,6 +102,16 @@ class EpisodeTrajectoryBuilder:
                                 )
                             ]
                             if whole.token_rewards is not None
+                            else None
+                        ),
+                        token_advantages=(
+                            [
+                                value if active else 0.0
+                                for value, active in zip(
+                                    whole.token_advantages[:end], mask, strict=True
+                                )
+                            ]
+                            if whole.token_advantages is not None
                             else None
                         ),
                         fragment_id=f"{whole.rollout_id}:turn:{index}",
@@ -135,9 +177,14 @@ class EpisodeTrajectoryBuilder:
         # for positions after the initial prompt, as required by Trajectory.
         full = initial.copy()
         logprobs, masks, turns, process_rewards, action_keys = [], [], [], [], []
+        direct_advantages = []
         score = episode.score
         if any(index >= len(episode.turns) for index in score.process_rewards):
             raise AgentContractError("Process rewards refer to an unknown turn.")
+        structured_outcome, structured_process, structured_advantages = (
+            _structured_reward_data(score)
+        )
+        reward = score.reward + structured_outcome
         for index, turn in enumerate(episode.turns):
             prompt = list(turn.prompt_tokens)
             if prompt[: len(full)] != full:
@@ -152,21 +199,43 @@ class EpisodeTrajectoryBuilder:
             masks.extend([False] * len(gap))
             turns.extend([-1] * len(gap))
             process_rewards.extend([0.0] * len(gap))
+            direct_advantages.extend([0.0] * len(gap))
             action_keys.extend([None] * len(gap))
             generation = turn.generation
             # Missing process scores mean no extra process reward for this
             # turn. A supplied vector must cover its original output, including
             # any generated EOS tokens, without interpolation or re-tokenizing.
-            rewards = score.process_rewards.get(index, (0.0,) * len(generation.tokens))
+            rewards = list(
+                score.process_rewards.get(index, (0.0,) * len(generation.tokens))
+            )
             if len(rewards) != len(generation.tokens):
                 raise AgentContractError(
                     "Process rewards must align with original output tokens."
+                )
+            for token_index in range(len(rewards)):
+                if token_index == len(rewards) - 1:
+                    rewards[token_index] += sum(
+                        structured_process.get((target, index), 0.0)
+                        for target in ("turn", "interaction")
+                    )
+                rewards[token_index] += structured_process.get(
+                    ("token", (index, token_index)), 0.0
+                )
+            direct = [0.0] * len(generation.tokens)
+            direct[-1] += sum(
+                structured_advantages.get((target, index), 0.0)
+                for target in ("turn", "interaction")
+            )
+            for token_index in range(len(direct)):
+                direct[token_index] += structured_advantages.get(
+                    ("token", (index, token_index)), 0.0
                 )
             full.extend(generation.tokens)
             logprobs.extend(generation.logprobs)
             masks.extend([True] * len(generation.tokens))
             turns.extend([index] * len(generation.tokens))
             process_rewards.extend(rewards)
+            direct_advantages.extend(direct)
             action_keys.extend(
                 (interaction_ids[index], i) for i in range(len(generation.tokens))
             )
@@ -176,11 +245,16 @@ class EpisodeTrajectoryBuilder:
             prompt_tokens=initial,
             completion_tokens=full[len(initial) :],
             logprobs=logprobs,
-            reward=score.reward,
+            reward=reward,
             group_id=episode.group_id,
             loss_mask=masks,
             turn_ids=turns,
-            token_rewards=process_rewards if score.process_rewards else None,
+            token_rewards=(
+                process_rewards
+                if score.process_rewards or structured_process
+                else None
+            ),
+            token_advantages=direct_advantages if any(direct_advantages) else None,
             truncated=episode.status in {"max_turns", "token_limit", "context_limit"},
             reward_components={**score.components, "success": float(score.success)},
             rollout_id=episode.rollout_id or episode.episode_id,
