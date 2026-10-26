@@ -102,6 +102,40 @@ class Trajectory:
     # that the caller declared to be an advantage.  It is appended after the
     # historical fields to preserve positional construction compatibility.
     token_advantages: list[float] | None = None
+    # Branch provenance is optional for ordinary linear rollouts. A branch ID
+    # turns multiple fragments of that branch into one logical PPO sequence,
+    # while branch_group_id identifies sibling counterfactuals for reward and
+    # advantage normalization without changing the original prompt group.
+    branch_id: str | None = None
+    branch_group_id: str | None = None
+    branch_completed: bool | None = None
+    shared_prefix_weight: float = 1.0
+    # Action weights are completion aligned and multiply the policy objective.
+    # They are normally one for active tokens and zero for context. Weighted
+    # branch export uses fractional values only for actions shared by sibling
+    # paths; branch-local actions remain at unit weight.
+    action_weights: list[float] | None = None
+
+    @property
+    def logical_sequence_id(self) -> tuple[str, str | None] | tuple[str, int]:
+        """Return the identity used to join fragments of one training path."""
+        return (
+            (self.rollout_id, self.branch_id)
+            if self.rollout_id is not None
+            else ("row", id(self))
+        )
+
+    @property
+    def comparison_group_id(self) -> str:
+        """Return the reward-comparison group for this branch or trajectory."""
+        return self.branch_group_id or self.group_id
+
+    @property
+    def effective_action_weights(self) -> list[float]:
+        """Materialize objective weights without mutating legacy trajectories."""
+        if self.action_weights is not None:
+            return list(self.action_weights)
+        return [1.0 if active else 0.0 for active in self.loss_mask]
 
     @property
     def provenance(self) -> dict:
@@ -125,10 +159,17 @@ class Trajectory:
                 "fragment_id",
                 "interaction_ids",
                 "parent_interaction_id",
+                "branch_id",
+                "branch_group_id",
+                "branch_completed",
+                "shared_prefix_weight",
             )
         }
         source["action_keys"] = (
             tuple(self.action_keys) if self.action_keys is not None else None
+        )
+        source["action_weights"] = (
+            tuple(self.action_weights) if self.action_weights is not None else None
         )
         return source
 
@@ -168,10 +209,30 @@ class Trajectory:
             "task_id",
             "fragment_id",
             "parent_interaction_id",
+            "branch_id",
+            "branch_group_id",
         ):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a nonempty string or None.")
+        if (
+            self.branch_completed is not None
+            and type(self.branch_completed) is not bool
+        ):
+            raise ValueError("branch_completed must be a boolean or None.")
+        if self.branch_id is None and (
+            self.branch_group_id is not None or self.branch_completed is not None
+        ):
+            raise ValueError("Branch metadata requires branch_id.")
+        if self.branch_id is not None and self.branch_completed is not True:
+            raise ValueError("Only completed branches may enter PPO trajectories.")
+        if (
+            isinstance(self.shared_prefix_weight, bool)
+            or not isinstance(self.shared_prefix_weight, Real)
+            or not math.isfinite(float(self.shared_prefix_weight))
+            or self.shared_prefix_weight < 0
+        ):
+            raise ValueError("shared_prefix_weight must be finite and nonnegative.")
         if self.sample_index is not None and (
             type(self.sample_index) is not int or self.sample_index < 0
         ):
@@ -204,6 +265,21 @@ class Trajectory:
                 ):
                     raise ValueError(
                         "Action keys must identify an interaction and token offset."
+                    )
+        if self.action_weights is not None:
+            if len(self.action_weights) != n:
+                raise ValueError("action_weights must align with completion tokens.")
+            for weight, active in zip(self.action_weights, self.loss_mask, strict=True):
+                if (
+                    isinstance(weight, bool)
+                    or not isinstance(weight, Real)
+                    or not math.isfinite(float(weight))
+                    or weight < 0
+                    or (active and weight <= 0)
+                    or (not active and weight != 0)
+                ):
+                    raise ValueError(
+                        "Active action weights must be positive and context weights zero."
                     )
         if not math.isfinite(self.reward):
             raise ValueError("reward must be finite.")

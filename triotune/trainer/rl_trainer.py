@@ -89,13 +89,17 @@ class PPOTrainer:
         if reference_model is None and self.args.reference is not None:
             reference_model = self.args.reference.name
         if lora_rank is None:
-            lora_rank = configured_model.lora_rank if configured_model is not None else 32
+            lora_rank = (
+                configured_model.lora_rank if configured_model is not None else 32
+            )
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if reference_model is not None and (
             not isinstance(reference_model, str) or not reference_model.strip()
         ):
-            raise ValueError("reference_model must be a non-empty model ID when provided.")
+            raise ValueError(
+                "reference_model must be a non-empty model ID when provided."
+            )
         if (
             isinstance(lora_rank, bool)
             or not isinstance(lora_rank, int)
@@ -129,7 +133,10 @@ class PPOTrainer:
         if algorithm_plan is not None and plan is not None:
             raise ValueError("Supply either algorithm_plan or plan, not both.")
         configured_plan = getattr(self.args, "algorithm_plan", None)
-        if sum(value is not None for value in (algorithm_plan, plan, configured_plan)) > 1:
+        if (
+            sum(value is not None for value in (algorithm_plan, plan, configured_plan))
+            > 1
+        ):
             raise ValueError("Supply only one PPO algorithm plan.")
         self.algorithm_plan = algorithm_plan or plan or configured_plan
         self._owns_critic = self.args.use_critic and critic is None
@@ -322,7 +329,8 @@ class PPOTrainer:
         # Outcome statistics describe logical candidates; token usage and
         # physical trajectory counts continue to describe actual remote work.
         logical = {
-            t.rollout_id or ("row", i): t for i, t in enumerate(trajectories)
+            t.logical_sequence_id if t.rollout_id else ("row", i): t
+            for i, t in enumerate(trajectories)
         }
         rewards = [t.reward for t in logical.values()]
         active_logprobs = [
@@ -399,9 +407,18 @@ class PPOTrainer:
                     np.mean([t.truncated for t in trajectories])
                 ),
                 "train/trajectories": float(len(trajectories)),
-                "train/logical_rollouts": float(len(logical)),
-                "train/action_tokens": float(sum(sum(mask) for mask in batch.masks)),
-                "train/prompt_groups": float(len({t.group_id for t in trajectories})),
+                "train/logical_rollouts": float(
+                    len(
+                        {t.rollout_id or ("row", i) for i, t in enumerate(trajectories)}
+                    )
+                ),
+                "train/logical_sequences": float(len(logical)),
+                "train/action_tokens": float(
+                    sum(sum(t.effective_action_weights) for t in batch.trajectories)
+                ),
+                "train/prompt_groups": float(
+                    len({t.comparison_group_id for t in trajectories})
+                ),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
                 "train/learning_rate": self.args.learning_rate,
                 "usage/actor_train_tokens": float(actor_tokens),
@@ -442,9 +459,7 @@ class PPOTrainer:
         if overlong_penalties:
             metrics.update(
                 {
-                    "reward/overlong_penalty_mean": float(
-                        np.mean(overlong_penalties)
-                    ),
+                    "reward/overlong_penalty_mean": float(np.mean(overlong_penalties)),
                     "rollout/overlong_fraction": float(
                         np.mean([value > 0 for value in overlong_penalties])
                     ),
@@ -581,12 +596,7 @@ class PPOTrainer:
                 )
                 generated = filtered
                 if (
-                    len(
-                        {
-                            trajectory.group_id
-                            for trajectory in accepted + generated
-                        }
-                    )
+                    len({trajectory.group_id for trajectory in accepted + generated})
                     < self.args.batch_size
                 ):
                     refill_count += 1
@@ -656,9 +666,7 @@ class PPOTrainer:
         if not callable(self.reward_fn):
             raise ValueError("evaluate() requires reward_fn.")
         await self.initialize()
-        sampler = await call_async(
-            self._client, "save_weights_and_get_sampling_client"
-        )
+        sampler = await call_async(self._client, "save_weights_and_get_sampling_client")
         started = time.perf_counter()
         trajectories: list[Trajectory] = []
         prompt_count = 0
@@ -791,9 +799,7 @@ class PPOTrainer:
                     "usage/sample_output_tokens": float(
                         self._sample_output_tokens - initial_sample_output
                     ),
-                    "usage/sample_input_tokens_total": float(
-                        self._sample_input_tokens
-                    ),
+                    "usage/sample_input_tokens_total": float(self._sample_input_tokens),
                     "usage/sample_output_tokens_total": float(
                         self._sample_output_tokens
                     ),
@@ -851,9 +857,7 @@ class PPOTrainer:
             elapsed = time.perf_counter() - started
             summary = {
                 "time/train_runtime": elapsed,
-                "time/train_steps_per_second": (
-                    self.state.global_step - initial_step
-                )
+                "time/train_steps_per_second": (self.state.global_step - initial_step)
                 / elapsed,
                 "usage/train_tokens_total": self.state.metrics.get(
                     "usage/train_tokens_total", 0.0

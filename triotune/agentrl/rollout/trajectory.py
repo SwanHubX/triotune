@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ...trainer.ppo.trajectory import Trajectory
-from ..types import AgentContractError, EpisodeResult, RolloutExport
+from ..types import AgentContractError, EpisodeResult, EpisodeScore, RolloutExport
 
 
 def _structured_reward_data(score):
@@ -55,7 +55,7 @@ class EpisodeTrajectoryBuilder:
     """
 
     def __init__(self, *, mode: str = "concat"):
-        """Choose whole-episode or disjoint per-turn training rows.
+        """Choose whole-episode, per-turn, or interaction-tree training rows.
 
         Individual rows retain the initial prompt and all preceding tokens as
         masked context. Only the selected turn is active. This keeps group
@@ -64,9 +64,14 @@ class EpisodeTrajectoryBuilder:
         GAE runs independently within each row. This is an explicit temporal
         objective and need not equal concatenated GAE when discount, lambda,
         dense rewards, or critic bootstrap differ across turn boundaries.
+
+        Branch mode emits one logical training path for every completed
+        ``EpisodeBranch``. It reconstructs the shared ancestry from immutable
+        interaction parent links, preserves original token evidence, and keeps
+        unfinished siblings only in branch metadata.
         """
-        if mode not in {"concat", "individual"}:
-            raise ValueError("Export mode must be concat or individual.")
+        if mode not in {"concat", "individual", "branch"}:
+            raise ValueError("Export mode must be concat, individual, or branch.")
         self.mode = mode
 
     def export(self, episode: EpisodeResult) -> RolloutExport:
@@ -77,6 +82,8 @@ class EpisodeTrajectoryBuilder:
         action mask; the collector additionally checks action keys for custom
         exporters that provide overlapping paths or branching trajectories.
         """
+        if self.mode == "branch":
+            return self._export_branches(episode)
         whole = self.build(episode)
         if self.mode == "concat":
             rows = [whole]
@@ -135,6 +142,171 @@ class EpisodeTrajectoryBuilder:
                 "outcome_scope": "rollout",
                 "shared_prefix": "context_only",
             },
+        )
+
+    @staticmethod
+    def _branch_path(episode: EpisodeResult, branch) -> tuple[str, ...]:
+        """Recover a root-to-leaf path without copying sampled interactions.
+
+        The branch record owns only its suffix. Walking from its fork parent to
+        the root ensures that every shared action keeps the exact interaction ID
+        used by sibling paths, which is required for collector-side weighting.
+        Episode validation has already checked the suffix links; this method
+        additionally guards against malformed cycles supplied after validation.
+        """
+        interactions = {item.interaction_id: item for item in episode.interactions}
+        prefix, seen = [], set(branch.interaction_ids)
+        current = branch.parent_interaction_id
+        while current is not None:
+            if current in seen or current not in interactions:
+                raise AgentContractError("Branch ancestry is cyclic or incomplete.")
+            seen.add(current)
+            prefix.append(current)
+            current = interactions[current].parent_interaction_id
+        return tuple(reversed(prefix)) + branch.interaction_ids
+
+    @staticmethod
+    def _branch_score(episode: EpisodeResult, path: tuple[str, ...], branch):
+        """Project global process signals onto one branch-local turn sequence.
+
+        Branch reward is already the complete local outcome, so trajectory-level
+        assignments from the episode are not added again. Turn, interaction,
+        token reward, and direct-advantage assignments are retained only when
+        their original interaction lies on this path, with positions remapped to
+        the branch-local order. This preserves P1 reward/advantage separation.
+        """
+        generated = [
+            item.interaction_id
+            for item in episode.interactions
+            if item.turn is not None
+        ]
+        global_index = {
+            interaction_id: index for index, interaction_id in enumerate(generated)
+        }
+        local_index = {
+            interaction_id: index for index, interaction_id in enumerate(path)
+        }
+        process = {}
+        for interaction_id in path:
+            source_index = global_index[interaction_id]
+            if source_index in episode.score.process_rewards:
+                process[local_index[interaction_id]] = episode.score.process_rewards[
+                    source_index
+                ]
+        assignments = []
+        for assignment in episode.score.assignments:
+            if assignment.target == "trajectory":
+                continue
+            position = assignment.position
+            if assignment.target == "token":
+                if not isinstance(position, tuple):
+                    continue
+                source_turn, token_index = position
+            else:
+                if type(position) is not int:
+                    continue
+                source_turn, token_index = position, None
+            if not 0 <= source_turn < len(generated):
+                continue
+            interaction_id = generated[source_turn]
+            if interaction_id not in local_index:
+                continue
+            target_turn = local_index[interaction_id]
+            assignments.append(
+                replace(
+                    assignment,
+                    position=(target_turn, token_index)
+                    if token_index is not None
+                    else target_turn,
+                )
+            )
+        components = dict(episode.score.components)
+        components["branch_reward"] = float(branch.reward)
+        return EpisodeScore(
+            reward=float(branch.reward),
+            success=episode.score.success,
+            components=components,
+            process_rewards=process,
+            assignments=tuple(assignments),
+        )
+
+    def _export_branches(self, episode: EpisodeResult) -> RolloutExport:
+        """Export completed leaves while retaining the full declared tree.
+
+        Branch groups are scoped by logical rollout before reaching PPO. A
+        caller can therefore reuse a readable local group label such as
+        ``tool-choice`` in concurrent episodes without accidentally merging
+        unrelated reward baselines. Every row starts at the episode's original
+        prompt, so the existing PPO prompt-consistency invariant still applies.
+        """
+        episode.__post_init__()
+        if not episode.trainable or not episode.branches:
+            raise AgentContractError(
+                "Branch export requires a scored episode with declared branches."
+            )
+        interaction_by_id = {
+            interaction.interaction_id: interaction
+            for interaction in episode.interactions
+        }
+        rows = []
+        group_metadata = {}
+        rollout_id = episode.rollout_id or episode.episode_id
+        for branch in episode.branches:
+            scoped_group = f"{rollout_id}:branch-group:{branch.group_id}"
+            state = group_metadata.setdefault(
+                scoped_group,
+                {
+                    "branch_ids": [],
+                    "completed_branch_ids": [],
+                    "parent_interaction_id": branch.parent_interaction_id,
+                },
+            )
+            state["branch_ids"].append(branch.branch_id)
+            if not branch.completed:
+                continue
+            state["completed_branch_ids"].append(branch.branch_id)
+            path = self._branch_path(episode, branch)
+            interactions = [
+                interaction_by_id[interaction_id] for interaction_id in path
+            ]
+            if any(interaction.turn is None for interaction in interactions):
+                raise AgentContractError(
+                    "A completed branch can contain only sampled interactions."
+                )
+            branch_episode = replace(
+                episode,
+                turns=[interaction.turn for interaction in interactions],
+                interactions=interactions,
+                score=self._branch_score(episode, path, branch),
+                branches=[],
+            )
+            row = self.build(branch_episode)
+            row.fragment_id = f"{rollout_id}:branch:{branch.branch_id}"
+            row.parent_interaction_id = branch.parent_interaction_id
+            row.branch_id = branch.branch_id
+            row.branch_group_id = scoped_group
+            row.branch_completed = True
+            row.shared_prefix_weight = float(branch.shared_prefix_weight)
+            row.__post_init__()
+            rows.append(row)
+        if not rows:
+            raise AgentContractError("Branch export contains no completed branches.")
+        for state in group_metadata.values():
+            state["complete"] = len(state["branch_ids"]) == len(
+                state["completed_branch_ids"]
+            )
+        return RolloutExport(
+            trajectories=rows,
+            logical_rollout_id=rollout_id,
+            fragment_map={row.fragment_id: row.interaction_ids for row in rows},
+            group_id=episode.group_id,
+            metadata={
+                "mode": "branch",
+                "outcome_scope": "branch",
+                "shared_prefix": "original_actions",
+                "branch_groups": group_metadata,
+            },
+            branch_map={branch.branch_id: branch for branch in episode.branches},
         )
 
     def validate_prefix(self, episode: EpisodeResult, prompt_tokens: list[int]) -> None:
@@ -250,9 +422,7 @@ class EpisodeTrajectoryBuilder:
             loss_mask=masks,
             turn_ids=turns,
             token_rewards=(
-                process_rewards
-                if score.process_rewards or structured_process
-                else None
+                process_rewards if score.process_rewards or structured_process else None
             ),
             token_advantages=direct_advantages if any(direct_advantages) else None,
             truncated=episode.status in {"max_turns", "token_limit", "context_limit"},

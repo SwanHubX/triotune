@@ -34,7 +34,11 @@ def make_loss_fn(
             raise ValueError("Custom loss needs one logprob tensor per trajectory.")
         sequence_targets = {}
         if config.importance_sampling_level == "sequence":
-            pooled_delta, pooled_advantage = defaultdict(list), defaultdict(list)
+            pooled_delta, pooled_advantage, pooled_weight = (
+                defaultdict(list),
+                defaultdict(list),
+                defaultdict(list),
+            )
             for i, (t, adv, prox, mask, full_lp) in enumerate(
                 zip(
                     batch.trajectories,
@@ -57,16 +61,20 @@ def make_loss_fn(
                     keep &= correction >= config.rejection_lower
                 if config.rejection_upper is not None:
                     keep &= correction <= config.rejection_upper
-                key = t.rollout_id or ("row", i)
+                key = t.logical_sequence_id if t.rollout_id else ("row", i)
                 pooled_delta[key].append((lp[valid] - previous)[keep])
                 pooled_advantage[key].append(lp.new_tensor(adv)[valid][keep])
+                pooled_weight[key].append(
+                    lp.new_tensor(t.effective_action_weights)[valid][keep]
+                )
             for key, rows in pooled_delta.items():
                 deltas_for_rollout = torch.cat(rows)
                 advantages_for_rollout = torch.cat(pooled_advantage[key])
-                denom = max(1, deltas_for_rollout.numel())
+                weights_for_rollout = torch.cat(pooled_weight[key])
+                denom = weights_for_rollout.sum().clamp_min(1e-12)
                 sequence_targets[key] = (
-                    (deltas_for_rollout.sum() / denom).exp(),
-                    advantages_for_rollout.sum() / denom,
+                    ((deltas_for_rollout * weights_for_rollout).sum() / denom).exp(),
+                    (advantages_for_rollout * weights_for_rollout).sum() / denom,
                 )
         sums, counts, deltas, ratios, clipped, rejected = [], [], [], [], [], []
         row_weights = batch.loss_weights or [1.0] * len(batch.trajectories)
@@ -98,7 +106,8 @@ def make_loss_fn(
                 )
             lp = lp[len(t.prompt_tokens) - 1 :]
             valid = torch.tensor(mask, dtype=torch.bool, device=lp.device)
-            n = int(valid.sum())
+            token_weight = lp.new_tensor(t.effective_action_weights)[valid]
+            n = float(token_weight.sum())
             counts.append(n)
             # Keep zero dependencies for fully masked rows: the SDK requires a
             # gradient tensor for every datum, including deliberately ignored rows.
@@ -122,7 +131,7 @@ def make_loss_fn(
                 # keeps its pieces together, so fragment boundaries cannot
                 # change the geometric ratio or mean candidate advantage.
                 seq_ratio, seq_advantage = sequence_targets[
-                    t.rollout_id or ("row", row_index)
+                    t.logical_sequence_id if t.rollout_id else ("row", row_index)
                 ]
                 ratio, advantage = (
                     seq_ratio.expand_as(delta),
@@ -161,7 +170,7 @@ def make_loss_fn(
                 if config.c_clip is not None:
                     terms = torch.minimum(terms, config.c_clip * advantage.abs())
             # Filter the numerator only; all reductions retain original counts.
-            terms = (terms * correction).masked_fill(~keep, 0)
+            terms = (terms * correction * token_weight).masked_fill(~keep, 0)
             sums.append(row_weights[row_index] * terms.sum() + lp.sum() * 0)
             deltas.append(delta.detach())
             ratios.append(ratio.detach())
@@ -170,16 +179,22 @@ def make_loss_fn(
         if not sum(counts):
             raise ValueError("Custom loss has no active action tokens.")
         active = [
-            (s, n, t.group_id, t.rollout_id or ("row", i), row_weights[i])
+            (
+                s,
+                n,
+                t.comparison_group_id,
+                t.logical_sequence_id if t.rollout_id else ("row", i),
+                row_weights[i],
+            )
             for i, (s, n, t) in enumerate(
                 zip(sums, counts, batch.trajectories, strict=True)
             )
             if n
         ]
-        # Sequence reductions treat all fragments of one rollout as one
-        # candidate. Splitting a long candidate into more rows cannot increase
-        # its sequence weight. Token reductions retain their natural action
-        # token weighting; masked shared prefixes contribute to neither count.
+        # Sequence reductions treat all fragments of one branch (or one linear
+        # rollout) as one candidate. Fractional shared-prefix weights contribute
+        # to both numerator and denominator, so duplicating a path cannot change
+        # its aggregate objective solely by adding another physical row.
         rollout_sums, rollout_counts = {}, defaultdict(float)
         for s, n, _, rollout, weight in active:
             rollout_sums[rollout] = rollout_sums.get(rollout, 0) + s
@@ -199,14 +214,11 @@ def make_loss_fn(
                 + zero
             )
         elif config.loss_aggregation == "prompt_mean":
-            group_tokens = defaultdict(int)
+            group_tokens = defaultdict(float)
             for _, n, group, _, weight in active:
                 group_tokens[group] += n * weight
             objective = (
-                sum(
-                    s / max(group_tokens[group], 1e-12)
-                    for s, _, group, _, _ in active
-                )
+                sum(s / max(group_tokens[group], 1e-12) for s, _, group, _, _ in active)
                 / len(group_tokens)
                 * batch.prompt_mean_scale
                 + zero

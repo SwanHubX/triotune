@@ -97,15 +97,17 @@ class AgentConfig:
     stop: str | list[str] | list[int] | None = None
     log_path: str | None = None
     # Concat keeps the full episode in one PPO row. Individual exports one row
-    # per generated turn with all preceding actions masked as context. The
-    # latter defines independent temporal targets at explicit turn boundaries.
+    # per generated turn with all preceding actions masked as context. Branch
+    # follows declared interaction-tree leaves and emits one row per completed
+    # branch while preserving shared sampled actions by their stable identities.
     export_mode: str = "concat"
     # None requires every requested candidate. A positive threshold allows
     # accepted partial groups, counted by candidate rather than fragment count.
     min_usable_group_size: int | None = None
     # Shared generated actions are counted once by default. Repeat deliberately
-    # assigns each path copy its own loss contribution; causal evidence must
-    # still agree with the original sampled action and its conditioning prefix.
+    # assigns each path copy its own loss contribution. Weighted keeps one copy
+    # per sibling branch and normalizes its objective contribution from the
+    # branch-declared shared_prefix_weight values.
     shared_prefix_policy: str = "deduplicate"
 
     def __post_init__(self) -> None:
@@ -123,10 +125,12 @@ class AgentConfig:
         positive_int(self.max_refill_batches, "max_refill_batches")
         if self.min_usable_group_size is not None:
             positive_int(self.min_usable_group_size, "min_usable_group_size")
-        if self.export_mode not in {"concat", "individual"}:
-            raise ValueError("export_mode must be concat or individual.")
-        if self.shared_prefix_policy not in {"deduplicate", "repeat"}:
-            raise ValueError("shared_prefix_policy must be deduplicate or repeat.")
+        if self.export_mode not in {"concat", "individual", "branch"}:
+            raise ValueError("export_mode must be concat, individual, or branch.")
+        if self.shared_prefix_policy not in {"deduplicate", "repeat", "weighted"}:
+            raise ValueError(
+                "shared_prefix_policy must be deduplicate, repeat, or weighted."
+            )
         if not isinstance(self.prompt_key, str) or not self.prompt_key.strip():
             raise ValueError("prompt_key must be a nonempty string.")
         if self.on_system_failure not in {"raise", "drop_group"}:

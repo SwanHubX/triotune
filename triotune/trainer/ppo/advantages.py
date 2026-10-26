@@ -37,7 +37,9 @@ class RewardNormalizer(Protocol):
 class AdvantageEstimator(Protocol):
     """Estimate token-aligned advantages and critic returns."""
 
-    def estimate(self, rewards, values, mask, **kwargs) -> tuple[list[float], list[float]]: ...
+    def estimate(
+        self, rewards, values, mask, **kwargs
+    ) -> tuple[list[float], list[float]]: ...
 
 
 class ReturnEstimator(Protocol):
@@ -105,7 +107,9 @@ class PPOAlgorithmPlan:
         except TypeError:
             values = method(rewards)
         values = list(values)
-        if len(values) != len(rewards) or any(not math.isfinite(float(v)) for v in values):
+        if len(values) != len(rewards) or any(
+            not math.isfinite(float(v)) for v in values
+        ):
             raise ValueError("Process shaper must return finite aligned rewards.")
         return [float(value) for value in values]
 
@@ -132,7 +136,9 @@ class PPOAlgorithmPlan:
         method = getattr(policy, "weight", policy)
         value = float(method(trajectory, mask))
         if not math.isfinite(value) or value < 0:
-            raise ValueError("LossWeightPolicy must return a finite nonnegative weight.")
+            raise ValueError(
+                "LossWeightPolicy must return a finite nonnegative weight."
+            )
         return value
 
 
@@ -218,14 +224,17 @@ def prepare_advantages(
 
     if not trajectories:
         raise ValueError("An update requires at least one trajectory.")
-    group_ids = [trajectory.group_id for trajectory in trajectories]
+    # Branch groups compare sibling counterfactuals from one fork. Ordinary
+    # trajectories continue to use their prompt group, preserving the legacy
+    # normalization path exactly.
+    group_ids = [trajectory.comparison_group_id for trajectory in trajectories]
     rewards, reward_groups, reward_indices = [], [], {}
     row_indices = []
     masks = []
     action_counts = defaultdict(int)
     for index, trajectory in enumerate(trajectories):
         key = (
-            ("rollout", trajectory.rollout_id)
+            ("sequence", *trajectory.logical_sequence_id)
             if trajectory.rollout_id
             else ("row", index)
         )
@@ -233,12 +242,16 @@ def prepare_advantages(
     references = {}
     for index, trajectory in enumerate(trajectories):
         key = (
-            ("rollout", trajectory.rollout_id)
+            ("sequence", *trajectory.logical_sequence_id)
             if trajectory.rollout_id
             else ("row", index)
         )
-        reward = plan.shape_reward(trajectory, trajectory.reward) if plan else trajectory.reward
-        reference = (trajectory.group_id, reward)
+        reward = (
+            plan.shape_reward(trajectory, trajectory.reward)
+            if plan
+            else trajectory.reward
+        )
+        reference = (trajectory.comparison_group_id, reward)
         if key in references and references[key] != reference:
             raise ValueError(
                 "Fragments of one rollout must share group and outcome reward."
@@ -260,7 +273,7 @@ def prepare_advantages(
         if key not in reward_indices:
             reward_indices[key] = len(rewards)
             rewards.append([max(-config.reward_clip, min(config.reward_clip, reward))])
-            reward_groups.append(trajectory.group_id)
+            reward_groups.append(trajectory.comparison_group_id)
         row_indices.append(reward_indices[key])
         masks.append(list(trajectory.loss_mask))
 

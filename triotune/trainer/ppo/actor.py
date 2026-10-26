@@ -52,9 +52,7 @@ def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
     ratio = np.exp(np.clip(delta, -700, 700))
     low = 1 - config.eps_clip
     high = 1 + (
-        config.eps_clip
-        if config.eps_clip_higher is None
-        else config.eps_clip_higher
+        config.eps_clip if config.eps_clip_higher is None else config.eps_clip_higher
     )
     return {
         "policy/ratio": float(np.mean(ratio)),
@@ -76,6 +74,7 @@ def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
 # Prompt-group batching and remote actor optimization
 # ---------------------------------------------------------------------------
 
+
 def minibatches(batch: PreparedBatch, count: int):
     """Keep prompt groups intact, including variable response counts.
 
@@ -85,7 +84,7 @@ def minibatches(batch: PreparedBatch, count: int):
     groups = {}
     for i, t in enumerate(batch.trajectories):
         if any(batch.masks[i]):
-            groups.setdefault(t.group_id, []).append(i)
+            groups.setdefault(t.comparison_group_id, []).append(i)
     if count > len(groups):
         raise ValueError("ppo_n_minibatches must not exceed active prompt groups.")
     units = list(groups.values())
@@ -132,11 +131,12 @@ class PPOActor:
         prompts = {}
         for t in trajectories:
             t.__post_init__()
-            previous = prompts.setdefault(t.group_id, t.prompt_tokens)
-            if previous != t.prompt_tokens:
-                raise ValueError(
-                    "One group_id must identify one identical tokenized prompt."
-                )
+            for group_id in {t.group_id, t.comparison_group_id}:
+                previous = prompts.setdefault(group_id, t.prompt_tokens)
+                if previous != t.prompt_tokens:
+                    raise ValueError(
+                        "One PPO group must identify one identical tokenized prompt."
+                    )
         validate_policy_versions(trajectories)
         proximal = None
         if config.recompute_logprob or config.use_decoupled_loss:
@@ -169,11 +169,28 @@ class PPOActor:
         chunks = list(minibatches(batch, config.ppo_n_minibatches))
         metrics = []
         diagnostics = []
-        native_backend = config.loss_backend == "native" and not (
-            self.plan
-            and (
-                self.plan.loss_weight_policy is not None
-                or self.plan.objective is not None
+        native_backend = (
+            config.loss_backend == "native"
+            and not (
+                self.plan
+                and (
+                    self.plan.loss_weight_policy is not None
+                    or self.plan.objective is not None
+                )
+            )
+            and all(
+                all(
+                    weight == 1.0
+                    for weight, active in zip(
+                        trajectory.effective_action_weights,
+                        mask,
+                        strict=True,
+                    )
+                    if active
+                )
+                for trajectory, mask in zip(
+                    batch.trajectories, batch.masks, strict=True
+                )
             )
         )
         for _ in range(config.update_epochs):
@@ -252,8 +269,9 @@ class PPOActor:
                 row["_loss_weight"] = float(
                     (
                         sum(
-                            weight * sum(mask)
-                            for weight, mask in zip(
+                            weight * sum(trajectory.effective_action_weights)
+                            for trajectory, weight, mask in zip(
+                                chunk.trajectories,
                                 chunk.loss_weights or [1.0] * len(chunk.masks),
                                 chunk.masks,
                                 strict=True,
@@ -271,13 +289,20 @@ class PPOActor:
                         )
                     )
                     if self.plan and self.plan.loss_weight_policy is not None
-                    else row["train/action_tokens"]
+                    else sum(
+                        sum(trajectory.effective_action_weights)
+                        for trajectory in chunk.trajectories
+                    )
                     if config.loss_aggregation == "token_mean"
-                    else len({
-                        t.rollout_id or ("row", i)
-                        for i, (t, mask) in enumerate(zip(chunk.trajectories, chunk.masks, strict=True))
-                        if any(mask)
-                    })
+                    else len(
+                        {
+                            t.logical_sequence_id if t.rollout_id else ("row", i)
+                            for i, (t, mask) in enumerate(
+                                zip(chunk.trajectories, chunk.masks, strict=True)
+                            )
+                            if any(mask)
+                        }
+                    )
                     if config.loss_aggregation in {"seq_mean", "constant"}
                     else 1.0
                 )
@@ -332,9 +357,7 @@ class PPOActor:
                     "policy/ratio_std": float(np.std(ratios)),
                     "policy/ratio_p95": float(np.quantile(ratios, 0.95)),
                     "policy/ratio_max": float(np.max(ratios)),
-                    "policy/update_approx_kl": float(
-                        np.mean(ratios - 1 - deltas)
-                    ),
+                    "policy/update_approx_kl": float(np.mean(ratios - 1 - deltas)),
                     "policy/clip_fraction": float(np.mean(clipped)),
                     "policy/clip_fraction_low": float(np.mean(ratios < low)),
                     "policy/clip_fraction_high": float(np.mean(ratios > high)),

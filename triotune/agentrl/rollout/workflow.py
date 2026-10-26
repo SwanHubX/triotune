@@ -20,8 +20,8 @@ from uuid import uuid4
 from ...trainer.ppo.rollout import gather_cancel_on_error
 from ...trainer.ppo.trajectory import Trajectory
 from ..runtime.sampling import SamplingSnapshot
-from ..training.rewards import aggregate_assignments
 from ..training.evaluation import evaluation_metrics
+from ..training.rewards import aggregate_assignments
 from ..types import (
     SYSTEM_STATUSES,
     AgentContractError,
@@ -29,8 +29,8 @@ from ..types import (
     EpisodeLogger,
     EpisodeResult,
     ExecutionContext,
-    SampleAcceptance,
     RolloutExport,
+    SampleAcceptance,
     _execution_context,
 )
 
@@ -53,6 +53,10 @@ class AgentRolloutBatch:
     # complete group and an explicitly accepted partial group observable.
     exports: list[RolloutExport] = field(default_factory=list)
     groups: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Branch groups are nested counterfactual sets inside accepted logical
+    # rollouts. They are separate from candidate prompt groups so fragment count
+    # and unfinished sibling paths cannot change candidate-level completeness.
+    branch_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def metrics(self, *, prefix: str = "agent") -> dict[str, float]:
         """Aggregate execution metrics with explicit, task-relevant denominators.
@@ -74,6 +78,13 @@ class AgentRolloutBatch:
             f"{prefix}/accepted_trajectories": float(len(self.trajectories)),
             f"{prefix}/dropped_groups": float(self.dropped_groups),
             f"{prefix}/refill_batches": float(self.refill_batches),
+            f"{prefix}/branch_groups": float(len(self.branch_groups)),
+            f"{prefix}/completed_branches": float(
+                sum(
+                    len(state["completed_branch_ids"])
+                    for state in self.branch_groups.values()
+                )
+            ),
             f"{prefix}/retry_count": float(
                 sum(event.retried for e in episodes for event in e.retries)
             ),
@@ -188,8 +199,10 @@ class AgentRolloutWorkflow:
             type(min_usable_group_size) is not int or min_usable_group_size < 1
         ):
             raise ValueError("min_usable_group_size must be positive or None.")
-        if shared_prefix_policy not in {"deduplicate", "repeat"}:
-            raise ValueError("shared_prefix_policy must be deduplicate or repeat.")
+        if shared_prefix_policy not in {"deduplicate", "repeat", "weighted"}:
+            raise ValueError(
+                "shared_prefix_policy must be deduplicate, repeat, or weighted."
+            )
         self.min_usable_group_size = min_usable_group_size
         self.shared_prefix_policy = shared_prefix_policy
         self.accept_sample = accept_sample
@@ -348,7 +361,9 @@ class AgentRolloutWorkflow:
                             )
                         if not accepted:
                             episode.status = "rejected"
-                            episode.error = "Sample acceptance hook rejected the episode."
+                            episode.error = (
+                                "Sample acceptance hook rejected the episode."
+                            )
                             exported = None
                     except (AgentContractError, ValueError, TypeError) as exc:
                         episode.status, episode.error, episode.score = (
@@ -399,12 +414,23 @@ class AgentRolloutWorkflow:
             for e, exported in results
             if exported is not None and e.group_id not in rejected_groups
         ]
+        branch_groups = {}
+        for exported in exports:
+            for group_id, state in exported.metadata.get("branch_groups", {}).items():
+                # Exporters scope branch groups to one logical rollout. Reject
+                # collisions instead of merging independently sampled trees.
+                if group_id in branch_groups:
+                    raise AgentContractError(
+                        "Branch group identity is not rollout scoped."
+                    )
+                branch_groups[group_id] = copy.deepcopy(state)
         batch = AgentRolloutBatch(
             [e for e, _ in results],
             [t for exported in exports for t in exported.trajectories],
             dropped_groups=len(rejected_groups),
             exports=exports,
             groups=groups,
+            branch_groups=branch_groups,
         )
         if strict and rejected_groups:
             raise EpisodeCollectionError(batch)
@@ -446,6 +472,65 @@ class AgentRolloutWorkflow:
         ):
             raise AgentContractError("Export identity differs from its candidate.")
         rows = exported.trajectories
+        if exported.branch_map:
+            declared = {branch.branch_id: branch for branch in episode.branches}
+            if exported.branch_map != declared or set(exported.branch_map) != set(
+                declared
+            ):
+                raise AgentContractError(
+                    "Exported branch map must preserve every declared episode branch."
+                )
+            group_states = exported.metadata.get("branch_groups")
+            if not isinstance(group_states, dict) or not group_states:
+                raise AgentContractError(
+                    "Branch export requires explicit group metadata."
+                )
+            expected_group_states = {}
+            for branch in exported.branch_map.values():
+                group_id = (
+                    f"{exported.logical_rollout_id}:branch-group:{branch.group_id}"
+                )
+                state = expected_group_states.setdefault(
+                    group_id,
+                    {
+                        "branch_ids": [],
+                        "completed_branch_ids": [],
+                        "parent_interaction_id": branch.parent_interaction_id,
+                    },
+                )
+                state["branch_ids"].append(branch.branch_id)
+                if branch.completed:
+                    state["completed_branch_ids"].append(branch.branch_id)
+            for state in expected_group_states.values():
+                state["complete"] = len(state["branch_ids"]) == len(
+                    state["completed_branch_ids"]
+                )
+            if group_states != expected_group_states:
+                raise AgentContractError(
+                    "Branch group metadata differs from declared branch completion."
+                )
+            complete_groups = {
+                group_id
+                for group_id, state in group_states.items()
+                if isinstance(state, dict) and state.get("complete") is True
+            }
+            # A partial sibling set has no unbiased branch-relative baseline.
+            # Keep it in branch_map/metadata for diagnostics, but do not train
+            # any completed prefix of that group as if the missing branch had a
+            # zero reward. Other complete groups in the same tree remain usable.
+            rows = [row for row in rows if row.branch_group_id in complete_groups]
+            if not rows:
+                raise AgentContractError(
+                    "Branch export contains no complete branch group."
+                )
+            exported.trajectories = rows
+            exported.fragment_map = {
+                row.fragment_id: row.interaction_ids for row in rows
+            }
+        elif episode.branches or any(row.branch_id is not None for row in rows):
+            raise AgentContractError(
+                "Branch trajectories require a declared branch map."
+            )
         ids = [row.fragment_id for row in rows]
         if (
             len(set(ids)) != len(ids)
@@ -455,12 +540,25 @@ class AgentRolloutWorkflow:
             raise AgentContractError(
                 "Fragment map must identify every row exactly once."
             )
-        seen, accepted = {}, []
+        seen, accepted, occurrences = {}, [], {}
         source, source_turns = {}, {}
+        interaction_records = {
+            interaction.interaction_id: interaction
+            for interaction in episode.interactions
+        }
+        generated_interactions = [
+            interaction
+            for interaction in episode.interactions
+            if interaction.turn is not None
+        ]
+        if episode.interactions and len(generated_interactions) != len(episode.turns):
+            raise AgentContractError(
+                "Generated interactions must identify every recorded turn."
+            )
         for index, turn in enumerate(episode.turns):
             identity = (
-                episode.interactions[index].interaction_id
-                if episode.interactions
+                generated_interactions[index].interaction_id
+                if generated_interactions
                 else f"{episode.episode_id}:turn:{index}"
             )
             source_turns[identity] = turn
@@ -479,9 +577,12 @@ class AgentRolloutWorkflow:
                 list(row.token_rewards) if row.token_rewards is not None else None
             )
             row.token_advantages = (
-                list(row.token_advantages)
-                if row.token_advantages is not None
-                else None
+                list(row.token_advantages) if row.token_advantages is not None else None
+            )
+            row.action_weights = (
+                list(row.action_weights)
+                if row.action_weights is not None
+                else [1.0 if active else 0.0 for active in row.loss_mask]
             )
             full_tokens = row.prompt_tokens + row.completion_tokens
             checked_contexts = set()
@@ -507,10 +608,39 @@ class AgentRolloutWorkflow:
             if not set(row.interaction_ids).issubset(source_turns):
                 raise AgentContractError("Fragment refers to an unknown interaction.")
             structured_outcome = aggregate_assignments(episode.score.assignments)[0]
-            if row.reward != episode.score.reward + structured_outcome:
+            branch = exported.branch_map.get(row.branch_id)
+            if row.branch_id is not None and branch is None:
                 raise AgentContractError(
-                    "Fragments must share the scored candidate outcome."
+                    "Branch fragment refers to an undeclared branch identity."
                 )
+            expected_reward = (
+                float(branch.reward)
+                if branch is not None
+                else episode.score.reward + structured_outcome
+            )
+            if row.reward != expected_reward:
+                raise AgentContractError(
+                    "A fragment must preserve its candidate or branch-local outcome."
+                )
+            if branch is not None:
+                expected_group = (
+                    f"{exported.logical_rollout_id}:branch-group:{branch.group_id}"
+                )
+                expected_path = list(branch.interaction_ids)
+                parent = branch.parent_interaction_id
+                while parent is not None:
+                    expected_path.append(parent)
+                    parent = interaction_records[parent].parent_interaction_id
+                if (
+                    row.branch_completed is not True
+                    or row.branch_group_id != expected_group
+                    or row.shared_prefix_weight != branch.shared_prefix_weight
+                    or row.parent_interaction_id != branch.parent_interaction_id
+                    or not set(row.interaction_ids).issubset(expected_path)
+                ):
+                    raise AgentContractError(
+                        "Branch fragment metadata differs from its branch record."
+                    )
             if row.action_keys is None:
                 raise AgentContractError("Exports require stable action keys.")
             else:
@@ -555,6 +685,7 @@ class AgentRolloutWorkflow:
                             )
                         if self.shared_prefix_policy == "deduplicate":
                             row.loss_mask[i] = False
+                            row.action_weights[i] = 0.0
                             if row.turn_ids is not None:
                                 row.turn_ids[i] = -1
                             if row.token_rewards is not None:
@@ -562,9 +693,54 @@ class AgentRolloutWorkflow:
                             if row.token_advantages is not None:
                                 row.token_advantages[i] = 0.0
                     seen[key] = evidence
+                    occurrences.setdefault(key, []).append((row, i))
             if any(row.loss_mask):
                 row.__post_init__()
                 accepted.append(row)
+        if self.shared_prefix_policy == "weighted":
+            for key, positions in occurrences.items():
+                if len(positions) < 2:
+                    continue
+                owners = {}
+                for row, index in positions:
+                    owner = row.logical_sequence_id
+                    if owner in owners:
+                        # Multiple fragments of one branch are a physical split,
+                        # not separate counterfactual evidence. Keep the first
+                        # action occurrence and mask later copies exactly once.
+                        row.loss_mask[index] = False
+                        row.action_weights[index] = 0.0
+                        if row.turn_ids is not None:
+                            row.turn_ids[index] = -1
+                        if row.token_rewards is not None:
+                            row.token_rewards[index] = 0.0
+                        if row.token_advantages is not None:
+                            row.token_advantages[index] = 0.0
+                    else:
+                        owners[owner] = (row, index)
+                if len(owners) < 2:
+                    continue
+                total = sum(row.shared_prefix_weight for row, _ in owners.values())
+                if total <= 0:
+                    raise AgentContractError(
+                        "Shared branch actions require a positive total prefix weight."
+                    )
+                for row, index in owners.values():
+                    weight = row.shared_prefix_weight / total
+                    if weight == 0:
+                        row.loss_mask[index] = False
+                        row.action_weights[index] = 0.0
+                        if row.turn_ids is not None:
+                            row.turn_ids[index] = -1
+                        if row.token_rewards is not None:
+                            row.token_rewards[index] = 0.0
+                        if row.token_advantages is not None:
+                            row.token_advantages[index] = 0.0
+                    else:
+                        row.action_weights[index] = weight
+            accepted = [row for row in accepted if any(row.loss_mask)]
+            for row in accepted:
+                row.__post_init__()
         if not accepted:
             raise AgentContractError("Export contains no usable actions.")
         exported.trajectories = accepted

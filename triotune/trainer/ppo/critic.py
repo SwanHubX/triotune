@@ -24,6 +24,7 @@ from .trajectory import Trajectory
 # Marker-based value readout and clipped value objective
 # ---------------------------------------------------------------------------
 
+
 def critic_datums(trajectories, token_ids):
     """Build positive/negative marker targets on the real causal contexts.
 
@@ -72,8 +73,14 @@ def values_from_logprobs(logprobs, trajectories, config):
     return values
 
 
-def value_loss(values, old_values, returns, mask, *, clip: float = 0.2):
-    """Compute clipped value regression over active action states."""
+def value_loss(values, old_values, returns, mask, *, clip: float = 0.2, weights=None):
+    """Compute clipped value regression over weighted active action states.
+
+    Counterfactual branches can repeat an identical sampled prefix with
+    normalized action weights. Applying the same weights to critic regression
+    prevents that shared state from receiving one full value update per branch.
+    Linear rollouts omit ``weights`` and retain the original arithmetic mean.
+    """
 
     import torch
 
@@ -85,13 +92,21 @@ def value_loss(values, old_values, returns, mask, *, clip: float = 0.2):
     if not valid.any():
         raise ValueError("Value loss requires active tokens.")
     bounded = old_values.detach() + (values - old_values.detach()).clamp(-clip, clip)
-    return (
+    losses = (
         0.5
         * torch.maximum(
             (values - returns.detach()).square(),
             (bounded - returns.detach()).square(),
-        )[valid].mean()
+        )[valid]
     )
+    if weights is None:
+        return losses.mean()
+    if weights.shape != mask.shape or not torch.isfinite(weights).all():
+        raise ValueError("Value-loss weights must be finite and mask aligned.")
+    active_weights = weights[valid]
+    if (active_weights <= 0).any():
+        raise ValueError("Active value-loss weights must be positive.")
+    return (losses * active_weights).sum() / active_weights.sum()
 
 
 def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
@@ -103,7 +118,7 @@ def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
         or not trajectories
     ):
         raise ValueError("Critic trajectories, returns and masks must align.")
-    old, targets, valid = [], [], []
+    old, targets, valid, action_weights = [], [], [], []
     for trajectory, ret, mask in zip(trajectories, returns, masks, strict=True):
         trajectory.__post_init__()
         if (
@@ -119,6 +134,7 @@ def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
         old.extend(trajectory.values[:-1])
         targets.extend(ret)
         valid.extend(mask)
+        action_weights.extend(trajectory.effective_action_weights)
     if not any(valid):
         raise ValueError("Critic update has no active action states.")
     expected_targets = [
@@ -137,11 +153,17 @@ def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
         rows = values_from_logprobs(logprobs, trajectories, config)
         prediction = torch.cat([row[:-1] for row in rows])
         mask = torch.tensor(valid, device=prediction.device, dtype=torch.bool)
+        weights = prediction.new_tensor(action_weights)
         previous, target = prediction.new_tensor(old), prediction.new_tensor(targets)
         if not torch.isfinite(prediction).all():
             raise FloatingPointError("Critic values are nonfinite.")
         objective = value_loss(
-            prediction, previous, target, mask, clip=config.critic_eps_clip
+            prediction,
+            previous,
+            target,
+            mask,
+            clip=config.critic_eps_clip,
+            weights=weights,
         )
         # Keep a differentiable dependency for every marker datum, including
         # rows whose action positions are fully masked by the rollout.
@@ -157,7 +179,8 @@ def make_value_loss_fn(trajectories, returns, masks, config, token_ids):
             prediction_values = prediction.detach()[mask]
             target_variance = target_values.var(unbiased=False)
             explained_variance = (
-                1 - (target_values - prediction_values).var(unbiased=False)
+                1
+                - (target_values - prediction_values).var(unbiased=False)
                 / target_variance
                 if target_variance > 0
                 else target_variance.new_tensor(0.0)
@@ -319,9 +342,7 @@ class PyTRIOCritic:
                 metrics[key] = float(np.mean([row[key] for row in present]))
         for stem in ("critic/value", "critic/return"):
             mean_name, std_name = stem + "_mean", stem + "_std"
-            present = [
-                row for row in rows if mean_name in row and std_name in row
-            ]
+            present = [row for row in rows if mean_name in row and std_name in row]
             if present:
                 weights = [row["critic/action_tokens"] for row in present]
                 second_moment = np.average(
@@ -335,9 +356,7 @@ class PyTRIOCritic:
             [
                 value
                 for trajectory, mask in zip(trajectories, masks, strict=True)
-                for value, active in zip(
-                    trajectory.values[:-1], mask, strict=True
-                )
+                for value, active in zip(trajectory.values[:-1], mask, strict=True)
                 if active
             ],
             dtype=np.float64,

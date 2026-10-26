@@ -77,4 +77,4 @@ The default adapters use JSON actions such as {"tool_calls":[{"name":"calculate"
 
 ## Current scope
 
-Sampling uses temperature=1 and top_p=1 to preserve the PPO log-probability contract. The default renderer appends context to original sampled tokens; check tokenizer compatibility before using another model. Third-party SDK proxies, branching trajectories, context compaction and overlapping sampling with training are outside the current implementation.
+Sampling uses temperature=1 and top_p=1 to preserve the PPO log-probability contract. The default renderer appends context to original sampled tokens; check tokenizer compatibility before using another model. Explicit interaction-tree branches can export counterfactual PPO paths with branch-local rewards and weighted shared prefixes. Replay, context compaction and overlapping sampling with training are outside the current implementation.

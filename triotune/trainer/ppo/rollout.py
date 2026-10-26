@@ -36,8 +36,7 @@ def _reward_result(value):
         not isinstance(reward, Real)
         or isinstance(reward, bool)
         or any(
-            not isinstance(name, str)
-            or not isinstance(item, Real)
+            not isinstance(name, str) or not isinstance(item, Real)
             for name, item in components.items()
         )
     ):
@@ -157,7 +156,7 @@ def filter_informative_groups(trajectories: list[Trajectory]) -> list[Trajectory
     """DAPO: refill the prompt batch after removing equal raw-reward groups."""
     groups = defaultdict(list)
     for t in trajectories:
-        groups[t.group_id].append(t)
+        groups[t.comparison_group_id].append(t)
     return [
         t
         for group in groups.values()

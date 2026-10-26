@@ -35,9 +35,9 @@ records include interactions, events, and export metadata.
 from triotune.agentrl import AgentConfig
 
 config = AgentConfig(
-    export_mode="individual",
+    export_mode="branch",
     min_usable_group_size=2,
-    shared_prefix_policy="deduplicate",
+    shared_prefix_policy="weighted",
 )
 ```
 
@@ -60,10 +60,62 @@ no action key. Export validation checks the original token, behavior logprob,
 causal position, and conditioning prefix of every active action.
 
 Shared actions are masked after their first occurrence under `deduplicate`.
-`repeat` explicitly counts each occurrence. Conflicting evidence is always an
-error. Fragments with no active actions are omitted. Differing initial prompts
-cannot share a PPO group. Interaction lineage can represent branches, but
-custom branch exporters must still satisfy these training constraints.
+`repeat` explicitly counts each occurrence. `weighted` retains one occurrence
+per logical branch and normalizes shared-action contributions from the branches'
+declared prefix weights. Branch-local actions retain unit weight. The actor and
+critic consume the same completion-aligned weights; weighted rows use the
+custom PyTRIO loss boundary because the native objective has no token-weight
+field. Conflicting token, logprob, causal-position, or prefix evidence is always
+an error. Fragments with no active actions are omitted. Differing initial
+prompts cannot share a PPO group.
+
+## Branch trees
+
+`EpisodeBranch` declares a rollout-local branch suffix. Its
+`parent_interaction_id` is the fork state, and `interaction_ids` is the ordered
+parent-linked suffix after that state. The exporter walks parent links to recover
+the exact shared prefix rather than reconstructing it from displayed text.
+
+```python
+from triotune.agentrl import EpisodeBranch
+
+episode.branches = [
+    EpisodeBranch(
+        branch_id="tool-a",
+        parent_interaction_id=state_interaction_id,
+        interaction_ids=(tool_a_interaction_id, final_a_interaction_id),
+        group_id="tool-choice",
+        reward=1.0,
+        completed=True,
+        shared_prefix_weight=0.5,
+    ),
+    EpisodeBranch(
+        branch_id="tool-b",
+        parent_interaction_id=state_interaction_id,
+        interaction_ids=(tool_b_interaction_id, final_b_interaction_id),
+        group_id="tool-choice",
+        reward=0.0,
+        completed=True,
+        shared_prefix_weight=0.5,
+    ),
+]
+```
+
+Branch reward is the complete branch-local outcome, not an increment to the
+episode outcome. Trajectory-level episode assignments are therefore not copied
+onto every branch. Process-reward and direct-advantage assignments are projected
+onto the interactions present in each path and retain their P1 reward mode.
+Each branch group is scoped by logical rollout before PPO normalization, so
+concurrent episodes can reuse readable local labels without merging baselines.
+
+Only complete sibling groups enter training. An unfinished sibling remains in
+`RolloutExport.branch_map`, group metadata, and the episode log, but its completed
+siblings are not trained as though the missing reward were zero.
+`AgentRolloutBatch.branch_groups` exposes branch IDs, completed branch IDs, fork
+parent, and completeness independently of candidate-level
+`AgentRolloutBatch.groups`. PPO counts multiple fragments of one branch once for
+reward normalization and sequence reductions, while separate branches of the
+same logical rollout retain their distinct local rewards.
 
 By default all candidates must be usable. An explicit `min_usable_group_size`
 allows partial groups; the threshold counts candidates, not fragments. Failed
@@ -75,12 +127,12 @@ and pass@k continue to count episodes, including failed attempts.
 
 ## PPO provenance and policy age
 
-Outcome normalization counts each logical rollout once, and sequence reductions
-combine all its fragments before assigning candidate weight. Sequence importance
-ratios also pool retained action tokens across all fragments of a candidate.
-Token reductions continue to weight active action tokens. Overlong penalties
-use the candidate's total active action count. Fragments of one candidate share
-the same outcome reward.
+Outcome normalization counts each linear logical rollout once. For a branch
+tree, it counts each branch once and combines all fragments of that branch before
+assigning sequence weight. Sequence importance ratios follow the same logical
+sequence identity. Token reductions use active action weights. Overlong penalties
+use the branch or linear candidate's active action count. Fragments of one branch
+share its outcome reward; sibling branches may have different outcomes.
 
 `batch_datums(prepared_batch)` returns an SDK-compatible list with an ordered
 `provenance` sidecar. The sidecar identifies each physical row without placing

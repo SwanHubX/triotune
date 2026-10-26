@@ -371,6 +371,78 @@ class Interaction:
         return self.turn.tool_results if self.turn else []
 
 
+@dataclass(frozen=True, slots=True)
+class EpisodeBranch:
+    """Describe one trainable suffix in an episode interaction tree.
+
+    ``interaction_ids`` contains only the interactions created after the fork.
+    ``parent_interaction_id`` identifies the state from which that suffix starts;
+    the exporter follows parent links to recover the immutable shared prefix.
+    Sibling alternatives use the same rollout-local ``group_id`` so reward
+    normalization compares only branches produced from the same decision state.
+
+    ``reward`` is the complete branch-local outcome rather than an increment to
+    the episode outcome. A completed branch therefore requires a finite reward,
+    while an unfinished branch can retain ``None`` and remains visible in export
+    metadata without entering PPO. ``shared_prefix_weight`` controls how this
+    branch contributes to sampled actions that also occur in sibling paths when
+    the collector uses weighted shared-prefix training. Branch-local actions
+    always retain unit weight.
+    """
+
+    branch_id: str
+    interaction_ids: tuple[str, ...]
+    group_id: str
+    parent_interaction_id: str | None = None
+    reward: float | None = None
+    completed: bool = True
+    shared_prefix_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("branch_id", "group_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise AgentContractError(f"{name} must be a nonempty string.")
+        if self.parent_interaction_id is not None and (
+            not isinstance(self.parent_interaction_id, str)
+            or not self.parent_interaction_id
+        ):
+            raise AgentContractError(
+                "parent_interaction_id must be a nonempty string or None."
+            )
+        if (
+            not isinstance(self.interaction_ids, tuple)
+            or not self.interaction_ids
+            or len(set(self.interaction_ids)) != len(self.interaction_ids)
+            or any(
+                not isinstance(value, str) or not value
+                for value in self.interaction_ids
+            )
+        ):
+            raise AgentContractError(
+                "A branch needs an ordered tuple of unique interaction IDs."
+            )
+        if type(self.completed) is not bool:
+            raise AgentContractError("Branch completed must be a boolean.")
+        if self.completed and self.reward is None:
+            raise AgentContractError("A completed branch requires a local reward.")
+        if self.reward is not None and (
+            isinstance(self.reward, bool)
+            or not isinstance(self.reward, (int, float))
+            or not math.isfinite(float(self.reward))
+        ):
+            raise AgentContractError("Branch reward must be finite or None.")
+        if (
+            isinstance(self.shared_prefix_weight, bool)
+            or not isinstance(self.shared_prefix_weight, (int, float))
+            or not math.isfinite(float(self.shared_prefix_weight))
+            or self.shared_prefix_weight < 0
+        ):
+            raise AgentContractError(
+                "shared_prefix_weight must be finite and nonnegative."
+            )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AgentEvent:
     """Append-only semantic evidence scoped to an immutable execution context.
@@ -443,6 +515,10 @@ class RolloutExport:
     fragment_map: dict[str, tuple[str, ...]]
     group_id: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    # The branch map includes unfinished siblings even though only completed
+    # branches may produce trajectories. This makes partial tree collection
+    # auditable without turning missing counterfactual outcomes into rewards.
+    branch_map: dict[str, EpisodeBranch] = field(default_factory=dict)
 
 
 # Completion does not imply success: a valid final answer can still be wrong.
@@ -520,14 +596,20 @@ class EpisodeScore:
             raise AgentContractError("Reward assignments must be a sequence.")
         for assignment in self.assignments:
             if not hasattr(assignment, "target") or not hasattr(assignment, "value"):
-                raise AgentContractError("Reward assignments must expose target and value.")
+                raise AgentContractError(
+                    "Reward assignments must expose target and value."
+                )
             validate = getattr(assignment, "__post_init__", None)
             if callable(validate):
                 validate()
-            if isinstance(assignment.value, bool) or not isinstance(
-                assignment.value, (int, float)
-            ) or not math.isfinite(float(assignment.value)):
-                raise AgentContractError("Reward assignment values must be finite scalars.")
+            if (
+                isinstance(assignment.value, bool)
+                or not isinstance(assignment.value, (int, float))
+                or not math.isfinite(float(assignment.value))
+            ):
+                raise AgentContractError(
+                    "Reward assignment values must be finite scalars."
+                )
         object.__setattr__(self, "assignments", tuple(self.assignments))
 
 
@@ -570,6 +652,7 @@ class EpisodeResult:
     interactions: list[Interaction] = field(default_factory=list)
     events: list[AgentEvent] = field(default_factory=list)
     export_metadata: dict[str, Any] = field(default_factory=dict)
+    branches: list[EpisodeBranch] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate identity fields before tools or scorers observe a record.
@@ -612,6 +695,7 @@ class EpisodeResult:
                         f"Episode {name} differs from ExecutionContext."
                     )
         known = set()
+        interaction_by_id = {}
         for interaction in self.interactions:
             interaction.__post_init__()
             if interaction.interaction_id in known or (
@@ -632,6 +716,43 @@ class EpisodeResult:
                 if getattr(interaction.context, name) != getattr(self, name):
                     raise AgentContractError(f"Interaction changed candidate {name}.")
             known.add(interaction.interaction_id)
+            interaction_by_id[interaction.interaction_id] = interaction
+        branch_ids, branch_suffixes, branch_parents = set(), set(), {}
+        for branch in self.branches:
+            if not isinstance(branch, EpisodeBranch):
+                raise AgentContractError(
+                    "Episode branches must be EpisodeBranch records."
+                )
+            branch.__post_init__()
+            if branch.branch_id in branch_ids:
+                raise AgentContractError("Branch IDs must be unique within an episode.")
+            branch_ids.add(branch.branch_id)
+            if branch.parent_interaction_id is not None and (
+                branch.parent_interaction_id not in interaction_by_id
+            ):
+                raise AgentContractError("Branch parent interaction is unknown.")
+            previous = branch.parent_interaction_id
+            for interaction_id in branch.interaction_ids:
+                interaction = interaction_by_id.get(interaction_id)
+                if interaction is None:
+                    raise AgentContractError("Branch refers to an unknown interaction.")
+                if interaction.parent_interaction_id != previous:
+                    raise AgentContractError(
+                        "Branch interactions must form one parent-linked suffix."
+                    )
+                if interaction_id in branch_suffixes:
+                    raise AgentContractError(
+                        "A branch-local interaction cannot belong to two suffixes."
+                    )
+                branch_suffixes.add(interaction_id)
+                previous = interaction_id
+            expected_parent = branch_parents.setdefault(
+                branch.group_id, branch.parent_interaction_id
+            )
+            if expected_parent != branch.parent_interaction_id:
+                raise AgentContractError(
+                    "Branches in one group must start from the same parent interaction."
+                )
 
     @property
     def trainable(self) -> bool:
@@ -769,8 +890,7 @@ class InteractionScorer(Protocol):
 class FailureClassifier(Protocol):
     """Map an adapter exception to a stable episode status and optional message."""
 
-    def classify(self, stage: str, error: BaseException, episode: EpisodeResult):
-        ...
+    def classify(self, stage: str, error: BaseException, episode: EpisodeResult): ...
 
 
 class SampleAcceptance(Protocol):

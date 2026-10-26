@@ -29,21 +29,20 @@ def filter_agent_groups(trajectories):
     Equal terminal rewards do not make a process-reward episode uninformative.
     Process rewards are consumed independently of scalar reward normalization.
     """
-    informative = {t.group_id for t in filter_informative_groups(trajectories)}
+    informative = {
+        t.comparison_group_id for t in filter_informative_groups(trajectories)
+    }
     informative.update(
-        t.group_id
+        t.comparison_group_id
         for t in trajectories
-        if (
-            t.token_rewards is not None
-            and any(t.token_rewards)
-        )
+        if (t.token_rewards is not None and any(t.token_rewards))
     )
     informative.update(
-        t.group_id
+        t.comparison_group_id
         for t in trajectories
         if t.token_advantages is not None and any(t.token_advantages)
     )
-    return [t for t in trajectories if t.group_id in informative]
+    return [t for t in trajectories if t.comparison_group_id in informative]
 
 
 if TYPE_CHECKING:
@@ -147,7 +146,9 @@ class AgentTrainingLoop:
                 progress.update(1)
         if not episodes:
             raise ValueError("Agent evaluation dataset is empty.")
-        self.last_eval_batch = AgentRolloutBatch(episodes, trajectories, dropped, exports=exports, groups=groups)
+        self.last_eval_batch = AgentRolloutBatch(
+            episodes, trajectories, dropped, exports=exports, groups=groups
+        )
         metrics = self.last_eval_batch.metrics(prefix="eval/agent")
         metrics.update(
             evaluation_metrics(episodes, pass_ks=self.config.evaluation.pass_ks)
@@ -185,7 +186,7 @@ class AgentTrainingLoop:
         """
         config = self.trainer.args
         snapshot = await self.snapshot_factory()
-        episodes, accepted, exports, groups = [], [], [], {}
+        episodes, accepted, exports, groups, branch_groups = [], [], [], {}, {}
         self.last_train_snapshot = snapshot
         group_count, empty_batches, dropped, refills = 0, 0, 0, 0
         collection_count = 0
@@ -214,15 +215,26 @@ class AgentTrainingLoop:
                 generated = filter_agent_groups(generated)
             accepted.extend(generated)
             accepted_ids = {t.rollout_id for t in generated}
-            exports.extend(e for e in batch.exports if e.logical_rollout_id in accepted_ids)
+            exports.extend(
+                e for e in batch.exports if e.logical_rollout_id in accepted_ids
+            )
             groups.update(batch.groups)
+            branch_groups.update(batch.branch_groups)
             group_count += len({t.group_id for t in generated})
             empty_batches = 0 if generated else empty_batches + 1
             if empty_batches >= config.max_empty_batches:
                 raise RuntimeError(
                     "Agent dynamic sampling found too many uninformative groups."
                 )
-        return AgentRolloutBatch(episodes, accepted, dropped, refills, exports, groups)
+        return AgentRolloutBatch(
+            episodes,
+            accepted,
+            dropped,
+            refills,
+            exports,
+            groups,
+            branch_groups,
+        )
 
     async def train(self) -> PPOState:
         """Run collection, updates, configured evaluations, and final saving.
