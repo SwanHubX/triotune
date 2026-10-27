@@ -12,13 +12,8 @@ import hashlib
 from dataclasses import replace
 
 from ...trainer.ppo.trajectory import Trajectory
-from ..training.rewards import _aggregate_assignment_data
+from ..training.rewards import _project_score
 from ..types import AgentContractError, EpisodeResult, EpisodeScore, RolloutExport
-
-
-def _structured_reward_data(score):
-    """Aggregate structured submissions while retaining target positions."""
-    return _aggregate_assignment_data(score.assignments)
 
 
 class EpisodeTrajectoryBuilder:
@@ -472,12 +467,17 @@ class EpisodeTrajectoryBuilder:
         logprobs, masks, turns, process_rewards, action_keys = [], [], [], [], []
         direct_advantages = []
         score = episode.score
-        if any(index >= len(episode.turns) for index in score.process_rewards):
-            raise AgentContractError("Process rewards refer to an unknown turn.")
-        structured_outcome, structured_process, structured_advantages = (
-            _structured_reward_data(score)
+        # Trace and training consume the same raw projection. Shaping,
+        # normalization, GAE, and loss weights remain owned by the PPO layer.
+        reward, projected_rewards, projected_advantages = _project_score(
+            score, episode.turns
         )
-        reward = score.reward + structured_outcome
+        # Preserve the distinction between an explicitly submitted zero
+        # process signal and the absence of process supervision.
+        has_process_rewards = bool(score.process_rewards) or any(
+            assignment.mode == "reward" and assignment.target != "trajectory"
+            for assignment in score.assignments
+        )
         for index, turn in enumerate(episode.turns):
             prompt = list(turn.prompt_tokens)
             if prompt[: len(full)] != full:
@@ -495,39 +495,8 @@ class EpisodeTrajectoryBuilder:
             direct_advantages.extend([0.0] * len(gap))
             action_keys.extend([None] * len(gap))
             generation = turn.generation
-            # Missing process scores mean no extra process reward for this
-            # turn. A supplied vector must cover its original output, including
-            # any generated EOS tokens, without interpolation or re-tokenizing.
-            rewards = list(
-                score.process_rewards.get(index, (0.0,) * len(generation.tokens))
-            )
-            if len(rewards) != len(generation.tokens):
-                raise AgentContractError(
-                    "Process rewards must align with original output tokens."
-                )
-            for token_index in range(len(rewards)):
-                if token_index == len(rewards) - 1:
-                    rewards[token_index] += sum(
-                        structured_process.get((target, index), 0.0)
-                        for target in ("turn", "interaction")
-                    )
-                rewards[token_index] += structured_process.get(
-                    ("token", (index, token_index)), 0.0
-                )
-            # A trajectory advantage is already an estimator output, not a
-            # terminal reward. Broadcast it without GAE/discount propagation;
-            # physical fragment masks prevent repeated context gradients.
-            direct = [structured_advantages.get(("trajectory", None), 0.0)] * len(
-                generation.tokens
-            )
-            direct[-1] += sum(
-                structured_advantages.get((target, index), 0.0)
-                for target in ("turn", "interaction")
-            )
-            for token_index in range(len(direct)):
-                direct[token_index] += structured_advantages.get(
-                    ("token", (index, token_index)), 0.0
-                )
+            rewards = projected_rewards[index]
+            direct = projected_advantages[index]
             full.extend(generation.tokens)
             logprobs.extend(generation.logprobs)
             masks.extend([True] * len(generation.tokens))
@@ -547,9 +516,7 @@ class EpisodeTrajectoryBuilder:
             group_id=episode.group_id,
             loss_mask=masks,
             turn_ids=turns,
-            token_rewards=(
-                process_rewards if score.process_rewards or structured_process else None
-            ),
+            token_rewards=(process_rewards if has_process_rewards else None),
             token_advantages=direct_advantages if any(direct_advantages) else None,
             truncated=episode.status in {"max_turns", "token_limit", "context_limit"},
             reward_components={**score.components, "success": float(score.success)},

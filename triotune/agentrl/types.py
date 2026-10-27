@@ -360,8 +360,11 @@ class Interaction:
     ``turn`` references the original generation, parsed action, and partial
     tool results; it is absent when sampling never produced a valid generation.
     Latency covers sampling and tools, including bounded retry backoff, but not
-    terminal episode scoring. Reward stores the terminal score only on the
-    final interaction and stores dense process rewards on their actual turn.
+    terminal episode scoring. ``reward`` is the raw local total, equal to
+    ``outcome_reward + sum(process_rewards)``. Outcome is recorded only on the
+    last generated interaction; process rewards and direct advantages retain
+    their original output-token offsets. These are scorer signals before PPO
+    shaping, normalization, and GAE, not critic returns or extra reward sources.
     """
 
     context: ExecutionContext
@@ -374,6 +377,10 @@ class Interaction:
     retries: list[RetryEvent] = field(default_factory=list)
     status: str = "running"
     resource_owner: str = "runner"
+    # Append optional diagnostic fields to preserve positional construction of
+    # existing Interaction records. Direct advantages never enter reward.
+    outcome_reward: float = 0.0
+    token_advantages: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.context.interaction_id is None:
@@ -401,9 +408,22 @@ class Interaction:
                     "Interaction spans must match its original request and generation."
                 )
         if not all(
-            math.isfinite(value) for value in (self.reward, *self.process_rewards)
+            math.isfinite(value)
+            for value in (
+                self.reward,
+                self.outcome_reward,
+                *self.process_rewards,
+                *self.token_advantages,
+            )
         ):
             raise AgentContractError("Interaction rewards must be finite.")
+        if self.turn is not None and any(
+            vector and len(vector) != len(self.turn.generation.tokens)
+            for vector in (self.process_rewards, self.token_advantages)
+        ):
+            raise AgentContractError(
+                "Interaction reward vectors must align with original output tokens."
+            )
 
     @property
     def interaction_id(self) -> str:
@@ -539,16 +559,19 @@ class ToolResultEvent(AgentEvent):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RewardEvent(AgentEvent):
-    """A terminal or token-aligned process score attached to an interaction.
+    """A raw local reward total with separate outcome/process/advantage views.
 
     These records are observations of scorer decisions, not an additional
     reward source. Export consumes EpisodeScore exactly once and never sums
-    event payloads into that score a second time.
+    event payloads into that score a second time. ``reward`` already includes
+    ``outcome_reward`` and ``process_rewards``; token_advantages are policy-only.
     """
 
     kind: str = field(default="reward", init=False)
     reward: float
     process_rewards: tuple[float, ...] = ()
+    outcome_reward: float = 0.0
+    token_advantages: tuple[float, ...] = ()
 
 
 @dataclass(slots=True)

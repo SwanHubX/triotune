@@ -46,6 +46,33 @@ Their timestamps are process-local monotonic seconds. Reward events describe
 scorer output; they are not added to the reward a second time. JSONL episode
 records include interactions, events, and export metadata.
 
+Interaction and RewardEvent reward fields share the exporter's raw projection:
+
+- `outcome_reward` includes `EpisodeScore.reward` and structured trajectory
+  rewards, and is attached only to the last generated interaction.
+- `process_rewards` merges legacy process vectors and structured interaction,
+  turn, and token rewards after their declared aggregation and discount. Turn
+  and interaction scalars are placed on that generation's last output token.
+- `token_advantages` records policy-only assignments separately, including
+  trajectory advantages broadcast to original model-output tokens.
+- `reward` is the raw local total: `outcome_reward + sum(process_rewards)`.
+  It already includes both components; do not add the component views to it.
+
+These values precede PPO shaping, candidate normalization, GAE, KL penalties,
+and loss weighting. They are not expected to equal normalized advantages or
+critic returns. Fragment export retains the same per-action source values while
+masking repeated context; branch-local outcomes remain in the branch records
+and replace the episode outcome according to the branch export contract.
+
+Reward views are committed only after scoring and token alignment validation
+succeed. Exact retries of `EpisodeRunner.submit_reward(episode, score)` reuse
+the committed result without appending events, including after collector export;
+different content for an already committed episode raises `AgentContractError`.
+Rescoring requires a separate record, so an existing trace cannot disagree with
+already exported training rows. Optional diagnostic fields were appended to
+Interaction and RewardEvent; existing positional Interaction arguments retain
+their order. SDK provider traces continue to use their separate session format.
+
 ## Export and group policy
 
 ```python

@@ -151,6 +151,65 @@ def _aggregate_assignment_data(assignments, rollout_ids=None):
     return outcome, process, direct
 
 
+def _project_score(score, turns):
+    """Project one score onto original output tokens for both export and trace.
+
+    Interaction/turn scalars belong on the last generated token, token signals
+    retain their exact offsets, and trajectory advantages broadcast over model
+    output only. Return the outcome separately: PPO places it after candidate
+    normalization, while trace attaches it to the last generated interaction.
+    Neither consumer may treat a direct advantage as a critic reward.
+    """
+    outcome, process, direct = _aggregate_assignment_data(score.assignments)
+    if any(index >= len(turns) for index in score.process_rewards):
+        raise AgentContractError("Process rewards refer to an unknown turn.")
+    for target, position in (*process, *direct):
+        if target == "trajectory":
+            continue
+        index, offset = position if target == "token" else (position, None)
+        if index >= len(turns) or (
+            offset is not None and offset >= len(turns[index].generation.tokens)
+        ):
+            raise AgentContractError(
+                "Reward assignment refers to an unknown output token or turn."
+            )
+
+    rewards, advantages = [], []
+    for index, turn in enumerate(turns):
+        count = len(turn.generation.tokens)
+        row = list(score.process_rewards.get(index, (0.0,) * count))
+        if len(row) != count:
+            raise AgentContractError(
+                "Process rewards must align with original output tokens."
+            )
+        row[-1] += sum(
+            process.get((target, index), 0.0) for target in ("turn", "interaction")
+        )
+        advantage = [direct.get(("trajectory", None), 0.0)] * count
+        advantage[-1] += sum(
+            direct.get((target, index), 0.0) for target in ("turn", "interaction")
+        )
+        for offset in range(count):
+            row[offset] += process.get(("token", (index, offset)), 0.0)
+            advantage[offset] += direct.get(("token", (index, offset)), 0.0)
+        rewards.append(tuple(row))
+        advantages.append(tuple(advantage))
+    outcome += score.reward
+    # Validate before a ledger or event list is changed. A finite submission
+    # can still overflow when combined with another source or legacy vector.
+    if not all(
+        math.isfinite(value)
+        for value in (
+            outcome,
+            *(value for row in rewards + advantages for value in row),
+            *(sum(row) for row in rewards),
+            outcome + sum(rewards[-1]) if rewards else outcome,
+        )
+    ):
+        raise AgentContractError("Projected rewards and advantages must be finite.")
+    return outcome, rewards, advantages
+
+
 def _assignment_vectors(outcome, process, direct):
     """Keep legacy per-turn vectors and expose trajectory advantage at None."""
 

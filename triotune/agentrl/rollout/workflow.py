@@ -926,7 +926,10 @@ class AgentRolloutWorkflow:
             row.fragment_id: row.interaction_ids for row in accepted
         }
         exported.metadata["shared_prefix_policy"] = self.shared_prefix_policy
+        # Export annotations augment execution evidence. Keep reward commit
+        # markers so delayed retries cannot append duplicate RewardEvents.
         episode.export_metadata = {
+            **episode.export_metadata,
             "logical_rollout_id": exported.logical_rollout_id,
             "group_id": exported.group_id,
             "fragment_map": dict(exported.fragment_map),

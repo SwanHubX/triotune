@@ -23,7 +23,7 @@ from pytrio import PyTrioError
 
 from ..config import RetryPolicy
 from ..rollout.trajectory import EpisodeTrajectoryBuilder
-from ..training.rewards import RewardAssignment, RewardLedger
+from ..training.rewards import RewardAssignment, RewardLedger, _project_score
 from ..types import (
     SYSTEM_STATUSES,
     ActionParseError,
@@ -332,26 +332,44 @@ class EpisodeRunner:
 
     async def submit_reward(self, episode, score=None):
         """Submit a delayed score exactly once and emit interaction evidence."""
-        if score is None and episode.export_metadata.get("reward_submitted"):
+        if episode.export_metadata.get("reward_submitted"):
+            if score is not None and score != episode.score:
+                raise AgentContractError(
+                    "Episode reward was already submitted with different content."
+                )
             return episode.score
         if score is None:
             score = await self.scorer.score({}, episode)
         score.__post_init__()
+        # Use the exporter's raw token projection before committing anything.
+        # Structured interaction/turn/token signals must not disappear from
+        # trace, and malformed positions must not leave partial reward events.
+        outcome, rewards, advantages = _project_score(score, episode.turns)
+        generated = [item for item in episode.interactions if item.turn is not None]
+        if generated and len(generated) != len(episode.turns):
+            raise AgentContractError("Interactions must identify every generated turn.")
         self.reward_ledger.submit(
             score.assignments, logical_rollout_id=episode.rollout_id
         )
         episode.score = score
         episode.export_metadata["reward_submitted"] = True
-        for index, interaction in enumerate(episode.interactions):
-            interaction.reward = (
-                score.reward if index == len(episode.interactions) - 1 else 0.0
-            )
-            interaction.process_rewards = score.process_rewards.get(index, ())
+        for index, interaction in enumerate(generated):
+            # Outcome is one episode observation, not one reward per turn.
+            # The scalar is a summary of the separate outcome/process fields;
+            # consumers must not add those views together again. Direct
+            # advantages remain separate so diagnostic sums cannot imply a
+            # reward or critic target that PPO never received.
+            interaction.outcome_reward = outcome if index == len(generated) - 1 else 0.0
+            interaction.process_rewards = rewards[index]
+            interaction.token_advantages = advantages[index]
+            interaction.reward = interaction.outcome_reward + sum(rewards[index])
             episode.events.append(
                 RewardEvent(
                     context=interaction.context,
                     reward=interaction.reward,
                     process_rewards=interaction.process_rewards,
+                    outcome_reward=interaction.outcome_reward,
+                    token_advantages=interaction.token_advantages,
                 )
             )
         return score
@@ -447,7 +465,6 @@ class EpisodeRunner:
                                 position=(index, token_index),
                             )
                         )
-                interaction.reward = result.reward
                 continue
             if not isinstance(result, (tuple, list)):
                 result = (result,)
