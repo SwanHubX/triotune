@@ -10,7 +10,7 @@ import asyncio
 import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -20,7 +20,7 @@ from tqdm import tqdm
 from ..api.cli_args import OPDConfig
 from ..api.client_api import call_async, optimizer_params
 from ..dataset import prepare_prompt
-from ..utils.checkpoint import save_checkpoint_async
+from ..utils.checkpoint import TrainingCheckpoint, save_checkpoint_async, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
@@ -415,8 +415,17 @@ class OPDTrainer:
         self.eval_dataset = eval_dataset
         self.state = OPDState()
         self._last_eval_step: int | None = None
+        self._checkpoint = TrainingCheckpoint(
+            self.args, "opd", train_dataset, eval_dataset,
+            identity={"model": self.model, "lora_rank": lora_rank,
+                      "teachers": [asdict(spec) for spec in teacher_specs],
+                      "teacher_groups": self.teacher_groups, "teacher_group_key": teacher_group_key},
+        )
+        if self._checkpoint.enabled and execution_plan is not None:
+            raise ValueError("Complete checkpoints require the built-in OPD execution plan.")
+        self._checkpoint.bind_loop()
         self._service_client = trio.ServiceClient()
-        self._training_client = self._service_client.create_lora_training_client(
+        self._training_client = self._checkpoint.create_client(self._service_client,
             base_model=self.model, rank=lora_rank, seed=self.args.seed,
         )
         self._tokenizer = self._training_client.get_tokenizer()
@@ -467,6 +476,8 @@ class OPDTrainer:
             },
             logging_step=self.args.logging_step,
         )
+
+        self._checkpoint.restore(self)
 
     # ------------------------------------------------------------------
     # Re-entrancy and failure-state guard
@@ -560,6 +571,7 @@ class OPDTrainer:
             error_method="save_state",
         )
         self.state.checkpoint_path = path
+        self._checkpoint.remote_saved(self, publish=False)
         return path
 
     def _log(self, metrics: dict[str, float]) -> None:
@@ -584,14 +596,15 @@ class OPDTrainer:
 
         self._metrics_api.flush(step=self.state.global_step)
 
-    def _finish_run(self, state: str, error: str | None = None) -> None:
+    def _finish_run(self, state: str, error: str | None = None, *, flush: bool = True) -> None:
         """Close SwanLab once and clear the owned run handle."""
 
-        self._metrics_api.finish(state=state, error=error)
+        self._metrics_api.finish(state=state, error=error, flush=flush)
 
     async def _step_async(self, rows: Sequence[Mapping[str, Any]]) -> OPDResult:
         """Execute one fresh-rollout OPD update without taking the public lock."""
 
+        self._checkpoint.require_training_loop()
         started = time.perf_counter()
         prompts = await asyncio.to_thread(self._prompts, rows)
         prepared = time.perf_counter()
@@ -615,6 +628,7 @@ class OPDTrainer:
             optimizer_params(self.args, trio.AdamParams),
         )
         self.state.global_step += 1
+        self.state.optimizer_steps += 1
         self.state.behavior_policy_version += 1
         self._sampling_seed_offset += len(prompts)
         self._student_sampler = None
@@ -653,12 +667,6 @@ class OPDTrainer:
                 self.args.importance_ratio_cap
             )
         checkpoint_path = None
-        save_started = time.perf_counter()
-        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
-            checkpoint_path = await self._save_state_async()
-        metrics["time/checkpoint"] = time.perf_counter() - save_started
-        metrics["time/step"] = time.perf_counter() - started
-        metrics["time/tokens_per_second"] = input_tokens / metrics["time/step"]
         self._total_tokens += input_tokens
         self._sample_input_tokens += sample_input_tokens
         self._sample_output_tokens += sample_output_tokens
@@ -677,7 +685,14 @@ class OPDTrainer:
             }
         )
         self.state.metrics = metrics
+        save_started = time.perf_counter()
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            checkpoint_path = await self._save_state_async()
+        metrics["time/checkpoint"] = time.perf_counter() - save_started
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = input_tokens / metrics["time/step"]
         self._log(metrics)
+        self._checkpoint.publish(self)
         return OPDResult(self.state.global_step, metrics, len(datums), version, checkpoint_path)
 
     # ------------------------------------------------------------------
@@ -770,8 +785,10 @@ class OPDTrainer:
     # Full dataset training and synchronous facades
     # ------------------------------------------------------------------
 
-    async def train_async(self) -> OPDState:
+    async def train_async(self, *, stop_after_step: int | None = None) -> OPDState:
         """Consume one pass of the dataset, with strictly fresh rollouts per update."""
+        limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+        self._checkpoint.begin()
         self._enter()
         started = time.perf_counter()
         initial_step, initial_tokens = self.state.global_step, self._total_tokens
@@ -785,13 +802,11 @@ class OPDTrainer:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
             if (
-                self.eval_dataset is not None
-                and self.args.eval_before_train
-                and self._last_eval_step is None
+                self._checkpoint.evaluation_due(self, self._last_eval_step)
             ):
                 await self._evaluate_async(self.eval_dataset)
-            batches = iter_batches(self.train_dataset, self.args.batch_size)
-            while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
+            batches = iter_batches(self._checkpoint.rows(self), self.args.batch_size)
+            while limit is None or self.state.global_step < limit:
                 rows = next(batches, None)
                 if not rows:
                     break
@@ -817,6 +832,7 @@ class OPDTrainer:
                     and self._last_eval_step != self.state.global_step
                 ):
                     await self._evaluate_async(self.eval_dataset)
+                    self._checkpoint.publish(self)
             if self.state.global_step > initial_step:
                 if not self.args.save_every or self.state.global_step % self.args.save_every:
                     await self._save_state_async()
@@ -840,7 +856,8 @@ class OPDTrainer:
                     ),
                 }
                 self.state.metrics.update(summary)
-                self._flush_log()
+                if not paused:
+                    self._flush_log()
                 self._metrics_api.publish(summary, step=self.state.global_step)
                 self._metrics_api.log_text(
                     key="checkpoint/path",
@@ -849,28 +866,33 @@ class OPDTrainer:
                 )
             if (
                 self.eval_dataset is not None
+                and not paused
                 and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 await self._evaluate_async(self.eval_dataset)
+            if self.state.checkpoint_path is not None:
+                self._checkpoint.publish(self)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise
         else:
-            self._flush_log()
-            self._finish_run("success")
+            if not paused:
+                self._flush_log()
+            self._finish_run("success", flush=not paused)
         finally:
             self._busy = False
+            self._checkpoint.end()
             progress.close()
         return self.state
 
-    def _run_sync(self, method: Any, *args: Any) -> Any:
+    def _run_sync(self, method: Any, *args: Any, **kwargs: Any) -> Any:
         """Run an async public entry point when no event loop is active."""
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(method(*args))
+            return asyncio.run(method(*args, **kwargs))
         raise RuntimeError(
             "Use await step_async()/train_async()/evaluate_async() inside an existing event loop."
         )
@@ -879,6 +901,6 @@ class OPDTrainer:
         """Synchronous entry point for step_async()."""
         return self._run_sync(self.step_async, rows)
 
-    def train(self) -> OPDState:
+    def train(self, *, stop_after_step: int | None = None) -> OPDState:
         """Synchronous entry point for train_async()."""
-        return self._run_sync(self.train_async)
+        return self._run_sync(self.train_async, stop_after_step=stop_after_step)

@@ -403,12 +403,31 @@ class CheckpointConfig:
             Interval measured in completed trainer updates. Zero disables
             periodic saves; trainers still create their documented final
             checkpoint so a successful run always exposes its result.
+        state_dir (`str` or `None`, default `None`):
+            Local directory for versioned JSON runtime manifests paired with
+            the remote model/optimizer snapshots. Complete mode requires fixed,
+            sized random-access training and evaluation datasets. SFT drains
+            each submitted update; agent rollout prefetch is unsupported.
+        resume_from (`str` or `None`, default `None`):
+            Path to a complete JSON manifest. Restore both remote optimizer
+            state and local data/RNG/accounting progress; bare weight URIs are
+            insufficient. Model, optimizer, evaluation and ordered data identity
+            must match. max_steps is the total target, not extra update count.
     """
 
     save_every: int = 0
+    # Complete local state is opt-in so existing streaming recipes keep their
+    # remote-only save contract. A manifest is required to restore optimizer,
+    # cursor, evaluation, random streams, and accounting as one transaction.
+    state_dir: str | None = None
+    resume_from: str | None = None
 
     def __post_init__(self) -> None:
         _integer("save_every", self.save_every, minimum=0)
+        for name in ("state_dir", "resume_from"):
+            value = getattr(self, name)
+            if value is not None:
+                _non_empty_string(f"checkpoint.{name}", value)
 
 
 @dataclass(slots=True)

@@ -13,7 +13,12 @@ from ..api.client_api import (
     wait,
     wait_async,
 )
-from .checkpoint import checkpoint_path, save_checkpoint, save_checkpoint_async
+from .checkpoint import (
+    checkpoint_path,
+    load_training_checkpoint,
+    save_checkpoint,
+    save_checkpoint_async,
+)
 from .dataloader import iter_batches
 from .datums import causal_datum, materialize_datum, materialize_model_input
 from .metrics import MetricsAPI, metric_name, normalize_metrics
@@ -34,6 +39,7 @@ __all__ = [
     "call_async",
     "causal_datum",
     "checkpoint_path",
+    "load_training_checkpoint",
     "client",
     "completion_logprobs",
     "compute_sample_tokens",

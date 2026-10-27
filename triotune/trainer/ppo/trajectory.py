@@ -373,3 +373,5 @@ class PPOState:
     checkpoint_path: str | None = None
     critic_optimizer_steps: int = 0
     critic_checkpoint_path: str | None = None
+    data_cursor: int = 0
+    checkpoint_manifest_path: str | None = None

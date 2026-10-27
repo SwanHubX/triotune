@@ -15,6 +15,7 @@ from ..api.cli_args import SFTConfig
 from ..api.client_api import call_async, optimizer_params, submit_async, wait_async
 from ..api.loss_api import BuiltinPyTrioObjective, LossSpec, SupervisedLossInput
 from ..dataset import SupervisedExample, prepare_sft
+from ..utils.checkpoint import TrainingCheckpoint, checkpoint_path, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import compute_train_tokens
@@ -58,7 +59,12 @@ class SFTTrainer:
         self.model = model.strip()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
-        self._client = trio.ServiceClient().create_lora_training_client(
+        self._checkpoint = TrainingCheckpoint(
+            self.args, "sft", train_dataset, eval_dataset,
+            identity={"model": self.model, "lora_rank": lora_rank},
+        )
+        self._checkpoint.bind_loop()
+        self._client = self._checkpoint.create_client(trio.ServiceClient(),
             base_model=self.model, rank=lora_rank, seed=self.args.seed
         )
         self._tokenizer = self._client.get_tokenizer()
@@ -72,6 +78,8 @@ class SFTTrainer:
             metadata={"model": self.model, "lora_rank": lora_rank},
             logging_step=self.args.logging_step,
         )
+
+        self._checkpoint.restore(self)
 
     # ------------------------------------------------------------------
     # Dataset conversion
@@ -214,6 +222,7 @@ class SFTTrainer:
         after the previous batch task, preserving monotonically ordered logs.
         """
 
+        self._checkpoint.require_training_loop()
         if not rows:
             raise ValueError("An SFT step requires at least one row.")
         started = time.perf_counter()
@@ -282,8 +291,9 @@ class SFTTrainer:
                 metrics["time/train"] = now - clock[0]
                 clock[1] = now
             if save_future is not None:
-                self.state.checkpoint_path = (await wait_async(save_future)).path
+                self.state.checkpoint_path = checkpoint_path(await wait_async(save_future))
             self.state.global_step = step
+            self.state.optimizer_steps = step
             self.state.metrics = metrics
             self._metrics_api.record(
                 metrics,
@@ -298,6 +308,8 @@ class SFTTrainer:
                     if name in metrics
                 },
             )
+            if save_future is not None:
+                self._checkpoint.remote_saved(self)
             return metrics
 
         return asyncio.create_task(collect())
@@ -310,18 +322,21 @@ class SFTTrainer:
             "save_state",
             name=f"sft-step-{self.state.global_step:08d}",
         )
-        self.state.checkpoint_path = saved.path
+        self.state.checkpoint_path = checkpoint_path(saved)
+        self._checkpoint.remote_saved(self)
 
     # ------------------------------------------------------------------
     # Full dataset training
     # ------------------------------------------------------------------
 
-    async def train(self) -> SFTState:
+    async def train(self, *, stop_after_step: int | None = None) -> SFTState:
         """Consume one dataset pass while bounding outstanding remote batches."""
 
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
-        batches = iter_batches(self.train_dataset, self.args.batch_size)
+        limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+        self._checkpoint.begin()
+        batches = iter_batches(self._checkpoint.rows(self), self.args.batch_size)
         progress = tqdm(
             total=self.args.max_steps,
             initial=self.state.global_step,
@@ -355,13 +370,13 @@ class SFTTrainer:
 
         try:
             if (
-                self.eval_dataset is not None
-                and self.args.eval_before_train
-                and self._last_eval_step is None
+                self._checkpoint.evaluation_due(self, self._last_eval_step)
             ):
                 await self.evaluate()
-            while self.args.max_steps is None or submitted < self.args.max_steps:
-                if len(pending) >= self.args.max_in_flight:
+            while limit is None or submitted < limit:
+                # Complete checkpoints serialize submissions so local cursor/RNG
+                # state cannot describe work queued beyond the saved optimizer.
+                if len(pending) >= (1 if self._checkpoint.enabled else self.args.max_in_flight):
                     await pending.pop(0)
                 while pending and pending[0].done():
                     pending.pop(0).result()
@@ -383,6 +398,7 @@ class SFTTrainer:
                     await asyncio.gather(*pending)
                     pending.clear()
                     await self.evaluate()
+                    self._checkpoint.publish(self)
             await asyncio.gather(*pending)
             if self.state.global_step and (
                 not self.args.save_every or self.state.global_step % self.args.save_every
@@ -390,6 +406,7 @@ class SFTTrainer:
                 await self._save_state()
             if (
                 self.eval_dataset is not None
+                and not paused
                 and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
@@ -416,7 +433,9 @@ class SFTTrainer:
                     data=self.state.checkpoint_path,
                     step=self.state.global_step,
                 )
-            self._metrics_api.finish()
+            if self.state.checkpoint_path is not None:
+                self._checkpoint.publish(self)
+            self._metrics_api.finish(flush=not paused)
         except BaseException as error:
             for task in pending:
                 task.cancel()
@@ -424,5 +443,6 @@ class SFTTrainer:
             self._metrics_api.finish(state="crashed", error=str(error))
             raise
         finally:
+            self._checkpoint.end()
             progress.close()
         return self.state
