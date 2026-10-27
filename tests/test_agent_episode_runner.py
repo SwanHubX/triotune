@@ -39,9 +39,16 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_candidate_identity_is_available_during_scoring(self):
         policy, _ = snapshot()
         observed = []
+        first_scored = asyncio.Event()
+        second_scored = asyncio.Event()
 
         class IdentityScorer:
             async def score(self, row, episode):
+                # Exercise out-of-order callbacks without timing-based sleeps.
+                if episode.sample_index == 0:
+                    await asyncio.wait_for(second_scored.wait(), timeout=5)
+                elif episode.sample_index == 2:
+                    await asyncio.wait_for(first_scored.wait(), timeout=5)
                 observed.append(
                     (
                         episode.rollout_id,
@@ -51,15 +58,35 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
                         episode.policy_version,
                     )
                 )
+                if episode.sample_index == 1:
+                    second_scored.set()
+                elif episode.sample_index == 0:
+                    first_scored.set()
                 return EpisodeScore(0.0, False)
 
         workflow = calculator_workflow()
+        workflow.max_concurrency = 3
         workflow.runner.scorer = IdentityScorer()
         batch = await workflow.collect(
             calculator_rows()[:1], policy, n_samples=3, strict=False
         )
 
-        self.assertEqual([item[2] for item in observed], [0, 1, 2])
+        # Scoring may finish out of order; each identity must still match its
+        # candidate, while the returned batch preserves candidate order.
+        self.assertCountEqual([item[2] for item in observed], [0, 1, 2])
+        self.assertCountEqual(
+            observed,
+            [
+                (
+                    episode.rollout_id,
+                    episode.group_id,
+                    episode.sample_index,
+                    episode.snapshot_id,
+                    episode.policy_version,
+                )
+                for episode in batch.episodes
+            ],
+        )
         self.assertEqual(len({item[0] for item in observed}), 3)
         self.assertEqual(len({item[1] for item in observed}), 1)
         self.assertNotEqual(observed[0][0], observed[0][1])
