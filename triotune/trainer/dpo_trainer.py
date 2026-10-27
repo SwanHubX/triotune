@@ -450,13 +450,18 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = self._reference_scores(pairs)
         referenced = time.perf_counter()
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         update = run_update(
             self._training_client,
             DPOObjective(reference, self.args.beta),
             datums,
-            optimizer_params(self.args, trio.AdamParams),
+            adam,
         )
         metrics = self._metrics(update.forward, update.optimizer)
+        metrics["optim/lr"] = adam.learning_rate
         metrics.update({
             "data/tokens": compute_train_tokens(datums),
             "time/prepare": prepared - started,
@@ -476,13 +481,18 @@ class DPOTrainer:
         prepared = time.perf_counter()
         reference = await self._reference_scores_async(pairs)
         referenced = time.perf_counter()
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         update = await run_update_async(
             self._training_client,
             DPOObjective(reference, self.args.beta),
             datums,
-            optimizer_params(self.args, trio.AdamParams),
+            adam,
         )
         metrics = self._metrics(update.forward, update.optimizer)
+        metrics["optim/lr"] = adam.learning_rate
         metrics.update({
             "data/tokens": compute_train_tokens(datums),
             "time/prepare": prepared - started,

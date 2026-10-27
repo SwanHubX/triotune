@@ -621,11 +621,15 @@ class OPDTrainer:
         # A failed/cancelled backward can leave partial remote gradients. Keep
         # the trainer unusable until both backward and optimizer have succeeded.
         self._requires_restart = True
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         update = await run_update_async(
             self._training_client,
             self._objective,
             datums,
-            optimizer_params(self.args, trio.AdamParams),
+            adam,
         )
         self.state.global_step += 1
         self.state.optimizer_steps += 1
@@ -653,7 +657,7 @@ class OPDTrainer:
         )
         metrics.update(
             {
-                "optim/lr": self.args.learning_rate,
+                "optim/lr": adam.learning_rate,
                 "data/input_tokens": float(input_tokens),
                 "time/prepare": prepared - started,
                 "time/snapshot": snapshotted - prepared,

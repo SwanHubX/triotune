@@ -8,6 +8,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import random
 import sys
@@ -18,6 +19,7 @@ from typing import Any
 
 from ..api.client_api import call, call_async
 from .dataloader import dataset_identity, training_rows
+from .scheduler import optimizer_horizons, scheduler_state
 
 
 def checkpoint_name(algorithm: str, step: int) -> str:
@@ -54,7 +56,7 @@ async def save_checkpoint_async(
 # ---------------------------------------------------------------------------
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 _RUNTIME_FIELDS = (
     "_last_eval_step",
     "_train_tokens",
@@ -148,11 +150,13 @@ def load_training_checkpoint(path):
         "loop",
         "reporting",
     }
+    if isinstance(payload, dict) and payload.get("format_version") == FORMAT_VERSION:
+        required.add("schedulers")
     if (
         not isinstance(payload, dict)
         or set(payload) != required
         or type(payload["format_version"]) is not int
-        or payload["format_version"] != FORMAT_VERSION
+        or payload["format_version"] not in (1, FORMAT_VERSION)
     ):
         raise ValueError("Unsupported or incomplete training checkpoint manifest.")
     _json_bytes(payload)
@@ -196,6 +200,33 @@ def load_training_checkpoint(path):
             or component["train_tokens"] < 0
         ):
             raise ValueError("Checkpoint component token accounting is invalid.")
+    if payload["format_version"] == FORMAT_VERSION:
+        if set(payload["schedulers"]) != set(payload["components"]):
+            raise ValueError("Checkpoint scheduler components are incomplete.")
+        for name, schedule in payload["schedulers"].items():
+            counter = state[
+                "critic_optimizer_steps" if name == "critic" else "optimizer_steps"
+            ]
+            if (
+                set(schedule) != {"total_steps", "optimizer_steps", "last_lr"}
+                or type(schedule["optimizer_steps"]) is not int
+                or schedule["optimizer_steps"] != counter
+            ):
+                raise ValueError(
+                    "Checkpoint scheduler counter does not match optimizer state."
+                )
+            total, rate = schedule["total_steps"], schedule["last_lr"]
+            if total is not None and (type(total) is not int or total < 1):
+                raise ValueError("Checkpoint scheduler horizon is invalid.")
+            if (counter == 0 and rate is not None) or (
+                counter > 0
+                and (
+                    type(rate) not in (int, float)
+                    or not math.isfinite(rate)
+                    or rate <= 0
+                )
+            ):
+                raise ValueError("Checkpoint scheduler learning rate is invalid.")
     if (
         "actor" not in payload["components"]
         or "python" not in payload["rng"]
@@ -308,6 +339,10 @@ class TrainingCheckpoint:
     """
 
     def __init__(self, config, algorithm, train_dataset, eval_dataset, *, identity):
+        # Resolve once from the original training plan, never from remaining
+        # rows or remaining steps after a restart. This also rejects unknown
+        # decay horizons before any trainer allocates a remote client.
+        self.optimizer_horizons = optimizer_horizons(config, train_dataset)
         self.enabled = bool(
             config.checkpoint.state_dir or config.checkpoint.resume_from
         )
@@ -325,8 +360,8 @@ class TrainingCheckpoint:
             raise ValueError("Complete checkpoints require a training dataset.")
         values = asdict(config)
         # Output destinations and save cadence do not affect optimization.
-        # The total horizon may be extended because current LRs are constant;
-        # all optimizer, rollout and evaluation controls must remain identical.
+        # Resolved decay horizons are retained separately. Constant schedules
+        # may extend the run; inferred decay horizons must remain unchanged.
         values.pop("checkpoint")
         reporting = values.pop("reporting")
         values["logging_step"] = reporting["logging_step"]
@@ -340,9 +375,28 @@ class TrainingCheckpoint:
         _json_bytes(self.identity)
         if config.checkpoint.resume_from:
             self.loaded = load_training_checkpoint(config.checkpoint.resume_from)
-            if self.loaded["algorithm"] != algorithm or self.loaded[
-                "identity"
-            ] != json.loads(_json_bytes(self.identity)):
+            previous_identity = copy.deepcopy(self.loaded["identity"])
+            if self.loaded["format_version"] == 1:
+                # P0-02 manifests describe constant LR without a scheduler
+                # module. Normalize only that historical default; changing LR
+                # or introducing warmup/decay during resume remains a mismatch.
+                old_config = previous_identity["config"]
+                optimizers = [old_config["optimizer"]]
+                if "critic" in old_config:
+                    optimizers.append(old_config["critic"]["optimizer"])
+                for optimizer in optimizers:
+                    optimizer.setdefault(
+                        "scheduler",
+                        {
+                            "type": "constant",
+                            "warmup_steps": 0,
+                            "total_steps": None,
+                            "min_lr": None,
+                        },
+                    )
+            if self.loaded["algorithm"] != algorithm or previous_identity != json.loads(
+                _json_bytes(self.identity)
+            ):
                 raise ValueError(
                     "Checkpoint configuration, model, optimizer or dataset identity does not match."
                 )
@@ -355,6 +409,41 @@ class TrainingCheckpoint:
                 raise ValueError(
                     "Checkpoint actor/critic components do not match the configuration."
                 )
+            expected_schedules = self._scheduler_states(self.loaded["state"])
+            if self.loaded["format_version"] == 1:
+                for name in expected:
+                    optimizer = (
+                        config.critic.optimizer
+                        if name == "critic"
+                        else config.optimizer
+                    )
+                    if (
+                        optimizer.scheduler.type != "constant"
+                        or optimizer.scheduler.warmup_steps
+                    ):
+                        raise ValueError(
+                            "Version 1 checkpoints require constant LR without warmup."
+                        )
+            else:
+                for name, schedule in expected_schedules.items():
+                    previous = self.loaded["schedulers"][name]
+                    lr_matches = (
+                        previous["last_lr"] is schedule["last_lr"]
+                        if schedule["last_lr"] is None
+                        else math.isclose(
+                            previous["last_lr"],
+                            schedule["last_lr"],
+                            rel_tol=1e-12,
+                            abs_tol=1e-15,
+                        )
+                    )
+                    if (
+                        previous["total_steps"] != schedule["total_steps"]
+                        or not lr_matches
+                    ):
+                        raise ValueError(
+                            "Checkpoint scheduler horizon or LR does not match the original training plan."
+                        )
             if "critic" in expected and (
                 self.loaded["components"]["critic"]["uri"]
                 != self.loaded["state"].get("critic_checkpoint_path")
@@ -379,6 +468,23 @@ class TrainingCheckpoint:
             if config.checkpoint.state_dir
             else Path(config.checkpoint.resume_from).expanduser().parent
         )
+
+    def _scheduler_states(self, state):
+        """Pair each component's schedule with its acknowledged optimizer count."""
+        result = {
+            "actor": scheduler_state(
+                self.config.optimizer,
+                state["optimizer_steps"],
+                self.optimizer_horizons["actor"],
+            )
+        }
+        if "critic" in self.optimizer_horizons:
+            result["critic"] = scheduler_state(
+                self.config.critic.optimizer,
+                state["critic_optimizer_steps"],
+                self.optimizer_horizons["critic"],
+            )
+        return result
 
     def bind_loop(self, kind="trainer", *, identity=None, owner=None):
         """Validate the application loop as well as the underlying PPO config."""
@@ -554,6 +660,7 @@ class TrainingCheckpoint:
             "identity": self.identity,
             "identity_sha256": hashlib.sha256(_json_bytes(self.identity)).hexdigest(),
             "components": components,
+            "schedulers": self._scheduler_states(state),
             "state": state,
             "runtime": {
                 key: getattr(trainer, key)

@@ -80,6 +80,9 @@ class SFTTrainer:
         )
 
         self._checkpoint.restore(self)
+        # Reserve submission indices independently of asynchronously collected
+        # results. Restarts begin at the last acknowledged optimizer count.
+        self._submitted_optimizer_steps = self.state.optimizer_steps
 
     # ------------------------------------------------------------------
     # Dataset conversion
@@ -232,11 +235,13 @@ class SFTTrainer:
         # Await submission only; result resolution happens in collect(). The
         # PyTRIO client preserves FB -> optim -> save request ordering.
         forward_future = await self._objective.submit_async(self._client, datums)
-        optim_future = await submit_async(
-            self._client,
-            "optim_step",
-            optimizer_params(self.args, trio.AdamParams),
+        optimizer_step = self._submitted_optimizer_steps + 1
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=optimizer_step,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
         )
+        optim_future = await submit_async(self._client, "optim_step", adam)
+        self._submitted_optimizer_steps = optimizer_step
         save_future = None
         if self.args.save_every and step % self.args.save_every == 0:
             save_future = await submit_async(
@@ -279,7 +284,7 @@ class SFTTrainer:
             metrics.update(
                 {
                     "train/tokens": float(token_count),
-                    "train/learning_rate": self.args.learning_rate,
+                    "train/learning_rate": adam.learning_rate,
                     "usage/train_tokens": float(train_tokens),
                     "usage/train_tokens_total": float(self._train_tokens),
                     "time/request_latency": latency,
@@ -293,7 +298,7 @@ class SFTTrainer:
             if save_future is not None:
                 self.state.checkpoint_path = checkpoint_path(await wait_async(save_future))
             self.state.global_step = step
-            self.state.optimizer_steps = step
+            self.state.optimizer_steps = optimizer_step
             self.state.metrics = metrics
             self._metrics_api.record(
                 metrics,

@@ -108,7 +108,7 @@ uv run --no-sync python train_resume.py \
 
 The script loads the cloud model and optimizer states, restores the data position and training progress, and completes steps 3 and 4. It then prints global_step=4 and the new manifest path.
 
-max_steps=4 always means 4 completed steps in total, so this resumed run performs 2 more steps. To continue to a higher total step count, you can increase max_steps.
+max_steps=4 always means 4 completed steps in total, so this resumed run performs 2 more steps. For constant LR or a schedule with scheduler.total_steps set explicitly from the first run, you can increase max_steps. Keep the original target when the decay horizon is inferred from max_steps.
 
 ## 4. Use other training entry points
 
@@ -129,7 +129,7 @@ To resume an agent, create a new AgentTrainingLoop with the same agent configura
 ## 5. Everyday usage
 
 - After an unexpected interruption, resume from the most recently generated complete JSON manifest.
-- Keep the model, LoRA rank, batch size, seed, learning rate, sampling and evaluation settings, and data content and order the same when resuming.
+- Keep the model, LoRA rank, batch size, seed, learning rate and scheduler configuration, sampling and evaluation settings, and data content and order the same when resuming.
 - Set stop_after_step above the current completed step count and no higher than max_steps. Keep the original total target when planning a pause.
 - Give each training task its own state_dir. A resumed run can continue writing to the original directory or use a new directory; when only resume_from is set, manifests continue to be written beside the original manifest.
 - When moving to another machine, bring the JSON manifest, prepare the same data and configuration, and log in with a PyTRIO account that can access the corresponding cloud checkpoint.

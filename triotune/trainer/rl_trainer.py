@@ -214,7 +214,7 @@ class PPOTrainer:
                 raise ValueError(
                     "Actor and critic must use independent training clients."
                 )
-            self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids)
+            self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids, total_steps=self._checkpoint.optimizer_horizons["critic"])
 
         # Actor and critic remain independent training clients, but one PPO
         # experiment owns one metric run with component-specific namespaces.
@@ -229,7 +229,7 @@ class PPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
-        self._actor = PPOActor(self._client, self.args, self.algorithm_plan)
+        self._actor = PPOActor(self._client, self.args, self.algorithm_plan, total_steps=self._checkpoint.optimizer_horizons["actor"])
         self._checkpoint.restore(self)
 
     async def _references(self, trajectories):
@@ -458,7 +458,7 @@ class PPOTrainer:
                     np.mean(policy_ages) if policy_ages else 0.0
                 ),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
-                "train/learning_rate": self.args.learning_rate,
+                "train/learning_rate": metrics.pop("optim/lr", self.args.learning_rate),
                 "usage/actor_train_tokens": float(actor_tokens),
                 "usage/actor_train_tokens_total": float(total_actor_tokens),
                 "usage/critic_train_tokens": float(critic_tokens),

@@ -11,6 +11,7 @@ import numpy as np
 
 from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
+from ...utils.scheduler import optimizer_horizons
 from ...utils.token_usage import compute_train_tokens
 from .advantages import PPOAlgorithmPlan, prepare_advantages
 from .datum import batch_datums, build_datum, completion_logprobs
@@ -111,12 +112,13 @@ def minibatches(batch: PreparedBatch, count: int):
 class PPOActor:
     """Prepare frozen policy targets and execute actor updates through PyTRIO."""
 
-    def __init__(self, client, config: PPOConfig, plan: PPOAlgorithmPlan | None = None):
+    def __init__(self, client, config: PPOConfig, plan: PPOAlgorithmPlan | None = None, *, total_steps: int | None = None):
         """Bind one remote training client and its immutable PPO configuration."""
 
         self.client, self.config = client, config
         self.plan = plan or getattr(config, "algorithm_plan", None)
         self.optimizer_steps = 0
+        self._lr_total_steps = total_steps if total_steps is not None else optimizer_horizons(config)["actor"]
         self.train_tokens = 0
         self.datum_provenance: tuple[dict, ...] = ()
         self.datum_prefix_groups: tuple[dict, ...] = ()
@@ -238,11 +240,11 @@ class PPOActor:
                 self.train_tokens += passes * compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
-                optimizer = await call_async(
-                    self.client, "optim_step", optimizer_params(config)
-                )
+                adam = optimizer_params(config, step=self.optimizer_steps + 1, total_steps=self._lr_total_steps)
+                optimizer = await call_async(self.client, "optim_step", adam)
                 self.optimizer_steps += 1
                 row = dict(result.metrics)
+                row["optim/lr"] = adam.learning_rate
                 if native_backend:
                     native = _native_policy_metrics(result, chunk, config)
                     diagnostics.append(
@@ -377,4 +379,7 @@ class PPOActor:
                     "policy/rejected_fraction": float(np.mean(rejected)),
                 }
             )
+        # One rollout can contain several scheduled updates. Publish the last
+        # applied LR rather than averaging distinct optimizer requests.
+        aggregated["optim/lr"] = metrics[-1]["optim/lr"]
         return aggregated

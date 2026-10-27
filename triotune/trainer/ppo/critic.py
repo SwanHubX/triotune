@@ -16,6 +16,7 @@ import numpy as np
 from ...api.client_api import call_async, optimizer_params
 from ...utils.checkpoint import save_checkpoint_async
 from ...utils.datums import materialize_datum
+from ...utils.scheduler import optimizer_horizons
 from ...utils.token_usage import compute_train_tokens
 from .datum import IGNORE_INDEX, TrainingDatums
 from .trajectory import Trajectory
@@ -221,7 +222,7 @@ class PyTRIOCritic:
     not sampled numerical answers. Their difference is an unbounded value.
     """
 
-    def __init__(self, client, config, token_ids, *, metrics=None):
+    def __init__(self, client, config, token_ids, *, metrics=None, total_steps=None):
         """Bind an independent PyTRIO client and two value marker token IDs."""
 
         self.client, self.config, self.token_ids = client, config, tuple(token_ids)
@@ -240,6 +241,7 @@ class PyTRIOCritic:
         self.metrics = metrics
         self.global_step = 0
         self.optimizer_steps = 0
+        self._lr_total_steps = total_steps if total_steps is not None else optimizer_horizons(config).get("critic")
         self.train_tokens = 0
         self.checkpoint_path = None
         self.datum_provenance: tuple[dict, ...] = ()
@@ -309,9 +311,8 @@ class PyTRIOCritic:
                 )
                 # Custom loss submits a forward, then a forward_backward.
                 self.train_tokens += 2 * compute_train_tokens(data)
-                optimizer = await call_async(
-                    self.client, "optim_step", optimizer_params(self._optimizer_config)
-                )
+                adam = optimizer_params(self._optimizer_config, step=self.optimizer_steps + 1, total_steps=self._lr_total_steps)
+                optimizer = await call_async(self.client, "optim_step", adam)
                 self.optimizer_steps += 1
                 row = {
                     key: float(value)
@@ -379,7 +380,7 @@ class PyTRIOCritic:
         metrics.update(
             {
                 "critic/optimizer_steps": float(self.optimizer_steps),
-                "critic/learning_rate": self._optimizer_config.learning_rate,
+                "critic/learning_rate": adam.learning_rate,
                 "critic/action_tokens": float(sum(sum(mask) for mask in masks)),
                 "time/critic_update": time.perf_counter() - start,
             }

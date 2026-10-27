@@ -108,7 +108,7 @@ uv run --no-sync python train_resume.py \
 
 脚本会加载云端模型和优化器状态，恢复数据位置与训练进度，继续完成第 3、4 步。完成后打印 global_step=4 和新的清单路径。
 
-max_steps=4 始终表示总共完成 4 步，恢复后本次还需执行 2 步。希望继续训练到更大的总步数时，可以提高 max_steps。
+max_steps=4 始终表示总共完成 4 步，恢复后本次还需执行 2 步。固定 LR 或从第一次训练就显式设置 scheduler.total_steps 的调度，可以提高 max_steps；由 max_steps 自动推导衰减总步数时，保持原目标不变。
 
 ## 4. 在其他训练入口中使用
 
@@ -129,7 +129,7 @@ agent 恢复时，使用相同的 agent 配置和 workflow 创建新的 AgentTra
 ## 5. 日常使用要点
 
 - 意外中断后，使用最近一次成功生成的 JSON 清单恢复。
-- 恢复时保持模型、LoRA rank、batch size、seed、学习率、采样与评估设置以及数据内容和顺序一致。
+- 恢复时保持模型、LoRA rank、batch size、seed、学习率与调度配置、采样与评估设置以及数据内容和顺序一致。
 - stop_after_step 应大于当前已完成的步数，并且不超过 max_steps。预先安排暂停时，保持原来的总目标步数。
 - 每个训练任务使用独立的 state_dir。恢复后可以继续写入原目录，也可以设置新的保存目录；只设置 resume_from 时，清单继续写入原清单所在目录。
 - 换机器时，携带 JSON 清单并准备相同的数据和配置，使用能访问对应云端 checkpoint 的 PyTRIO 账号登录。
