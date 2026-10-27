@@ -242,11 +242,11 @@ class SDKWorkflowAudit(unittest.IsolatedAsyncioTestCase):
     async def test_builtin_workflow_honors_total_token_budget(self):
         workflow, chat = sdk_workflow()
         async with workflow:
-            result = await workflow.run("2+3", max_generated_tokens=2)
+            with self.assertRaises(TimeoutError):
+                await workflow.run("2+3", max_generated_tokens=2)
         self.assertEqual(
             len(chat.calls), 1, "Workflow discarded the total token budget"
         )
-        self.assertNotEqual(result.status, "completed")
 
     async def test_builtin_workflow_honors_episode_timeout(self):
         class SlowChat(_FakeChat):

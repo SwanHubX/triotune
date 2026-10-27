@@ -24,6 +24,7 @@ from ...types import (
     AgentEvent,
     EpisodeScore,
     ExecutionContext,
+    ToolCall,
     ToolResult,
     ToolResultEvent,
 )
@@ -91,6 +92,16 @@ class OpenAITrajectoryExport:
     logical_rollout_id: str
     interactions: tuple[dict[str, Any], ...]
     rewards: tuple[Any, ...]
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAITraceBranch:
+    """Read-only suffix selected from one recorded interaction lineage."""
+
+    session_id: str
+    parent_interaction_id: str
+    interactions: tuple[dict[str, Any], ...]
     metadata: dict[str, Any]
 
 
@@ -181,20 +192,22 @@ class OpenAISession:
         else:
             index = sample_index if sample_index is not None else 0
             context = ExecutionContext(
-                rollout_id=rollout_id
-                if rollout_id is not None
-                else f"rollout_{uuid4().hex}",
+                rollout_id=(
+                    rollout_id if rollout_id is not None else f"rollout_{uuid4().hex}"
+                ),
                 episode_id=f"episode_{uuid4().hex}",
                 group_id=group_id if group_id is not None else f"group_{uuid4().hex}",
                 sample_index=index,
                 group_size=max(1, index + 1),
-                snapshot_id=snapshot_id
-                if snapshot_id is not None
-                else f"external_{uuid4().hex}",
+                snapshot_id=(
+                    snapshot_id
+                    if snapshot_id is not None
+                    else f"external_{uuid4().hex}"
+                ),
                 policy_version=policy_version,
-                resource_owner=resource_owner
-                if resource_owner is not None
-                else "openai-session",
+                resource_owner=(
+                    resource_owner if resource_owner is not None else "openai-session"
+                ),
             )
         if session_id is not None and (
             not isinstance(session_id, str) or not session_id
@@ -486,6 +499,34 @@ class OpenAISession:
             )
         )
 
+    def recover_inflight(
+        self, *, error: str = "Recovered incomplete SDK session"
+    ) -> OpenAITrajectoryExport:
+        """Finalize a cancelled request while preserving completed evidence.
+
+        The owner must cancel its request task first. Recovery never retries a
+        provider request or tool side effect; it marks only still-running
+        interactions cancelled, then returns the same diagnostic export path.
+        Failed/cancelled sessions cannot submit rewards or enter PPO.
+        """
+        if self.released:
+            raise AgentContractError("A released session cannot be recovered.")
+        if self.status not in {"open", "failed", "cancelled"}:
+            raise AgentContractError("Only an open or failed session can be recovered.")
+        self.running = False
+        for interaction in self.interactions:
+            if interaction.status == "running":
+                interaction.status = "cancelled"
+                interaction.error = error
+                interaction.latency = max(
+                    0.0, time.monotonic() - interaction.started_at
+                )
+        if self.status == "open":
+            self.finish("failed", error=error)
+        elif self.error is None:
+            self.error = error
+        return self.export_trajectory()
+
     def release(self) -> None:
         """Freeze writes after the owner has finished or aborted the session.
 
@@ -703,9 +744,7 @@ class OpenAISession:
             calls = (
                 item.get("tool_calls", [])
                 if key == "messages"
-                else [item]
-                if item.get("type") == "function_call"
-                else []
+                else [item] if item.get("type") == "function_call" else []
             )
             if calls:
                 owner = positions.get(index)
@@ -870,6 +909,111 @@ class OpenAISession:
         if interaction.status != "completed" or not interaction.response:
             raise AgentContractError("Only a completed request can be replayed.")
         return copy.deepcopy(interaction.response)
+
+    async def replay_tools(self, executor=None):
+        """Replay recorded tool calls without contacting the model.
+
+        With no executor, return detached recorded observations for inspection.
+        With a ToolExecutor, execute each original call in interaction order and
+        return detached results. The session trace is never mutated, so replay
+        cannot add training rewards, alter token evidence, or duplicate events.
+        """
+        from ...runtime.tools import FunctionToolExecutor
+
+        if executor is None:
+            return copy.deepcopy(
+                [
+                    {
+                        "interaction_id": item.interaction_id,
+                        "tool_calls": item.tool_calls,
+                        "tool_results": item.tool_results,
+                    }
+                    for item in self.interactions
+                    if item.tool_calls or item.tool_results
+                ]
+            )
+        if not hasattr(executor, "execute"):
+            raise AgentContractError("replay_tools requires a ToolExecutor.")
+        replayed = []
+        for item in self.interactions:
+            results = []
+            for raw in item.tool_calls:
+                function = raw.get("function", raw)
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    arguments = json.loads(arguments)
+                call = ToolCall(
+                    raw.get("id", raw.get("call_id", "")),
+                    function.get("name", raw.get("name", "")),
+                    arguments,
+                )
+                results.append(await executor.execute(call))
+            if results:
+                replayed.append((item.interaction_id, tuple(results)))
+        return tuple(replayed)
+
+    async def rescore(self, scorer, row=None):
+        """Run a scorer over this immutable trace without changing rewards."""
+        method = getattr(scorer, "score", scorer)
+        value = method({} if row is None else row, self)
+        return await value if hasattr(value, "__await__") else value
+
+    def branch(self, interaction_id: str) -> OpenAITraceBranch:
+        """Return a detached suffix beginning at one recorded interaction."""
+        if interaction_id not in self._by_id:
+            raise AgentContractError("Cannot branch from an unknown interaction.")
+        selected = []
+        current = self._by_id[interaction_id]
+        while current is not None:
+            selected.append(current)
+            child = next(
+                (
+                    item
+                    for item in self.interactions
+                    if item.parent_interaction_id == current.interaction_id
+                ),
+                None,
+            )
+            current = child
+        selected.reverse()
+        return OpenAITraceBranch(
+            self.session_id,
+            interaction_id,
+            tuple(self._jsonable(item) for item in selected),
+            {
+                "trainable": False,
+                "source": "recorded_trace",
+                "policy_version": self.context.policy_version,
+            },
+        )
+
+    @staticmethod
+    def compare(policy_a, policy_b):
+        """Compare two recorded traces without resampling or inventing tokens."""
+        if not isinstance(policy_a, OpenAISession) or not isinstance(
+            policy_b, OpenAISession
+        ):
+            raise AgentContractError("compare requires two OpenAISession traces.")
+        rows = []
+        for index, (left, right) in enumerate(
+            zip(policy_a.interactions, policy_b.interactions)
+        ):
+            rows.append(
+                {
+                    "index": index,
+                    "interaction_a": left.interaction_id,
+                    "interaction_b": right.interaction_id,
+                    "same_output_ids": left.output_ids == right.output_ids,
+                    "same_logprobs": left.logprobs == right.logprobs,
+                    "output_ids_a": left.output_ids,
+                    "output_ids_b": right.output_ids,
+                }
+            )
+        return {
+            "interactions": tuple(rows),
+            "lengths": (len(policy_a.interactions), len(policy_b.interactions)),
+            "trainable": False,
+        }
 
     def complete_request(self, interaction: OpenAIInteraction, response: Any) -> None:
         """Capture provider IDs, usage, logprobs, and optional raw token evidence.

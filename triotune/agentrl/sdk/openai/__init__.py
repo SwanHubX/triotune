@@ -22,7 +22,7 @@ from .native import (
     Qwen35ToolParser,
 )
 from .proxy_server import OpenAIProxyServer
-from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport
+from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport, OpenAITraceBranch
 from .workflow import OpenAIWorkflow, SDKRunResult
 from .episode import OpenAIEpisodeExecutor
 
@@ -42,6 +42,7 @@ __all__ = [
     "OpenAIResponsesObservationFormatter",
     "OpenAISession",
     "OpenAITrajectoryExport",
+    "OpenAITraceBranch",
     "OpenAIWorkflow",
     "PyTRIOBackend",
     "Qwen35ToolParser",

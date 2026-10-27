@@ -178,9 +178,7 @@ class OpenAIWorkflow:
             expected = (
                 context
                 if context is not None
-                else session.context
-                if session is not None
-                else None
+                else session.context if session is not None else None
             )
             if not isinstance(snapshot, SamplingSnapshot) or not isinstance(
                 expected, ExecutionContext
@@ -216,8 +214,18 @@ class OpenAIWorkflow:
             raise AgentContractError(
                 "Client-only workflows require an execute callback."
             )
+        # Keep workflow-level budgets authoritative for the built-in Agent
+        # path as well as execute= callbacks. Agent.run stores them on the
+        # session before its first request, so API calls, tools, and scoring
+        # all observe one total deadline and one generated-token counter.
         result = await self.agent.run(
-            input, context=context, session=session, training=training, **kwargs
+            input,
+            context=context,
+            session=session,
+            training=training,
+            episode_timeout=episode_timeout,
+            max_generated_tokens=max_generated_tokens,
+            **kwargs,
         )
         return await self._postprocess(input, result)
 
@@ -328,6 +336,7 @@ class OpenAIWorkflow:
         # interaction scoring temporarily narrows it to the matching child.
         # The final reset also preserves nested callers on failure/cancellation.
         context_token = _execution_context.set(session.context)
+        stage = "postprocess"
         try:
             if self.interaction_scorer is not None:
                 method = getattr(
@@ -340,6 +349,7 @@ class OpenAIWorkflow:
                     # shared scorer or sampling-client identity is mutated.
                     interaction_token = _execution_context.set(interaction.context)
                     try:
+                        stage = "interaction_scoring"
                         value = await self.boundary.operation(
                             session,
                             "interaction_scoring",
@@ -356,6 +366,7 @@ class OpenAIWorkflow:
                     finally:
                         _execution_context.reset(interaction_token)
             if self.scorer is not None:
+                stage = "scoring"
                 method = getattr(self.scorer, "score", self.scorer)
                 score = await self.boundary.operation(
                     session,
@@ -371,6 +382,7 @@ class OpenAIWorkflow:
                     )
             accepted = True
             if self.accept_sample is not None:
+                stage = "acceptance"
                 # P0/P1 SampleAcceptance accepts export=None for records that
                 # have no training export. Passing OpenAITrajectoryExport here
                 # would falsely imply the P2.5 EpisodeExecutor bridge exists.
@@ -390,7 +402,6 @@ class OpenAIWorkflow:
             return replace(result, accepted=accepted)
         except Exception as exc:
             session.accepted = False
-            stage = "acceptance" if self.accept_sample is not None else "scoring"
             classified = self.boundary.classify(stage, exc, session)
             if classified is not None:
                 session.failure_classification = classified

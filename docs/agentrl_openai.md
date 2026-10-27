@@ -100,6 +100,31 @@ the SDK boundary. Collector seeds reserve independent candidate ranges and
 advance per request. Tool retries remain owned by the SDK Agent; the bridge
 never retries an entire conversation or replays successful tool side effects.
 
+## Replay and recovery
+
+An `OpenAISession` keeps trace-only experimentation separate from training:
+
+```python
+observations = await session.replay_tools(tool_executor)  # no model request
+new_score = await session.rescore(new_scorer, row)
+suffix = session.branch(interaction_id)
+comparison = OpenAISession.compare(trace_a, trace_b)
+```
+
+`replay_tools()` uses recorded calls with a caller-supplied executor and returns
+new observations without mutating the session. With no executor it returns the
+recorded tool evidence. `rescore()` calls a scorer over the immutable session;
+it does not append a reward. `branch()` returns a detached interaction suffix,
+and `compare()` compares exact recorded output IDs/logprobs when available;
+neither resamples or fabricates training tokens. These APIs are diagnostic and
+their results have `trainable=False` semantics.
+
+If an owner cancels a request task after a tool completed, call
+`session.recover_inflight()`. It marks only still-running interactions as
+cancelled, preserves completed tool results, returns the normal trace export,
+and blocks delayed reward submission. The collector may then persist the trace
+and decide whether to start a fresh candidate under a new request identity.
+
 ## Register and run tools
 
 ```python

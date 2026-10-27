@@ -163,6 +163,8 @@ class Agent:
         session: OpenAISession | None = None,
         context: ExecutionContext | None = None,
         training: bool = False,
+        episode_timeout: float | None = None,
+        max_generated_tokens: int | None = None,
         **request_options: Any,
     ) -> AgentRunResult:
         """Run a fresh conversation in one isolated session until a final answer.
@@ -208,10 +210,18 @@ class Agent:
             raise AgentContractError(
                 "A training run requires a session bound in training mode."
             )
-        if self.max_generated_tokens is not None or self.episode_timeout is not None:
+        effective_tokens = (
+            self.max_generated_tokens
+            if max_generated_tokens is None
+            else max_generated_tokens
+        )
+        effective_timeout = (
+            self.episode_timeout if episode_timeout is None else episode_timeout
+        )
+        if effective_tokens is not None or effective_timeout is not None:
             session.configure_limits(
-                max_generated_tokens=self.max_generated_tokens,
-                episode_timeout=self.episode_timeout,
+                max_generated_tokens=effective_tokens,
+                episode_timeout=effective_timeout,
             )
         session.begin_execution()
         if (
@@ -329,9 +339,9 @@ class Agent:
                             ToolResultEvent(
                                 context=interaction.context,
                                 result=result,
-                                status="action_error"
-                                if result.is_error
-                                else "completed",
+                                status=(
+                                    "action_error" if result.is_error else "completed"
+                                ),
                             )
                         )
                 except BaseException as exc:
@@ -364,9 +374,11 @@ class Agent:
                 AgentEvent(
                     context=session.context,
                     kind="agent_end",
-                    status="cancelled"
-                    if isinstance(exc, asyncio.CancelledError)
-                    else "failed",
+                    status=(
+                        "cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "failed"
+                    ),
                 )
             )
             raise
