@@ -876,6 +876,7 @@ class EpisodeResult:
         return (
             bool(self.turns)
             and self.status not in SYSTEM_STATUSES
+            and self.status != "rejected"
             and not self.export_metadata.get("system_failure", False)
             and self.score is not None
         )

@@ -24,6 +24,7 @@ from triotune.agentrl import (
     EpisodeResult,
     EpisodeScore,
     EpisodeTrajectoryBuilder,
+    OpenAIEpisodeExecutor,
     ExecutionContext,
     RewardAssignment,
     RewardLedger,
@@ -324,15 +325,17 @@ class SDKWorkflowAudit(unittest.IsolatedAsyncioTestCase):
         async def score(input, result):
             return EpisodeScore(1.0, True)
 
-        workflow.scorer = score
-        async with workflow:
-            result = await workflow.run("2+3", context=context, snapshot=policy)
+        # The trace facade remains backward compatible. Its explicit episode
+        # adapter supplies the collector contract and standard PPO exporter.
+        runner = OpenAIEpisodeExecutor(lambda snapshot: workflow, scorer=SimpleNamespace(score=score))
+        async with runner:
+            result = await runner.run({"messages": "2+3"}, policy, group_id=context.group_id, context=context)
         self.assertEqual(len(sampling.calls), 2)
         self.assertTrue(result.interactions[0].tool_results)
         self.assertEqual(
-            result.interactions[0].output_ids, tuple(sampling.generated[0])
+            result.interactions[0].turn.generation.tokens, tuple(sampling.generated[0])
         )
-        self.assertEqual(result.interactions[0].sampling_source, "pytrio")
+        self.assertEqual(result.snapshot_id, policy.snapshot_id)
         self.assertTrue(
             isinstance(result, EpisodeResult),
             f"Returned {type(result).__name__}, not a collector EpisodeResult",

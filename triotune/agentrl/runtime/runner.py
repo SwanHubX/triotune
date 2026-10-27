@@ -250,10 +250,10 @@ class EpisodeRunner:
     def __init__(
         self,
         *,
-        parser: ActionParser,
-        tools: ToolExecutor,
+        parser: ActionParser | None,
+        tools: ToolExecutor | None,
         scorer: EpisodeScorer,
-        observations: ObservationFormatter,
+        observations: ObservationFormatter | None,
         renderer: ConversationRenderer | None = None,
         limits: EpisodeLimits | None = None,
         prompt_key: str = "messages",
@@ -274,7 +274,15 @@ class EpisodeRunner:
         If no renderer is provided, each run uses the snapshot's tokenizer.
         The exporter validates continuity during execution and is later reused
         by the collector to produce PPO trajectories.
+
+        An external-loop subclass overriding _execute may pass None for the
+        three model/tool adapters. Its recorded EpisodeResult still passes the
+        same scoring, reward-commit, identity, and export boundaries below.
         """
+        if type(self)._execute is EpisodeRunner._execute and any(
+            adapter is None for adapter in (parser, tools, observations)
+        ):
+            raise ValueError("The default episode loop requires parser, tools, and observations.")
         self.parser, self.tools, self.scorer = parser, tools, scorer
         self.interaction_scorer = interaction_scorer
         self.failure_classifier = failure_classifier
@@ -401,7 +409,9 @@ class EpisodeRunner:
         if self.interaction_scorer is None:
             return
         assignments = []
-        for index, interaction in enumerate(episode.interactions):
+        for index, interaction in enumerate(
+            item for item in episode.interactions if item.turn is not None
+        ):
             method = getattr(self.interaction_scorer, "score", self.interaction_scorer)
 
             async def score_one(method=method, interaction=interaction):
@@ -480,6 +490,10 @@ class EpisodeRunner:
                     assignment = replace(assignment, position=index)
                 assignments.append(assignment)
         episode.export_metadata["interaction_assignments"] = tuple(assignments)
+
+    async def _score_episode(self, row, episode):
+        """Keep the native scorer boundary replaceable by external-loop adapters."""
+        return await self.scorer.score(row, episode)
 
     async def run(
         self,
@@ -575,7 +589,7 @@ class EpisodeRunner:
                 renderer = self.renderer or ChatTemplateRenderer(snapshot.tokenizer)
                 await self._execute(episode, messages, snapshot, renderer, seed)
                 _execution_context.set(context)
-                if episode.status not in SYSTEM_STATUSES and (
+                if episode.status not in SYSTEM_STATUSES and episode.status != "rejected" and not episode.export_metadata.get("system_failure", False) and (
                     self.score_partial or episode.status == "completed"
                 ):
                     # Invalid actions and budget exits can still carry useful
@@ -585,7 +599,7 @@ class EpisodeRunner:
                             episode,
                             "scoring",
                             len(episode.turns) - 1,
-                            lambda: self.scorer.score(row, episode),
+                            lambda: self._score_episode(row, episode),
                             timeout=self.scorer_timeout,
                             retry_policy=self.scorer_retry or self.retry,
                         )

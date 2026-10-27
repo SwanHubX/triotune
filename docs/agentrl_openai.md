@@ -10,6 +10,96 @@ The inline agent supports text and local function tools through Chat Completions
 and Responses. It uses the official Python SDK; model access, authentication,
 request timeout and API retry configuration belong to that client.
 
+## Train SDK executions with PyTRIO
+
+`OpenAIEpisodeExecutor` implements the collector's native `EpisodeExecutor`
+contract. It inherits the existing episode lifecycle and scoring path, converts
+SDK sampling evidence to `EpisodeResult`, and uses the existing trajectory
+exporter. `OpenAIWorkflow.run()` and provider trace exports keep their existing
+return types and remain non-trainable on their own.
+
+```python
+from triotune import PPOConfig, PPOTrainer
+from triotune.agentrl import (
+    AgentRolloutWorkflow, AgentTrainingLoop, EpisodeLimits, EpisodeScore,
+    EpisodeTrajectoryBuilder, OpenAIEpisodeExecutor, function_tool,
+)
+from triotune.agentrl.sdk.openai import Agent, OpenAIClient, OpenAIWorkflow, PyTRIOBackend
+
+MODEL = "Qwen/Qwen3.5-4B"
+
+
+@function_tool(retry_safe=True)
+def add(a: float, b: float) -> float:
+    """Add two numbers."""
+    return a + b
+
+
+class Outcome:
+    async def score(self, row, episode):
+        success = episode.final_text is not None and episode.final_text.strip() == row["answer"]
+        return EpisodeScore(float(success), success)
+
+
+def make_workflow(snapshot):
+    client = OpenAIClient(backend=PyTRIOBackend(snapshot, model=MODEL, max_tokens=1024))
+    return OpenAIWorkflow(Agent(
+        name="calculator", instructions="Use tools. Answer with the number only.",
+        tools=[add], model=MODEL, client=client,
+    ))
+
+
+async def train():
+    runner = OpenAIEpisodeExecutor(
+        make_workflow, scorer=Outcome(),
+        limits=EpisodeLimits(max_tokens_per_turn=1024, max_generated_tokens=2048),
+        trajectory_builder=EpisodeTrajectoryBuilder(mode="individual"),
+    )
+    collector = AgentRolloutWorkflow(runner, max_concurrency=2)
+    trainer = PPOTrainer(
+        MODEL,
+        args=PPOConfig.for_algorithm("grpo", batch_size=1, num_generations=2, max_steps=1),
+        train_dataset=[{"messages": "What is 2+3?", "answer": "5"}],
+    )
+    await AgentTrainingLoop(trainer, collector).train()
+```
+
+Only the prompt field reaches the SDK/model; the native scorer receives the
+complete original row, including ground truth. Configure PyTRIO credentials as
+for the other training recipes. Built-in Agent execution uses PyTRIO directly
+and does not require an OpenAI API key. `execute=` can instead supply a
+third-party async function using the standard session-bound AsyncOpenAI client;
+install `.[openai-proxy]` for that callback path. A single user message is passed
+as text; multi-message prompts are passed as a list.
+
+The factory must return a fresh workflow, Agent (if used), client, and backend
+per candidate, bound to the exact supplied snapshot. These adapter resources
+are closed after execution; trainer-owned sampling clients and tokenizers are
+not closed or refreshed. This also supports overlapping fixed-policy collection
+and later PPO snapshot refresh without switching a shared client's backend.
+
+Original input/output IDs, aligned behavior logprobs, stop reason, usage,
+interaction/tool identity, completed tool results, SDK request/response IDs, and
+policy provenance survive conversion. Display text is never re-encoded into
+training tokens. External OpenAI backends, unknown sampling evidence, changed
+snapshots, and missing logprobs are rejected before optimizer work. Malformed
+actions and bounded partial generations retain original actions for native
+partial-episode scoring; system failures and rejected candidates cannot train.
+
+The native `scorer` is the primary outcome/success scorer. Explicit SDK reward
+submissions, including SDK workflow scorers, are additional contributions and
+are converted once into native RewardAssignments. SDK source names are scoped
+under `sdk/assignment/` to keep independent judges' aggregation populations
+separate. Do not submit the same outcome through both scorers. Native interaction
+scorers, scorer timeouts/retries, acceptance/group policies, JSONL reward traces,
+fragment maps, shared-action masking, normalization, GAE, and loss weighting all
+continue through the existing runner/collector/PPO stages.
+
+EpisodeLimits bound generated tokens, context, requests, and episode time at
+the SDK boundary. Collector seeds reserve independent candidate ranges and
+advance per request. Tool retries remain owned by the SDK Agent; the bridge
+never retries an entire conversation or replays successful tool side effects.
+
 ## Register and run tools
 
 ```python

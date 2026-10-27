@@ -154,8 +154,9 @@ class OpenAIWorkflow:
         The snapshot argument validates provenance only; model execution is
         delegated to the agent's configured backend. A PyTRIO backend binds its
         own fixed snapshot, whereas an external backend calls its provider.
-        This facade does not implement EpisodeExecutor or produce a PPO
-        RolloutExport. Its exported trace remains untrainable.
+        This facade exports diagnostic traces. OpenAIEpisodeExecutor wraps a
+        snapshot-bound workflow factory to produce native PPO EpisodeResults
+        without changing this API's return type or external-provider semantics.
 
         Supplying ``snapshot`` turns provenance checking on: the supplied root
         context must carry the same snapshot ID and policy version, and the
@@ -317,8 +318,8 @@ class OpenAIWorkflow:
     async def _postprocess(self, input, result):
         """Apply existing scoring and acceptance semantics to one SDK trace.
 
-        SDK traces remain non-trainable until P2.5 supplies an EpisodeResult and
-        RolloutExport. A scoring or acceptance infrastructure failure therefore
+        SDK traces remain non-trainable; OpenAIEpisodeExecutor separately builds
+        EpisodeResult and RolloutExport. A scoring or acceptance failure therefore
         marks this result unaccepted and raises; it cannot silently enter PPO.
         """
         session = result.session

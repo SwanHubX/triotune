@@ -207,6 +207,14 @@ def _response_messages(value: Any) -> list[dict[str, Any]]:
     return messages
 
 
+class _EpisodeLimitReached(ActionParseError):
+    """Preserve model-budget exits without labeling them as service failures."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class PyTRIOBackend:
     """Sample through one fixed PyTRIO ``SamplingSnapshot``.
 
@@ -245,6 +253,11 @@ class PyTRIOBackend:
         if not isinstance(model, str) or not model:
             raise ValueError("PyTRIO backend model must be a nonempty string.")
         self.snapshot = snapshot
+        # An EpisodeExecutor can bind these on its candidate-owned backend.
+        # Shared SamplingSnapshot/client objects are never modified. Ordinary
+        # SDK inference keeps the existing request-level behavior by default.
+        self.episode_limits = None
+        self.episode_seed = None
         self.model = model
         self.max_tokens = _strict_int(max_tokens, name="max_tokens", minimum=1)
         self.renderer = renderer
@@ -818,6 +831,8 @@ class PyTRIOBackend:
         self, endpoint: str, payload: Mapping[str, Any], *, session: Any
     ) -> None:
         """Run all deterministic preflight checks before request identity allocation."""
+        if self.episode_limits is not None and len(session.interactions) >= self.episode_limits.max_turns:
+            raise _EpisodeLimitReached("max_turns", "SDK episode exceeded max_turns.")
         if endpoint not in {"/v1/chat/completions", "/v1/responses"}:
             raise AgentContractError(f"Unsupported OpenAI endpoint: {endpoint}.")
         self._validate_session(session)
@@ -927,10 +942,16 @@ class PyTRIOBackend:
             prompt_tokens = self._prompt_tokens(endpoint, payload, session=session)
             model_messages, model_tools = None, None
         max_tokens = self._max_tokens(endpoint, payload)
+        if self.episode_limits is not None:
+            available = self.episode_limits.max_context_tokens - len(prompt_tokens)
+            if available <= 0:
+                raise _EpisodeLimitReached("context_limit", "SDK episode exhausted context capacity.")
+            max_tokens = min(max_tokens, self.episode_limits.max_tokens_per_turn, available)
         generation = await self.snapshot.sampler.generate(
             prompt_tokens,
             max_tokens=max_tokens,
-            seed=payload.get("seed"),
+            seed=(self.episode_seed + len(session.interactions) - 1)
+            if self.episode_seed is not None else payload.get("seed"),
         )
         generation.__post_init__()
         if len(generation.tokens) > max_tokens:

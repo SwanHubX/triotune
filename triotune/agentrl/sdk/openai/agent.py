@@ -69,7 +69,7 @@ class AgentRunResult:
 
     @property
     def trainable(self) -> bool:
-        """Remain false until P2.5 creates an exact PPO RolloutExport."""
+        """Keep API traces separate from OpenAIEpisodeExecutor's PPO records."""
         return False
 
     @property

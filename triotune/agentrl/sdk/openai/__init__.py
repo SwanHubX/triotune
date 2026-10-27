@@ -24,6 +24,7 @@ from .native import (
 from .proxy_server import OpenAIProxyServer
 from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport
 from .workflow import OpenAIWorkflow, SDKRunResult
+from .episode import OpenAIEpisodeExecutor
 
 __all__ = [
     "Agent",
@@ -34,6 +35,7 @@ __all__ = [
     "OpenAIBackend",
     "OpenAIChatObservationFormatter",
     "OpenAIClient",
+    "OpenAIEpisodeExecutor",
     "OpenAIInteraction",
     "OpenAINativeActionParser",
     "OpenAIProxyServer",
