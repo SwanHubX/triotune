@@ -9,6 +9,7 @@ closing the reporting run.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections.abc import Callable, Mapping
@@ -20,7 +21,6 @@ from typing import Any
 from uuid import uuid4
 
 import swanlab
-
 
 MetricFilter = Callable[[str], bool]
 
@@ -337,10 +337,21 @@ class MetricsAPI:
         if self._run is not None:
             self._run.log_text(key=key, data=data, step=step)
 
-    def finish(self, *, state: str = "success", error: str | None = None) -> None:
+    def state_dict(self) -> dict:
+        """Retain unfinished weighted metric windows across an orderly pause."""
+        return copy.deepcopy({name: getattr(self, name) for name in (
+            "_window", "_second_moments", "_extrema", "_latest", "_last_step",
+        )})
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore aggregation only; output handles belong to the new process."""
+        for name in ("_window", "_second_moments", "_extrema", "_latest", "_last_step"):
+            setattr(self, name, copy.deepcopy(state[name]))
+
+    def finish(self, *, state: str = "success", error: str | None = None, flush: bool = True) -> None:
         """Finish the active run once and make later calls no-ops."""
 
-        if self._window:
+        if self._window and flush:
             self.flush(step=self._last_step)
         self._write_history(
             "finish",

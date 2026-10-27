@@ -1,0 +1,28 @@
+# Fixed correct/incorrect arithmetic pairs and an untouched policy-base reference.
+model:
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 8
+reference:
+  name: ${model.name}
+training:
+  batch_size: 2
+  max_steps: 2
+  seed: 42
+optimizer:
+  learning_rate: 0.00001
+data:
+  max_length: 256
+  chat_template_kwargs: {enable_thinking: false}
+objective:
+  beta: 0.1
+evaluation:
+  before_train: true
+  after_train: true
+  steps: 0
+  batch_size: 2
+  max_batches: 1
+checkpoint:
+  save_every: 0
+reporting:
+  report_to: null
+  logging_step: 1

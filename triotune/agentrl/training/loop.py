@@ -12,17 +12,19 @@ from __future__ import annotations
 import asyncio
 import itertools
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from tqdm import tqdm
 
 from ...trainer.ppo.rollout import filter_informative_groups
+from ...utils.checkpoint import training_limit
 from ...utils.dataloader import iter_batches, num_batches
 from ..config import AgentConfig
 from ..rollout.workflow import AgentRolloutBatch, AgentRolloutWorkflow
 from ..runtime.sampling import SamplingSnapshot
 from ..types import AgentContractError
-from .evaluation import evaluation_metrics, paired_task_metrics
+from .evaluation import evaluation_metrics, paired_task_metrics, paired_task_summary
 
 
 def filter_agent_groups(trajectories):
@@ -86,6 +88,26 @@ class AgentTrainingLoop:
         self.update_history: list[dict[str, Any]] = []
         self.last_train_batch: AgentRolloutBatch | None = None
         self.last_train_snapshot: SamplingSnapshot | None = None
+        if trainer._checkpoint.enabled:
+            if self.config.async_rollouts or snapshot_factory is not None:
+                raise ValueError("Complete agent checkpoints require synchronous rollouts and the trainer snapshot factory.")
+            identity = self.config.to_dict()
+            identity.pop("log_path", None)
+            identity["executor"] = f"{type(workflow.runner).__module__}.{type(workflow.runner).__qualname__}"
+            identity["limits"] = asdict(workflow.runner.limits)
+            trainer._checkpoint.bind_loop("agent", identity=identity, owner=self)
+
+    def checkpoint_state(self):
+        """Keep sampler/evaluation progress without persisting completed turns."""
+        return {"seed_offset": self._seed_offset, "last_eval_step": self._last_eval_step,
+                "baseline": self._baseline_episodes, "updates": self.update_history}
+
+    def restore_checkpoint_state(self, state):
+        """Rejoin candidate seed ranges and paired evaluation after optimizer load."""
+        self._seed_offset = state["seed_offset"]
+        self._last_eval_step = state["last_eval_step"]
+        self._baseline_episodes = state["baseline"]
+        self.update_history = state["updates"]
 
     async def _snapshot(self):
         return await self.trainer.create_sampling_snapshot(stop=self.config.stop)
@@ -164,9 +186,13 @@ class AgentTrainingLoop:
             evaluation_metrics(episodes, pass_ks=self.config.evaluation.pass_ks)
         )
         if self._baseline_episodes is None:
-            self._baseline_episodes = list(episodes)
+            self._baseline_episodes = paired_task_summary(episodes)
         else:
             metrics.update(paired_task_metrics(self._baseline_episodes, episodes))
+        trainer._eval_sample_input_tokens += int(metrics["eval/agent/sample_input_tokens"])
+        trainer._eval_sample_output_tokens += int(metrics["eval/agent/sample_output_tokens"])
+        metrics["usage/eval_sample_input_tokens_total"] = float(trainer._eval_sample_input_tokens)
+        metrics["usage/eval_sample_output_tokens_total"] = float(trainer._eval_sample_output_tokens)
         await trainer.publish_metrics(metrics)
         self._last_eval_step = trainer.state.global_step
         return metrics
@@ -273,7 +299,12 @@ class AgentTrainingLoop:
                 "metrics": dict(metrics),
             }
         )
-        await trainer.publish_metrics(batch.metrics())
+        batch_metrics = batch.metrics()
+        trainer._sample_input_tokens += int(batch_metrics["agent/sample_input_tokens"])
+        trainer._sample_output_tokens += int(batch_metrics["agent/sample_output_tokens"])
+        batch_metrics["usage/sample_input_tokens_total"] = float(trainer._sample_input_tokens)
+        batch_metrics["usage/sample_output_tokens_total"] = float(trainer._sample_output_tokens)
+        await trainer.publish_metrics(batch_metrics)
         progress.update(1)
         if (
             trainer.eval_dataset is not None
@@ -281,6 +312,7 @@ class AgentTrainingLoop:
             and trainer.state.global_step % trainer.args.eval_steps == 0
         ):
             await self.evaluate()
+        trainer._checkpoint.publish(trainer)
 
     async def _train_overlapped(self, rows, progress):
         """Pipeline fixed-snapshot collection with one serialized PPO update.
@@ -345,7 +377,7 @@ class AgentTrainingLoop:
                     task.cancel()
             await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
 
-    async def train(self) -> PPOState:
+    async def train(self, *, stop_after_step: int | None = None) -> PPOState:
         """Run collection, updates, configured evaluations, and final saving.
 
         Dataset rows are consumed once; max_steps limits policy updates rather
@@ -355,7 +387,6 @@ class AgentTrainingLoop:
         cancellation, and returns the trainer's existing mutable PPOState.
         """
         trainer, config = self.trainer, self.trainer.args
-        initial_step = trainer.state.global_step
         try:
             if trainer.train_dataset is None:
                 raise ValueError("Agent training requires a train dataset.")
@@ -367,10 +398,15 @@ class AgentTrainingLoop:
                 raise ValueError(
                     "Periodic agent evaluation requires a replayable dataset."
                 )
+            if stop_after_step is not None and self.config.async_rollouts:
+                raise ValueError("Orderly pauses require synchronous agent rollouts.")
             await trainer.initialize()
-            if trainer.eval_dataset is not None and config.eval_before_train:
+            initial_step = trainer.state.global_step
+            limit, paused = training_limit(config, initial_step, stop_after_step)
+            trainer._checkpoint.begin()
+            if trainer._checkpoint.evaluation_due(trainer, self._last_eval_step):
                 await self.evaluate()
-            rows = iter(trainer.train_dataset)
+            rows = trainer._checkpoint.rows(trainer)
             with tqdm(
                 total=config.max_steps,
                 initial=initial_step,
@@ -378,8 +414,8 @@ class AgentTrainingLoop:
                 unit="step",
             ) as progress:
                 while (
-                    config.max_steps is None
-                    or trainer.state.global_step < config.max_steps
+                    limit is None
+                    or trainer.state.global_step < limit
                 ):
                     if self.config.async_rollouts:
                         await self._train_overlapped(rows, progress)
@@ -394,17 +430,21 @@ class AgentTrainingLoop:
                         self.last_train_snapshot,
                         progress,
                     )
-            if trainer.state.global_step == initial_step:
+            if trainer.state.global_step == initial_step and (
+                config.max_steps is None or initial_step < config.max_steps
+            ):
                 raise ValueError("No trainable agent batch was collected.")
             if not config.save_every or trainer.state.global_step % config.save_every:
                 await trainer.save_checkpoint()
             if (
                 trainer.eval_dataset is not None
+                and not paused
                 and config.eval_after_train
                 and self._last_eval_step != trainer.state.global_step
             ):
                 # A periodic evaluation may already cover the final weights.
                 await self.evaluate()
+            trainer._checkpoint.publish(trainer)
         except BaseException as exc:
             # Preserve cancellation and the original training exception even
             # if reporter cleanup also fails. Error text must be serializable.
@@ -418,6 +458,8 @@ class AgentTrainingLoop:
                 exc.add_note(f"Agent resource cleanup also failed: {cleanup_error}")
             raise
         else:
-            await trainer.close()
+            await trainer.close(flush=not paused)
             await self.workflow.close()
+        finally:
+            trainer._checkpoint.end()
         return trainer.state

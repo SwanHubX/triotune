@@ -81,6 +81,21 @@ def evaluation_metrics(episodes, *, pass_ks=(1,), prefix="eval/agent"):
     return metrics
 
 
+def paired_task_summary(episodes):
+    """Retain JSON-compatible per-task baselines without serializing episodes."""
+    groups = defaultdict(list)
+    for episode in episodes:
+        if episode.task_id is not None:
+            groups[episode.task_id].append(episode)
+    return {
+        key: {
+            "success_rate": sum(float(e.trainable and e.score.success) for e in group) / len(group),
+            "generated_tokens": sum(len(t.generation.tokens) for e in group for t in e.turns) / len(group),
+            "tool_calls": sum(len(t.action.tool_calls) if t.action else 0 for e in group for t in e.turns) / len(group),
+        } for key, group in groups.items()
+    }
+
+
 def paired_task_metrics(baseline, current, *, prefix="eval/agent/paired"):
     """Compare per-task mean success, lengths and costs for matching task IDs.
 
@@ -88,34 +103,13 @@ def paired_task_metrics(baseline, current, *, prefix="eval/agent/paired"):
     Calls without task IDs cannot form pairs and are counted in neither side.
     """
 
-    def aggregate(episodes):
-        result = defaultdict(list)
-        for e in episodes:
-            if e.task_id is not None:
-                result[e.task_id].append(e)
-        return result
-
-    before, after = aggregate(baseline), aggregate(current)
+    before = baseline if isinstance(baseline, dict) else paired_task_summary(baseline)
+    after = paired_task_summary(current)
     ids = sorted(before.keys() & after.keys())
     deltas = {"success_rate": [], "generated_tokens": [], "tool_calls": []}
     for key in ids:
-        for name, function in (
-            ("success_rate", lambda e: float(e.trainable and e.score.success)),
-            (
-                "generated_tokens",
-                lambda e: sum(len(t.generation.tokens) for t in e.turns),
-            ),
-            (
-                "tool_calls",
-                lambda e: sum(
-                    len(t.action.tool_calls) if t.action else 0 for t in e.turns
-                ),
-            ),
-        ):
-            deltas[name].append(
-                sum(map(function, after[key])) / len(after[key])
-                - sum(map(function, before[key])) / len(before[key])
-            )
+        for name, values in deltas.items():
+            values.append(after[key][name] - before[key][name])
     result = {f"{prefix}/tasks": float(len(ids))}
     result.update(
         {

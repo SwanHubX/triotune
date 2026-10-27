@@ -1,0 +1,36 @@
+# Student-sampled, token-aligned distillation from a distinct fixed teacher.
+# The trainer checks exact vocabulary equality before any training request.
+model:
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 8
+teacher:
+  name: Qwen/Qwen3.5-9B
+training:
+  batch_size: 2
+  max_steps: 2
+  seed: 42
+optimizer:
+  learning_rate: 0.00004
+rollout:
+  num_generations: 1
+  max_completion_length: 64
+  max_length: 256
+  chat_template_kwargs: {enable_thinking: false}
+execution:
+  max_concurrent_sampling: 2
+  max_concurrent_scoring: 2
+objective:
+  kl_coef: 1.0
+  discount_factor: 0.0
+  importance_ratio_cap: 5.0
+evaluation:
+  before_train: true
+  after_train: true
+  steps: 0
+  batch_size: 2
+  max_batches: 1
+checkpoint:
+  save_every: 0
+reporting:
+  report_to: null
+  logging_step: 1

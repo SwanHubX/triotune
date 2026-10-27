@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from ..api.cli_args import PPOConfig
 from ..api.client_api import call_async
-from ..utils.checkpoint import save_checkpoint_async
+from ..utils.checkpoint import TrainingCheckpoint, save_checkpoint_async, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
@@ -151,6 +151,15 @@ class PPOTrainer:
         self._last_eval_step: int | None = None
         self._rollout_metrics: dict[str, float] = {}
         self.state = PPOState()
+        self._checkpoint = TrainingCheckpoint(
+            self.args, "ppo", train_dataset, eval_dataset,
+            identity={"model": self.model, "lora_rank": lora_rank, "reference": self.reference_model},
+        )
+        if self._checkpoint.enabled and any(value is not None for value in (
+            critic, self.algorithm_plan, training_client, critic_training_client,
+            reference_client, tokenizer,
+        )):
+            raise ValueError("Complete PPO checkpoints require owned PyTRIO clients and built-in algorithm plans.")
 
     # ------------------------------------------------------------------
     # Client initialization and reference-model setup
@@ -167,9 +176,8 @@ class PPOTrainer:
         if self._client is None:
             if self._service is None:
                 self._service = trio.ServiceClient()
-            self._client = await call_async(
+            self._client = await self._checkpoint.create_client_async(
                 self._service,
-                "create_lora_training_client",
                 base_model=self.model,
                 rank=self.lora_rank,
                 seed=self.args.seed,
@@ -196,9 +204,8 @@ class PPOTrainer:
             if self._critic_client is None:
                 if self._service is None:
                     self._service = trio.ServiceClient()
-                self._critic_client = await call_async(
-                    self._service,
-                    "create_lora_training_client",
+                self._critic_client = await self._checkpoint.create_client_async(
+                    self._service, component="critic",
                     base_model=self.model,
                     rank=self.args.critic_lora_rank or self.lora_rank,
                     seed=None if self.args.seed is None else self.args.seed + 1,
@@ -207,7 +214,7 @@ class PPOTrainer:
                 raise ValueError(
                     "Actor and critic must use independent training clients."
                 )
-            self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids)
+            self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids, total_steps=self._checkpoint.optimizer_horizons["critic"])
 
         # Actor and critic remain independent training clients, but one PPO
         # experiment owns one metric run with component-specific namespaces.
@@ -222,7 +229,8 @@ class PPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
-        self._actor = PPOActor(self._client, self.args, self.algorithm_plan)
+        self._actor = PPOActor(self._client, self.args, self.algorithm_plan, total_steps=self._checkpoint.optimizer_horizons["actor"])
+        self._checkpoint.restore(self)
 
     async def _references(self, trajectories):
         """Populate missing reference logprobs when KL control is enabled."""
@@ -286,6 +294,7 @@ class PPOTrainer:
         parallel.  A trainer instance must not receive concurrent ``step``
         calls.
         """
+        self._checkpoint.require_training_loop()
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
         # Validate provenance before reference scoring or critic work. The
@@ -449,7 +458,7 @@ class PPOTrainer:
                     np.mean(policy_ages) if policy_ages else 0.0
                 ),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
-                "train/learning_rate": self.args.learning_rate,
+                "train/learning_rate": metrics.pop("optim/lr", self.args.learning_rate),
                 "usage/actor_train_tokens": float(actor_tokens),
                 "usage/actor_train_tokens_total": float(total_actor_tokens),
                 "usage/critic_train_tokens": float(critic_tokens),
@@ -577,15 +586,16 @@ class PPOTrainer:
                 data=self.state.critic_checkpoint_path,
                 step=self.state.global_step,
             )
+        self._checkpoint.remote_saved(self)
         return self.state.checkpoint_path
 
-    async def close(self, *, state="success", error=None) -> None:
+    async def close(self, *, state="success", error=None, flush=True) -> None:
         """Finish the experiment reporter; injected critics retain ownership."""
 
         if self._metrics is not None:
             # SwanLab restores signal handlers on finish and therefore remains
             # on the main thread even though actor/critic updates are concurrent.
-            self._metrics.finish(state=state, error=error)
+            self._metrics.finish(state=state, error=error, flush=flush)
 
     # ------------------------------------------------------------------
     # Dataset-driven rollout collection and training entry point
@@ -616,6 +626,14 @@ class PPOTrainer:
                 first_group=self._next_group,
                 sample_usage_callback=self._record_sample_usage,
             )
+            # The sampler is an export of this exact completed policy version.
+            # Recreated clients after resume receive a new physical run ID but
+            # retain the same logical version and the same per-group seed range.
+            for trajectory in generated:
+                trajectory.policy_version = self.state.global_step
+                trajectory.snapshot_id = getattr(
+                    self._sampling, "sampling_run_cuid", f"step-{self.state.global_step}"
+                )
             self._next_group += len(source)
             sampled_groups += len(source)
             if self.args.dynamic_sampling:
@@ -786,32 +804,34 @@ class PPOTrainer:
             metrics["eval/success_rate"] = float(np.mean(components["success"]))
         return self._publish_evaluation(metrics)
 
-    async def train(self) -> PPOState:
+    async def train(self, *, stop_after_step: int | None = None) -> PPOState:
         """Collect rollout batches until ``max_steps`` and return final state."""
         if self.train_dataset is None or not callable(self.reward_fn):
             raise ValueError(
                 "train() requires train_dataset and reward_fn; use step() for custom trajectories."
             )
+        self._checkpoint.bind_loop()
         started = time.perf_counter()
-        initial_step = self.state.global_step
-        progress = tqdm(
-            total=self.args.max_steps,
-            initial=initial_step,
-            desc="PPO train",
-            unit="step",
-        )
+        progress = None
         try:
             await self.initialize()
+            limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+            self._checkpoint.begin()
+            initial_step = self.state.global_step
+            progress = tqdm(
+                total=self.args.max_steps,
+                initial=initial_step,
+                desc="PPO train",
+                unit="step",
+            )
             if (
-                self.eval_dataset is not None
-                and self.args.eval_before_train
-                and self._last_eval_step is None
+                self._checkpoint.evaluation_due(self, self._last_eval_step)
             ):
                 await self.evaluate()
-            rows = iter(self.train_dataset)
+            rows = self._checkpoint.rows(self)
             while (
-                self.args.max_steps is None
-                or self.state.global_step < self.args.max_steps
+                limit is None
+                or self.state.global_step < limit
             ):
                 start = time.perf_counter()
                 initial_sample_input = self._sample_input_tokens
@@ -870,6 +890,7 @@ class PPOTrainer:
                     and self._last_eval_step != self.state.global_step
                 ):
                     await self.evaluate()
+                    self._checkpoint.publish(self)
             if not self.state.global_step:
                 raise ValueError("No trainable rollout batch was collected.")
             if (
@@ -879,6 +900,7 @@ class PPOTrainer:
                 await self.save_checkpoint()
             if (
                 self.eval_dataset is not None
+                and not paused
                 and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
@@ -905,7 +927,8 @@ class PPOTrainer:
                 summary,
                 step=self.state.global_step,
             )
-            await self.close()
+            self._checkpoint.publish(self)
+            await self.close(flush=not paused)
         except BaseException as error:
             try:
                 await self.close(state="crashed", error=str(error))
@@ -913,7 +936,9 @@ class PPOTrainer:
                 error.add_note(f"Reporter cleanup also failed: {cleanup_error}")
             raise
         finally:
-            progress.close()
+            self._checkpoint.end()
+            if progress is not None:
+                progress.close()
         return self.state
 
 

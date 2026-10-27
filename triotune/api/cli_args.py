@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, ClassVar, Literal
 
 
@@ -333,6 +333,40 @@ class TrainingConfig:
 
 
 @dataclass(slots=True)
+class SchedulerConfig:
+    """Schedule one optimizer's LR by its real, one-based update index.
+
+    ``constant`` keeps the base LR after optional warmup. ``linear`` and
+    ``cosine`` decay to ``min_lr`` at ``total_steps``; omitted totals are
+    inferred from the training plan. ``warmup_steps`` applies to all three
+    schedules. Its first update uses base_lr / warmup_steps, bounded below by
+    min_lr, and its final update reaches base_lr. A decay needs at least one
+    update after warmup. Omitted min_lr uses 1% of the base LR for decay;
+    explicit decay floors must be positive because PyTRIO rejects zero LR.
+    The total counts optimizer submissions, not batches,
+    generated episodes, or PPO rollout updates.
+    """
+
+    type: str = "constant"
+    warmup_steps: int = 0
+    total_steps: int | None = None
+    min_lr: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.type not in ("constant", "linear", "cosine"):
+            raise ValueError("scheduler.type must be constant, linear or cosine.")
+        _integer("scheduler.warmup_steps", self.warmup_steps, minimum=0)
+        if self.total_steps is not None:
+            _integer("scheduler.total_steps", self.total_steps, minimum=1)
+            if self.type != "constant" and self.warmup_steps >= self.total_steps:
+                raise ValueError("A decay scheduler requires warmup_steps < total_steps.")
+        if self.min_lr is not None:
+            _nonnegative("scheduler.min_lr", self.min_lr)
+            if self.type != "constant":
+                _positive("scheduler.min_lr", self.min_lr)
+
+
+@dataclass(slots=True)
 class OptimizerConfig:
     """Describe the AdamW parameters accepted by PyTRIO.
 
@@ -355,8 +389,12 @@ class OptimizerConfig:
             Global gradient-norm ceiling applied remotely. Zero disables
             clipping; a positive value limits unstable updates.
 
-    PyTRIO creates and owns the optimizer. Scheduler, precision, sharding and
-    distributed optimizer settings are therefore intentionally absent.
+        scheduler (`SchedulerConfig`, default constant LR):
+            Client-side LR policy. Triotune supplies the computed LR in each
+            AdamParams request; PyTRIO retains ownership of optimizer state.
+
+    Precision, sharding and distributed optimizer settings remain owned by
+    PyTRIO and are intentionally absent from this client-side configuration.
     """
 
     learning_rate: float = 1e-5
@@ -365,6 +403,7 @@ class OptimizerConfig:
     eps: float = 1e-8
     weight_decay: float = 0.0
     grad_clip_norm: float = 0.0
+    scheduler: SchedulerConfig | Mapping[str, Any] = field(default_factory=SchedulerConfig)
 
     def __post_init__(self) -> None:
         _positive("learning_rate", self.learning_rate)
@@ -380,6 +419,10 @@ class OptimizerConfig:
                 raise ValueError(f"{name} must be finite and in [0, 1).")
         _nonnegative("weight_decay", self.weight_decay)
         _nonnegative("grad_clip_norm", self.grad_clip_norm)
+        self.scheduler = _coerce_module(self.scheduler, SchedulerConfig)
+        self.scheduler.__post_init__()
+        if self.scheduler.min_lr is not None and self.scheduler.min_lr > self.learning_rate:
+            raise ValueError("scheduler.min_lr cannot exceed optimizer.learning_rate.")
 
     def optimizer_params(self) -> dict[str, float]:
         """Return the SDK-neutral mapping consumed by the PyTRIO adapter."""
@@ -403,12 +446,31 @@ class CheckpointConfig:
             Interval measured in completed trainer updates. Zero disables
             periodic saves; trainers still create their documented final
             checkpoint so a successful run always exposes its result.
+        state_dir (`str` or `None`, default `None`):
+            Local directory for versioned JSON runtime manifests paired with
+            the remote model/optimizer snapshots. Complete mode requires fixed,
+            sized random-access training and evaluation datasets. SFT drains
+            each submitted update; agent rollout prefetch is unsupported.
+        resume_from (`str` or `None`, default `None`):
+            Path to a complete JSON manifest. Restore both remote optimizer
+            state and local data/RNG/accounting progress; bare weight URIs are
+            insufficient. Model, optimizer, evaluation and ordered data identity
+            must match. max_steps is the total target, not extra update count.
     """
 
     save_every: int = 0
+    # Complete local state is opt-in so existing streaming recipes keep their
+    # remote-only save contract. A manifest is required to restore optimizer,
+    # cursor, evaluation, random streams, and accounting as one transaction.
+    state_dir: str | None = None
+    resume_from: str | None = None
 
     def __post_init__(self) -> None:
         _integer("save_every", self.save_every, minimum=0)
+        for name in ("state_dir", "resume_from"):
+            value = getattr(self, name)
+            if value is not None:
+                _non_empty_string(f"checkpoint.{name}", value)
 
 
 @dataclass(slots=True)
@@ -1270,9 +1332,9 @@ class PPOConfig(BaseTrainerConfig):
         )
         critic_values = dict(critic) if isinstance(critic, Mapping) else critic
         if isinstance(critic_values, dict):
-            critic_values.setdefault("optimizer", self.optimizer.optimizer_params())
+            critic_values.setdefault("optimizer", asdict(self.optimizer))
         elif critic_values is None:
-            critic_values = {"optimizer": self.optimizer.optimizer_params()}
+            critic_values = {"optimizer": asdict(self.optimizer)}
         object.__setattr__(
             self, "critic", _coerce_module(critic_values, PPOCriticConfig)
         )
@@ -1960,6 +2022,7 @@ __all__ = [
     "PPOCriticConfig",
     "PPORolloutConfig",
     "ReportingConfig",
+    "SchedulerConfig",
     "ReferenceConfig",
     "SFTConfig",
     "SFTDataConfig",

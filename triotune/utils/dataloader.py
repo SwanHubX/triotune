@@ -8,13 +8,52 @@ pad, shuffle, or construct a PyTRIO ``Datum``.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 from collections.abc import Iterable, Iterator
 from numbers import Integral
 from typing import TypeVar
 
-
 RowT = TypeVar("RowT")
+
+
+def dataset_identity(rows) -> dict | None:
+    """Hash ordered, replayable rows without storing another dataset copy.
+
+    Complete checkpoints support sized, random-access sources only. Iterators,
+    generators, shuffled iterable datasets and external cursors cannot prove
+    that skipping a saved row count yields the same next input. JSON-compatible
+    rows cover the public text/chat/token contracts and Hugging Face Dataset.
+    """
+    if rows is None:
+        return None
+    if not hasattr(rows, "__len__") or not hasattr(rows, "__getitem__") or iter(rows) is rows:
+        raise ValueError("Complete checkpoints require a sized, random-access dataset.")
+    digest = hashlib.sha256()
+    for index in range(len(rows)):
+        try:
+            encoded = json.dumps(rows[index], sort_keys=True, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Resumable dataset rows must be finite JSON-compatible values.") from error
+        digest.update(encoded.encode("utf-8") + b"\n")
+    return {"rows": len(rows), "sha256": digest.hexdigest()}
+
+
+def training_rows(rows, state):
+    """Continue at the saved raw-row cursor, including filtered/refill rows.
+
+    The cursor advances when a row is consumed. It becomes durable only after
+    the corresponding complete optimizer update is checkpointed. A failed
+    attempt must be discarded with its trainer and restarted from the previous
+    manifest; speculative/prefetched work is never published as committed work.
+    """
+    if state.data_cursor > len(rows):
+        raise ValueError("Saved data cursor exceeds the dataset length.")
+    for index in range(state.data_cursor, len(rows)):
+        row = rows[index]
+        state.data_cursor = index + 1
+        yield row
 
 
 def _validate_batch_size(batch_size: int) -> int:

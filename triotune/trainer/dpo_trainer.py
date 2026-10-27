@@ -25,7 +25,12 @@ from ..dataset import (
     prepare_preference,
     prepare_prompt,
 )
-from ..utils.checkpoint import save_checkpoint, save_checkpoint_async
+from ..utils.checkpoint import (
+    TrainingCheckpoint,
+    save_checkpoint,
+    save_checkpoint_async,
+    training_limit,
+)
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.scoring import (
@@ -81,8 +86,13 @@ class DPOTrainer:
         self.ref_model = ref_model.strip() if ref_model is not None else self.model
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
+        self._checkpoint = TrainingCheckpoint(
+            self.args, "dpo", train_dataset, eval_dataset,
+            identity={"model": self.model, "reference": self.ref_model, "lora_rank": lora_rank},
+        )
+        self._checkpoint.bind_loop()
         self._service_client = trio.ServiceClient()
-        self._training_client = self._service_client.create_lora_training_client(
+        self._training_client = self._checkpoint.create_client(self._service_client,
             base_model=self.model, rank=lora_rank, seed=self.args.seed
         )
         self._reference_client = self._service_client.create_sampling_client(
@@ -118,6 +128,8 @@ class DPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
+
+        self._checkpoint.restore(self)
 
     # ------------------------------------------------------------------
     # Preference preparation and model scoring
@@ -354,10 +366,10 @@ class DPOTrainer:
             metrics["optim/grad_norm"] = metrics["grad_norm"]
         return metrics
 
-    def _finish_run(self, state: str, error: str | None = None) -> None:
+    def _finish_run(self, state: str, error: str | None = None, *, flush: bool = True) -> None:
         """Close SwanLab once and clear the owned run handle."""
 
-        self._metrics_api.finish(state=state, error=error)
+        self._metrics_api.finish(state=state, error=error, flush=flush)
 
     def _log_swanlab(self, metrics: dict[str, float], count: int) -> None:
         """Accumulate step metrics and flush at the configured interval."""
@@ -385,15 +397,7 @@ class DPOTrainer:
         """Publish one successful synchronous update and optional checkpoint."""
 
         self.state.global_step += 1
-        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
-            save_started = time.perf_counter()
-            self._save_state()
-            metrics["time/save"] = time.perf_counter() - save_started
-        metrics["time/step"] = time.perf_counter() - started
-        metrics["time/tokens_per_second"] = (
-            metrics["data/tokens"] / metrics["time/step"]
-        )
-        metrics["time/pairs_per_second"] = count / metrics["time/step"]
+        self.state.optimizer_steps += 1
         self._total_tokens += int(metrics["data/tokens"])
         self._total_pairs += count
         metrics.update(
@@ -403,13 +407,21 @@ class DPOTrainer:
             }
         )
         self.state.metrics = metrics
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
+            self._save_state()
+            metrics["time/save"] = time.perf_counter() - save_started
         result = DPOResult(
             self.state.global_step,
             metrics,
             count,
             self.state.checkpoint_path,
         )
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = count / metrics["time/step"]
         self._log_swanlab(metrics, count)
+        self._checkpoint.publish(self)
         return result
 
     def _save_state(self) -> str:
@@ -417,6 +429,7 @@ class DPOTrainer:
 
         path = save_checkpoint(self._training_client, "dpo", self.state.global_step)
         self.state.checkpoint_path = path
+        self._checkpoint.remote_saved(self, publish=False)
         return path
 
     async def _save_state_async(self) -> str:
@@ -424,24 +437,31 @@ class DPOTrainer:
 
         path = await save_checkpoint_async(self._training_client, "dpo", self.state.global_step)
         self.state.checkpoint_path = path
+        self._checkpoint.remote_saved(self, publish=False)
         return path
 
     def step(self, rows: Sequence[Mapping[str, Any]]) -> DPOResult:
         """Score one preference batch, backpropagate DPO loss, and optimize."""
 
+        self._checkpoint.require_training_loop()
         started = time.perf_counter()
         pairs = self._preferences(rows)
         datums = self._datums(pairs)
         prepared = time.perf_counter()
         reference = self._reference_scores(pairs)
         referenced = time.perf_counter()
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         update = run_update(
             self._training_client,
             DPOObjective(reference, self.args.beta),
             datums,
-            optimizer_params(self.args, trio.AdamParams),
+            adam,
         )
         metrics = self._metrics(update.forward, update.optimizer)
+        metrics["optim/lr"] = adam.learning_rate
         metrics.update({
             "data/tokens": compute_train_tokens(datums),
             "time/prepare": prepared - started,
@@ -454,19 +474,25 @@ class DPOTrainer:
     async def step_async(self, rows: Sequence[Mapping[str, Any]]) -> DPOResult:
         """Asynchronous counterpart to :meth:`step`."""
 
+        self._checkpoint.require_training_loop()
         started = time.perf_counter()
         pairs = self._preferences(rows)
         datums = self._datums(pairs)
         prepared = time.perf_counter()
         reference = await self._reference_scores_async(pairs)
         referenced = time.perf_counter()
+        adam = optimizer_params(
+            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         update = await run_update_async(
             self._training_client,
             DPOObjective(reference, self.args.beta),
             datums,
-            optimizer_params(self.args, trio.AdamParams),
+            adam,
         )
         metrics = self._metrics(update.forward, update.optimizer)
+        metrics["optim/lr"] = adam.learning_rate
         metrics.update({
             "data/tokens": compute_train_tokens(datums),
             "time/prepare": prepared - started,
@@ -475,15 +501,7 @@ class DPOTrainer:
             "time/optim": update.optimizer_seconds,
         })
         self.state.global_step += 1
-        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
-            save_started = time.perf_counter()
-            await self._save_state_async()
-            metrics["time/save"] = time.perf_counter() - save_started
-        metrics["time/step"] = time.perf_counter() - started
-        metrics["time/tokens_per_second"] = (
-            metrics["data/tokens"] / metrics["time/step"]
-        )
-        metrics["time/pairs_per_second"] = len(pairs) / metrics["time/step"]
+        self.state.optimizer_steps += 1
         self._total_tokens += int(metrics["data/tokens"])
         self._total_pairs += len(pairs)
         metrics.update(
@@ -493,13 +511,21 @@ class DPOTrainer:
             }
         )
         self.state.metrics = metrics
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            save_started = time.perf_counter()
+            await self._save_state_async()
+            metrics["time/save"] = time.perf_counter() - save_started
         result = DPOResult(
             self.state.global_step,
             metrics,
             len(pairs),
             self.state.checkpoint_path,
         )
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = metrics["data/tokens"] / metrics["time/step"]
+        metrics["time/pairs_per_second"] = len(pairs) / metrics["time/step"]
         self._log_swanlab(metrics, len(pairs))
+        self._checkpoint.publish(self)
         return result
 
     @staticmethod
@@ -660,13 +686,15 @@ class DPOTrainer:
     # Full dataset training
     # ------------------------------------------------------------------
 
-    def train(self) -> DPOState:
+    def train(self, *, stop_after_step: int | None = None) -> DPOState:
         """Consume one dataset pass with synchronous PyTRIO calls."""
 
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train().")
         started = time.perf_counter()
-        batches = iter_batches(self.train_dataset, self.args.batch_size)
+        limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+        self._checkpoint.begin()
+        batches = iter_batches(self._checkpoint.rows(self), self.args.batch_size)
         progress = tqdm(
             total=self.args.max_steps,
             initial=self.state.global_step,
@@ -676,12 +704,10 @@ class DPOTrainer:
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
-                self.eval_dataset is not None
-                and self.args.eval_before_train
-                and self._last_eval_step is None
+                self._checkpoint.evaluation_due(self, self._last_eval_step)
             ):
                 self.evaluate()
-            while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
+            while limit is None or self.state.global_step < limit:
                 rows = next(batches, None)
                 if not rows:
                     break
@@ -696,36 +722,45 @@ class DPOTrainer:
                     and self._last_eval_step != self.state.global_step
                 ):
                     self.evaluate()
+                    self._checkpoint.publish(self)
             if self.state.global_step and (
                 not self.args.save_every or self.state.global_step % self.args.save_every
             ):
                 self._save_state()
             if (
                 self.eval_dataset is not None
+                and not paused
                 and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 self.evaluate()
-            self._flush_swanlab()
+            if not paused:
+                self._flush_swanlab()
             self._log_final_checkpoint()
-            self._log_final_samples(last_rows)
+            if not paused:
+                self._log_final_samples(last_rows)
             self._log_training_summary(started)
+            if self.state.checkpoint_path is not None:
+                self._checkpoint.publish(self)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise
         else:
-            self._finish_run("success")
+            self._finish_run("success", flush=not paused)
         finally:
+            self._checkpoint.end()
             progress.close()
         return self.state
 
-    async def train_async(self) -> DPOState:
+    async def train_async(self, *, stop_after_step: int | None = None) -> DPOState:
         """Consume one dataset pass with asynchronous PyTRIO calls."""
 
         if self.train_dataset is None:
             raise ValueError("train_dataset is required for train_async().")
         started = time.perf_counter()
-        batches = iter_batches(self.train_dataset, self.args.batch_size)
+        limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+        self._checkpoint.begin()
+        batches = iter_batches(self._checkpoint.rows(self), self.args.batch_size)
         progress = tqdm(
             total=self.args.max_steps,
             initial=self.state.global_step,
@@ -735,12 +770,10 @@ class DPOTrainer:
         last_rows: list[Mapping[str, Any]] = []
         try:
             if (
-                self.eval_dataset is not None
-                and self.args.eval_before_train
-                and self._last_eval_step is None
+                self._checkpoint.evaluation_due(self, self._last_eval_step)
             ):
                 await self.evaluate_async()
-            while self.args.max_steps is None or self.state.global_step < self.args.max_steps:
+            while limit is None or self.state.global_step < limit:
                 rows = next(batches, None)
                 if not rows:
                     break
@@ -755,25 +788,32 @@ class DPOTrainer:
                     and self._last_eval_step != self.state.global_step
                 ):
                     await self.evaluate_async()
+                    self._checkpoint.publish(self)
             if self.state.global_step and (
                 not self.args.save_every or self.state.global_step % self.args.save_every
             ):
                 await self._save_state_async()
             if (
                 self.eval_dataset is not None
+                and not paused
                 and self.args.eval_after_train
                 and self._last_eval_step != self.state.global_step
             ):
                 await self.evaluate_async()
-            self._flush_swanlab()
+            if not paused:
+                self._flush_swanlab()
             self._log_final_checkpoint()
-            await self._log_final_samples_async(last_rows)
+            if not paused:
+                await self._log_final_samples_async(last_rows)
             self._log_training_summary(started)
+            if self.state.checkpoint_path is not None:
+                self._checkpoint.publish(self)
         except BaseException as error:
             self._finish_run("crashed", str(error))
             raise
         else:
-            self._finish_run("success")
+            self._finish_run("success", flush=not paused)
         finally:
+            self._checkpoint.end()
             progress.close()
         return self.state

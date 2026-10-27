@@ -189,18 +189,39 @@ def sampling_params(config: Any, factory: Any = None, *, stop: Any = None) -> An
     return sdk_object("SamplingParams", values, factory)
 
 
-def optimizer_params(config: Any, factory: Any = None) -> Any:
+def optimizer_params(
+    config: Any, factory: Any = None, *, step: int | None = None,
+    total_steps: int | None = None,
+) -> Any:
     """Materialize remote Adam parameters from a trainer config.
 
     Args:
         config: Object exposing ``optimizer_params()``.
         factory: Optional ``AdamParams`` constructor.
+        step: One-based index of the optimizer update being submitted. Scheduled
+            callers must pass their own component's update index, including
+            pending SFT submissions. The default preserves constant-LR callers.
+        total_steps: Inferred optimizer horizon; explicit scheduler.total_steps
+            takes precedence. It is not the number of remaining updates.
 
     Returns:
         A PyTRIO ``AdamParams`` instance or compatibility mapping.
     """
 
-    return sdk_object("AdamParams", config.optimizer_params(), factory)
+    values = dict(config.optimizer_params())
+    optimizer = getattr(config, "optimizer", config)
+    schedule = getattr(optimizer, "scheduler", None)
+    if schedule is not None:
+        if step is None:
+            if schedule.type != "constant" or schedule.warmup_steps:
+                raise ValueError("Scheduled optimizer_params requires an optimizer step.")
+        else:
+            from ..utils.scheduler import learning_rate_for_step
+
+            values["learning_rate"] = learning_rate_for_step(optimizer, step, total_steps=total_steps)
+            if values["learning_rate"] <= 0:
+                raise ValueError("PyTRIO requires a positive scheduled learning rate.")
+    return sdk_object("AdamParams", values, factory)
 
 
 __all__ = [

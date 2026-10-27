@@ -58,6 +58,13 @@ def load_experiment(path: Path, *, model=None, steps=None):
             (path.resolve().parent / reporting["log_dir"]).resolve()
         )
     values["reporting"] = reporting
+    # Keep runtime manifest paths under the experiment's existing relative-path
+    # contract, including when a saved run is resumed from another directory.
+    checkpoint = dict(values.get("checkpoint", {}))
+    for name in ("state_dir", "resume_from"):
+        if checkpoint.get(name) and not Path(checkpoint[name]).is_absolute():
+            checkpoint[name] = str((path.resolve().parent / checkpoint[name]).resolve())
+    values["checkpoint"] = checkpoint
     trainer = PPOConfig.for_algorithm(algorithm, **values)
     agent = AgentConfig.from_dict(settings.get("agent", {}))
     costs = CostConfig(**settings.get("reward", {}))

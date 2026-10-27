@@ -2,31 +2,33 @@
 
 **PyTRIO-native training recipes and trainer building blocks.**
 
-Triotune provides text-training recipes and trainer components through the public PyTRIO client API. It handles data preparation, reward and advantage calculation, token alignment, and training-loop orchestration. PyTRIO supplies model execution, tokenization, sampling, and optimization.
+Triotune handles data preparation, rewards, advantages, token alignment, and training loops through the public PyTRIO client API. PyTRIO supplies model execution, tokenization, sampling, optimization, and checkpoint storage.
 
 <p align="center">
   <a href="README_CN.md">中文文档</a>
 </p>
 
-
 ## 🗂️ Contents
 
 - [Introduction](#-introduction)
 - [News](#-news)
-- [Installation](#-installation)
-- [Algorithms](#-algorithms)
-- [Data contracts](#-data-contracts)
-- [Token usage metrics](#token-usage-metrics)
+- [Get Started](#-get-started)
+  - [Installation](#-installation)
+  - [Quick Start](#-quick-start)
+- [Supported Features](#-supported-features)
+  - [Algorithms](#-algorithms)
+  - [Models](#-models)
 - [Python API](#-python-api)
+- [Agent RL](#agent-rl)
+- [Data Contracts](#-data-contracts)
+- [Token Usage Metrics](#token-usage-metrics)
 - [Documentation](#documentation)
-- [Repository layout](#-repository-layout)
-- [Current scope](#-current-scope)
+- [Repository Layout](#-repository-layout)
+- [Current Scope](#-current-scope)
 
 ## 👋 Introduction
 
-Triotune provides a trainer-shaped interface for a few PyTRIO-backed training algorithms. The package is intentionally client-side: PyTRIO remains responsible for model weights, LoRA training clients, tokenizers, sampling, forward/backward execution, optimizer steps, and checkpoint storage.
-
-The current trainers are:
+Choose from four PyTRIO-backed trainers:
 
 - **PPO**: one asynchronous trainer for PPO, GRPO, RLOO, GSPO, SAPO, CISPO, DAPO, and related presets.
 - **DPO**: chosen/rejected preference pairs, optional reference-policy scoring, and a local pairwise loss submitted through PyTRIO.
@@ -35,19 +37,20 @@ The current trainers are:
 
 PPO, DPO, and OPD include asynchronous training paths where the underlying PyTRIO client supports them. Shared utilities handle text, token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
-For multi-turn tool-using agents, triotune.agentrl provides execution, sampling,
-trajectory export, scoring, and evaluation interfaces over the existing PPO trainer.
+For multi-turn agents, `triotune.agentrl` adds tool execution, trajectory export, scoring, and evaluation to the PPO trainer.
 
 ## 📰 News
 
-- **2026-10-19:** Triotune 0.1.1 standardized dataset preprocessing and renamed the distribution and source layout to triotune, while adding modular PPO and on-policy distillation pipelines plus YAML-based recipe configuration.
-- **2026-10-12:** Triotune 0.1.0 (pytrio-cookbook) was published to [PyPI](https://pypi.org/project/pytrio-cookbook/).
+- **0.1.3 · 2026-10-27:** Multi-turn Agent RL, tool execution, trajectory and reward alignment, OpenAI integration, and bilingual training examples.
+- **0.1.2 · 2026-10-19:** Fixed package exports so the PyPI distribution and Python import both use `triotune`; updated examples and documentation.
+- **0.1.1 · 2026-10-19:** Standardized dataset preprocessing, renamed the distribution and source layout to `triotune`, and added modular PPO, on-policy distillation, and YAML recipe configuration.
+- **0.1.0 · 2026-10-12:** Initial release as `pytrio-cookbook` on [PyPI](https://pypi.org/project/triotune/).
 
 ## 🚀 Get Started
 
 ### 📦 Installation
 
-- Python 3.12 (the package currently declares >=3.12,<3.13)
+- Python 3.12 (`>=3.12,<3.13`)
 - Access to a PyTRIO-compatible training service and the models used by your recipe
 
 Install [uv](https://docs.astral.sh/uv/) on macOS or Linux:
@@ -80,7 +83,7 @@ Run the GSM8K PPO example with its YAML configuration:
 uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yaml
 ```
 
-## 🔧 Support Matrix
+## 🔧 Supported Features
 
 ### 🧠 Algorithms
 
@@ -98,27 +101,6 @@ PyTRIO currently supports the following models:
 
 - Qwen/Qwen3.5-4B
 - Qwen/Qwen3.8-27B
-
-## 🧩 Data contracts
-
-The trainers accept a deliberately small set of input representations:
-
-- a string;
-- a non-empty list of token IDs; or
-- a non-empty list of {role, content} chat messages.
-
-Algorithm-specific fields are:
-
-- **GRPO:** messages and a string answer used by the reward function;
-- **DPO:** shared messages, plus chosen and rejected responses;
-- **SFT:** text, messages, prompt/completion, or pre-tokenized input_ids (optionally with labels);
-- **OPD:** prompt rows; the teacher scores completions sampled by the student.
-
-See the [trainer guide](triotune/trainer/README.md) for validation rules and complete JSONL examples.
-
-## Token usage metrics
-
-[PyTRIO](https://pytrio.com/dashboard) records training tokens , prefill tokens , sampler tokens. Triotune reports these counts and their running totals in SwanLab, preferring PyTRIO's sampling counters and accumulating training usage from submitted compute requests. The counts normally agree, but fallback counting, failed requests, or retries may cause differences; PyTRIO's server-side records are authoritative.
 
 ## 🐍 Python API
 
@@ -140,6 +122,93 @@ asyncio.run(
 )
 ```
 
+## Agent RL
+
+Install the `ppo` extra and configure PyTRIO credentials. Define a tool and an episode reward, then train with GRPO:
+
+```python
+import asyncio
+
+from triotune import PPOConfig, PPOTrainer
+from triotune.agentrl import (
+    AgentConfig, AgentTrainingLoop, EpisodeScore, FunctionToolExecutor, function_tool,
+)
+
+
+@function_tool
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+
+class AnswerScorer:
+    async def score(self, row, episode):
+        used_tool = any(
+            not result.is_error
+            for turn in episode.turns for result in turn.tool_results
+        )
+        success = (
+            episode.status == "completed" and used_tool
+            and episode.final_text.strip() == row["answer"]
+        )
+        return EpisodeScore(float(success), success)
+
+
+async def main():
+    trainer = PPOTrainer(
+        model="Qwen/Qwen3.5-4B",
+        args=PPOConfig.for_algorithm("grpo", batch_size=1, max_steps=1),
+        train_dataset=[{
+            "messages": [
+                {"role": "system", "content": (
+                    'Use add. Reply with JSON: '
+                    '{"tool_calls":[{"name":"add","arguments":{"a":2,"b":3}}]}. '
+                    'After tool_results, reply with {"final":"5"}.'
+                )},
+                {"role": "user", "content": "What is 2 + 3?"},
+            ],
+            "answer": "5",
+        }],
+    )
+    agent = AgentConfig()
+    snapshot = await trainer.create_sampling_snapshot(stop=agent.stop)
+    workflow = agent.build_workflow(
+        tokenizer=snapshot.tokenizer,
+        tools=FunctionToolExecutor([add]),
+        scorer=AnswerScorer(),
+    )
+    state = await AgentTrainingLoop(trainer, workflow, config=agent).train()
+    print(state.checkpoint_path)
+
+
+asyncio.run(main())
+```
+
+See the [AgentRL guide](docs/agenrl/README.md) for evaluation and custom workflows.
+
+## 🧩 Data Contracts
+
+The trainers accept:
+
+- a string;
+- a non-empty list of token IDs; or
+- a non-empty list of `{role, content}` chat messages.
+
+Algorithm-specific fields are:
+
+- **GRPO:** `messages` and a string `answer` used by the reward function;
+- **DPO:** shared `messages`, plus `chosen` and `rejected` responses;
+- **SFT:** `text`, `messages`, `prompt`/`completion`, or pre-tokenized `input_ids` (optionally with `labels`);
+- **OPD:** prompt rows; the teacher scores completions sampled by the student.
+
+See the [trainer guide](triotune/trainer/README.md) for validation rules and complete JSONL examples.
+
+## Token Usage Metrics
+
+[PyTRIO](https://pytrio.com/dashboard) records training, prefill, and sampler tokens. Triotune reports these counts and their running totals in SwanLab, using PyTRIO's sampling counters when available and submitted compute requests for training usage.
+
+Fallback counting, failed requests, or retries may cause differences. PyTRIO's server-side records are authoritative.
+
 ## Documentation
 
 - [Trainer guide](triotune/trainer/README.md)
@@ -147,16 +216,17 @@ asyncio.run(
 - [PPO algorithm guide](docs/algorithms/ppo_series.md)
 - [GRPO algorithm guide](docs/algorithms/grpo_series.md)
 
-## 🗃 Repository layout
+## 🗃 Repository Layout
 
 ```text
 triotune/
 ├── api/           # Public configuration and client contracts
+├── agentrl/       # Agent execution, trajectories, and training loops
 ├── dataset/       # Shared validation and tokenization
 ├── trainer/       # Algorithm trainers and components
 └── utils/         # Shared runtime utilities
 ```
 
-## 🎯 Current scope
+## 🎯 Current Scope
 
-Triotune currently targets text-only, PyTRIO-backed experiments. It does not claim to provide a Web UI, Megatron integration, multimodal training, or a universal plugin/registry system. If you need a custom model module, first adapt it to the public PyTRIO client contract and use the existing trainer interfaces; first-class custom-module registration is planned work, not a supported promise of version 0.1.2.
+Triotune targets text-only training through PyTRIO. Custom model modules must implement PyTRIO's public client contract to use the trainer interfaces. Web UI, Megatron integration, multimodal training, and a general plugin registry are outside the current scope.

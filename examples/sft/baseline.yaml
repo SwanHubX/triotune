@@ -1,0 +1,28 @@
+# Fixed prompt/completion supervision; no dataset download or network reporter.
+model:
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 8
+training:
+  batch_size: 2
+  max_steps: 2
+  seed: 42
+optimizer:
+  learning_rate: 0.0001
+data:
+  max_length: 256
+  completion_only_loss: true
+  chat_template_kwargs: {enable_thinking: false}
+execution:
+  # Keep requests serialized to make this acceptance baseline easy to inspect.
+  max_in_flight: 1
+evaluation:
+  before_train: true
+  after_train: true
+  steps: 0
+  batch_size: 2
+  max_batches: 1
+checkpoint:
+  save_every: 0
+reporting:
+  report_to: null
+  logging_step: 1
