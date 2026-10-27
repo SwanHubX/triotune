@@ -23,9 +23,12 @@ from .rollout.workflow import (
 )
 from .runtime.conversation import (
     ChatTemplateRenderer,
+    CompactionPlan,
+    ContextCompactor,
     JsonActionParser,
     JsonObservationFormatter,
     NativeToolContinuationRenderer,
+    PrefixCache,
     TokenAppendRenderer,
 )
 from .runtime.runner import EpisodeRunner, RuntimeBoundary
@@ -61,6 +64,8 @@ from .types import (
     AgentEvent,
     AgentSampler,
     AgentTurn,
+    ContextCompaction,
+    ConversationCompactor,
     ConversationRenderer,
     EpisodeBranch,
     EpisodeExecutor,
@@ -110,7 +115,11 @@ __all__ = [
     "AgentTrainingLoop",
     "AgentTurn",
     "ChatTemplateRenderer",
+    "CompactionPlan",
     "CompositeScorer",
+    "ContextCompaction",
+    "ContextCompactor",
+    "ConversationCompactor",
     "ConversationRenderer",
     "CostConfig",
     "EpisodeBranch",
@@ -140,6 +149,7 @@ __all__ = [
     "ObservationFormatter",
     "OpenAIClient",
     "OpenAISession",
+    "PrefixCache",
     "PyTRIOAgentSampler",
     "PyTRIOBackend",
     "Qwen35ToolParser",

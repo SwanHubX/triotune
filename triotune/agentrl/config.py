@@ -109,6 +109,20 @@ class AgentConfig:
     # per sibling branch and normalizes its objective contribution from the
     # branch-declared shared_prefix_weight values.
     shared_prefix_policy: str = "deduplicate"
+    # Context compaction is opt-in because summaries change the model-visible
+    # state. Exact sampled actions before a reset remain separate PPO fragments.
+    context_compaction: bool = False
+    compaction_keep_recent_interactions: int = 2
+    compaction_summary_chars: int = 4096
+    # Full prompt tokenizations are safe to cache because generations and
+    # behavior probabilities are never stored in this renderer-local LRU.
+    prefix_cache_size: int = 256
+    # Asynchronous scheduling pipelines fixed-snapshot collection with the
+    # previous PPO update. Capacity counts prefetched batches, and the explicit
+    # staleness allowance bounds how old their behavior policy may be.
+    async_rollouts: bool = False
+    rollout_prefetch_capacity: int = 1
+    max_policy_staleness: int = 0
 
     def __post_init__(self) -> None:
         for name, cls in (
@@ -123,6 +137,25 @@ class AgentConfig:
                 raise TypeError(f"{name} must be a {cls.__name__} or mapping.")
         positive_int(self.max_concurrency, "max_concurrency")
         positive_int(self.max_refill_batches, "max_refill_batches")
+        positive_int(
+            self.compaction_keep_recent_interactions,
+            "compaction_keep_recent_interactions",
+        )
+        positive_int(self.compaction_summary_chars, "compaction_summary_chars")
+        positive_int(self.rollout_prefetch_capacity, "rollout_prefetch_capacity")
+        if type(self.prefix_cache_size) is not int or self.prefix_cache_size < 0:
+            raise ValueError("prefix_cache_size must be a nonnegative integer.")
+        if type(self.max_policy_staleness) is not int or self.max_policy_staleness < 0:
+            raise ValueError("max_policy_staleness must be a nonnegative integer.")
+        for name in ("context_compaction", "async_rollouts"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be boolean.")
+        if self.async_rollouts and (
+            self.max_policy_staleness < self.rollout_prefetch_capacity
+        ):
+            raise ValueError(
+                "Async rollout capacity cannot exceed max_policy_staleness."
+            )
         if self.min_usable_group_size is not None:
             positive_int(self.min_usable_group_size, "min_usable_group_size")
         if self.export_mode not in {"concat", "individual", "branch"}:
@@ -175,15 +208,19 @@ class AgentConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def build_workflow(self, *, tokenizer, tools, scorer, logger=None):
+    def build_workflow(
+        self, *, tokenizer, tools, scorer, logger=None, context_compactor=None
+    ):
         """Compose the built-in JSON adapters with application tools/scoring."""
         from .diagnostics.logging import JsonlEpisodeLogger
         from .rollout.trajectory import EpisodeTrajectoryBuilder
         from .rollout.workflow import AgentRolloutWorkflow
         from .runtime.conversation import (
             ChatTemplateRenderer,
+            ContextCompactor,
             JsonActionParser,
             JsonObservationFormatter,
+            PrefixCache,
             TokenAppendRenderer,
         )
         from .runtime.runner import EpisodeRunner
@@ -193,6 +230,14 @@ class AgentConfig:
             if self.renderer == "token_append"
             else ChatTemplateRenderer
         )
+        prefix_cache = (
+            PrefixCache(self.prefix_cache_size) if self.prefix_cache_size else None
+        )
+        if context_compactor is None and self.context_compaction:
+            context_compactor = ContextCompactor(
+                keep_recent_interactions=self.compaction_keep_recent_interactions,
+                max_summary_chars=self.compaction_summary_chars,
+            )
         if logger is None and self.log_path is not None:
             logger = JsonlEpisodeLogger(self.log_path)
         return AgentRolloutWorkflow(
@@ -201,6 +246,7 @@ class AgentConfig:
                 renderer=renderer(
                     tokenizer,
                     advertise_tools=self.advertise_tools,
+                    prefix_cache=prefix_cache,
                     **self.template_kwargs,
                 ),
                 tools=tools,
@@ -210,6 +256,7 @@ class AgentConfig:
                 retry=self.retry,
                 prompt_key=self.prompt_key,
                 trajectory_builder=EpisodeTrajectoryBuilder(mode=self.export_mode),
+                context_compactor=context_compactor,
             ),
             max_concurrency=self.max_concurrency,
             logger=logger,

@@ -18,7 +18,6 @@ from typing import Literal, Protocol
 
 from ..types import AgentContractError, EpisodeScore, EpisodeScorer
 
-
 RewardTarget = Literal["interaction", "turn", "token", "trajectory"]
 RewardMode = Literal["reward", "advantage"]
 RewardAggregation = Literal["sum", "mean", "last"]
@@ -32,6 +31,7 @@ class RewardSubmitter(Protocol):
         assignments,
         *,
         logical_rollout_id: str | None = None,
+        submission_id: str | None = None,
     ) -> tuple["RewardAssignment", ...]: ...
 
 
@@ -51,6 +51,8 @@ class RewardAssignment:
     trajectory-level assignment needs no index; interaction, turn and token
     assignments use it to retain their original location.  ``source`` is a
     stable diagnostic name and is also the grouping key for aggregation.
+    A trajectory advantage is broadcast to every active model-output token;
+    it bypasses reward shaping and GAE and never changes critic returns.
     """
 
     target: RewardTarget
@@ -80,42 +82,50 @@ class RewardAssignment:
             raise ValueError("RewardAssignment.source must be nonempty.")
         if self.target == "trajectory" and self.position is not None:
             raise ValueError("Trajectory assignments do not have a position.")
-        if self.target in {"interaction", "turn"} and self.position is not None and (
-            type(self.position) is not int or self.position < 0
+        if (
+            self.target in {"interaction", "turn"}
+            and self.position is not None
+            and (type(self.position) is not int or self.position < 0)
         ):
-            raise ValueError("Interaction and turn positions must be nonnegative integers.")
-        if self.target == "token" and self.position is not None and (
-            not isinstance(self.position, tuple)
-            or len(self.position) != 2
-            or any(type(value) is not int or value < 0 for value in self.position)
+            raise ValueError(
+                "Interaction and turn positions must be nonnegative integers."
+            )
+        if (
+            self.target == "token"
+            and self.position is not None
+            and (
+                not isinstance(self.position, tuple)
+                or len(self.position) != 2
+                or any(type(value) is not int or value < 0 for value in self.position)
+            )
         ):
             raise ValueError("Token positions must be (turn, token) integer pairs.")
 
 
-def aggregate_assignments(
-    assignments: Sequence[RewardAssignment],
-) -> tuple[float, dict[int, tuple[float, ...]], dict[int, tuple[float, ...]]]:
-    """Fold submitted assignments into outcome, process and direct-advantage data.
-
-    Assignments are grouped by source, mode, target and position.  This makes
-    ``mean`` and ``last`` explicit and prevents a scorer retry from silently
-    adding the same logical submission twice when callers reuse the list.
-    """
-
+def _aggregate_assignment_data(assignments, rollout_ids=None):
+    """Reduce signals by scope/source/target without losing target positions."""
     groups: dict[tuple, list[RewardAssignment]] = {}
-    for assignment in assignments:
+    scopes = [None] * len(assignments) if rollout_ids is None else rollout_ids
+    for scope, assignment in zip(scopes, assignments, strict=True):
+        if not isinstance(assignment, RewardAssignment):
+            raise TypeError("Expected RewardAssignment objects.")
+        assignment.__post_init__()
         key = (
+            scope,
             assignment.mode,
             assignment.target,
             assignment.source,
             assignment.position,
         )
+        if key in groups and groups[key][0].aggregation != assignment.aggregation:
+            raise AgentContractError(
+                "Assignments for one source and target must share aggregation."
+            )
         groups.setdefault(key, []).append(assignment)
 
     outcome = 0.0
-    process: dict[int, dict[int, float]] = {}
-    direct: dict[int, dict[int, float]] = {}
-    for (mode, target, _source, position), values in groups.items():
+    process, direct = {}, {}
+    for (_scope, mode, target, _source, position), values in groups.items():
         weighted = [float(item.value) * float(item.discount) for item in values]
         if values[0].aggregation == "mean":
             value = sum(weighted) / len(weighted)
@@ -126,59 +136,150 @@ def aggregate_assignments(
         if target == "trajectory":
             if mode == "reward":
                 outcome += value
-            continue
-        if target == "token":
-            if not isinstance(position, tuple):
-                raise AgentContractError("Token assignments require a (turn, token) position.")
-            turn, token = position
-        else:
-            if type(position) is not int:
-                raise AgentContractError(f"{target.title()} assignments require a position.")
-            turn, token = position, -1
+                continue
+        elif position is None:
+            raise AgentContractError(
+                f"{target.title()} assignments require a position."
+            )
         destination = direct if mode == "advantage" else process
-        row = destination.setdefault(turn, {})
-        row[token] = row.get(token, 0.0) + value
+        key = (target, position)
+        destination[key] = destination.get(key, 0.0) + value
+    if not all(
+        math.isfinite(value) for value in (outcome, *process.values(), *direct.values())
+    ):
+        raise AgentContractError("Aggregated rewards and advantages must be finite.")
+    return outcome, process, direct
 
-    def vectors(source: dict[int, dict[int, float]]) -> dict[int, tuple[float, ...]]:
+
+def _assignment_vectors(outcome, process, direct):
+    """Keep legacy per-turn vectors and expose trajectory advantage at None."""
+
+    def vectors(source):
+        turns = {}
+        for (target, position), value in source.items():
+            if target == "trajectory":
+                turns[None] = {0: value}
+                continue
+            turn, token = position if target == "token" else (position, -1)
+            row = turns.setdefault(turn, {})
+            row[token] = row.get(token, 0.0) + value
         return {
             turn: tuple(values[index] for index in sorted(values))
-            for turn, values in source.items()
+            for turn, values in turns.items()
         }
 
     return outcome, vectors(process), vectors(direct)
 
 
-class RewardLedger:
-    """Idempotent reward submission buffer for one logical rollout session.
+def aggregate_assignments(
+    assignments: Sequence[RewardAssignment],
+) -> tuple[float, dict[int, tuple[float, ...]], dict[int | None, tuple[float, ...]]]:
+    """Fold contributions into outcome, process and direct-advantage vectors.
 
-    A ledger accepts delayed scorer results and suppresses repeated trajectory
-    outcome submissions for the same logical rollout. Process and advantage
-    assignments remain position keyed, so independently scored interactions
-    can still contribute without multiplying the terminal outcome.
+    Group by source, mode, target and position before applying sum/mean/last.
+    This function does not deduplicate submissions; RewardLedger owns that
+    boundary. A trajectory advantage is returned as ``direct[None] = (value,)``
+    because it has no turn position. The exporter uses the same reduction with
+    exact target positions to broadcast that scalar only onto model actions.
+    """
+    return _assignment_vectors(*_aggregate_assignment_data(assignments))
+
+
+class RewardLedger:
+    """Idempotent reward submission buffer with independent rollout scopes.
+
+    Explicit submission IDs identify whole atomic payloads within a rollout.
+    Exact retries are ignored; conflicting payloads raise before any mutation.
+    Different IDs can contribute to the same signal's sum/mean/last aggregation.
+    Without an ID, legacy rollout/source/mode deduplication applies to whole
+    trajectory bundles, never to individual values inside a submit call.
+    Process signals without explicit submission IDs remain additive.
     """
 
     def __init__(self):
         self._assignments: list[RewardAssignment] = []
-        self._trajectory_submissions: set[tuple[str, str, str]] = set()
+        self._rollout_ids: list[str | None] = []
+        self._trajectory_submissions: dict[tuple, tuple[RewardAssignment, ...]] = {}
+        self._submissions: dict[tuple, tuple[RewardAssignment, ...]] = {}
+        self._aggregations: dict[tuple, str] = {}
 
     def submit(
         self,
         assignments: RewardAssignment | Sequence[RewardAssignment],
         *,
         logical_rollout_id: str | None = None,
+        submission_id: str | None = None,
     ) -> tuple[RewardAssignment, ...]:
-        values = (assignments,) if isinstance(assignments, RewardAssignment) else tuple(assignments)
-        accepted = []
+        """Commit a validated payload, returning only newly accepted contributions."""
+        for name, identity in (
+            ("logical_rollout_id", logical_rollout_id),
+            ("submission_id", submission_id),
+        ):
+            if identity is not None and (
+                not isinstance(identity, str) or not identity.strip()
+            ):
+                raise AgentContractError(f"{name} must be a nonempty string or None.")
+        values = (
+            (assignments,)
+            if isinstance(assignments, RewardAssignment)
+            else tuple(assignments)
+        )
+        # Validate the entire payload before claiming an ID or appending values.
+        _aggregate_assignment_data(values)
+        submission_key = (logical_rollout_id, submission_id)
+        if submission_id is not None and submission_key in self._submissions:
+            if self._submissions[submission_key] != values:
+                raise AgentContractError(
+                    "submission_id conflicts with its previous reward payload."
+                )
+            return ()
+
+        pending_bundles = {}
+        if submission_id is None and logical_rollout_id is not None:
+            for assignment in values:
+                if assignment.target == "trajectory":
+                    key = (logical_rollout_id, assignment.source, assignment.mode)
+                    pending_bundles.setdefault(key, []).append(assignment)
+        repeated = set()
+        for key, bundle in pending_bundles.items():
+            if key in self._trajectory_submissions:
+                if self._trajectory_submissions[key] != tuple(bundle):
+                    raise AgentContractError(
+                        "Trajectory submission conflicts; use distinct submission_id values for new contributions."
+                    )
+                repeated.add(key)
+
+        accepted, aggregations = [], dict()
         for assignment in values:
-            if not isinstance(assignment, RewardAssignment):
-                raise TypeError("RewardLedger accepts RewardAssignment objects.")
-            if logical_rollout_id is not None and assignment.target == "trajectory":
-                key = (logical_rollout_id, assignment.source, assignment.mode)
-                if key in self._trajectory_submissions:
-                    continue
-                self._trajectory_submissions.add(key)
-            self._assignments.append(assignment)
+            if (
+                assignment.target == "trajectory"
+                and (logical_rollout_id, assignment.source, assignment.mode) in repeated
+            ):
+                continue
+            key = (
+                logical_rollout_id,
+                assignment.mode,
+                assignment.target,
+                assignment.source,
+                assignment.position,
+            )
+            previous = aggregations.get(
+                key, self._aggregations.get(key, assignment.aggregation)
+            )
+            if previous != assignment.aggregation:
+                raise AgentContractError(
+                    "Assignments for one source and target must share aggregation."
+                )
+            aggregations[key] = assignment.aggregation
             accepted.append(assignment)
+
+        self._assignments.extend(accepted)
+        self._rollout_ids.extend([logical_rollout_id] * len(accepted))
+        self._aggregations.update(aggregations)
+        if submission_id is not None:
+            self._submissions[submission_key] = values
+        for key, bundle in pending_bundles.items():
+            self._trajectory_submissions[key] = tuple(bundle)
         return tuple(accepted)
 
     commit = submit
@@ -188,7 +289,11 @@ class RewardLedger:
         return tuple(self._assignments)
 
     def aggregate(self):
-        return aggregate_assignments(self._assignments)
+        # Normalize each rollout's aggregation population independently, then
+        # sum its signals; one runner can own a ledger across many candidates.
+        return _assignment_vectors(
+            *_aggregate_assignment_data(self._assignments, self._rollout_ids)
+        )
 
 
 def validate_process_rewards(episode, rewards) -> None:

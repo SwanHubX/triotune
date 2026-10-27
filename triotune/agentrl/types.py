@@ -289,6 +289,57 @@ class AgentTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextCompaction:
+    """Audit one exact-token context reset before a generated interaction.
+
+    ``turn_index`` identifies the first turn sampled from the compacted prompt.
+    The new prompt IDs are stored verbatim because a summary is model context,
+    not behavior-policy output, and must never be reconstructed by decoding old
+    actions. Retained and summarized interaction IDs explain which prior tool
+    exchanges remain literal and which were replaced by application-provided
+    summaries. Export uses these records to split one logical rollout into
+    independently causal physical rows.
+    """
+
+    turn_index: int
+    original_prompt_tokens: int
+    compacted_prompt_tokens: tuple[int, ...]
+    retained_interaction_ids: tuple[str, ...] = ()
+    summarized_interaction_ids: tuple[str, ...] = ()
+    removed_messages: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.turn_index) is not int or self.turn_index < 1:
+            raise AgentContractError("Compaction turn_index must be positive.")
+        if (
+            type(self.original_prompt_tokens) is not int
+            or self.original_prompt_tokens < 1
+            or type(self.removed_messages) is not int
+            or self.removed_messages < 1
+        ):
+            raise AgentContractError(
+                "Compaction token and removed-message counts must be positive."
+            )
+        validate_tokens(self.compacted_prompt_tokens, name="compacted_prompt_tokens")
+        for name in ("retained_interaction_ids", "summarized_interaction_ids"):
+            values = getattr(self, name)
+            if (
+                not isinstance(values, tuple)
+                or len(set(values)) != len(values)
+                or any(not isinstance(value, str) or not value for value in values)
+            ):
+                raise AgentContractError(
+                    f"{name} must contain unique nonempty interaction IDs."
+                )
+        if set(self.retained_interaction_ids).intersection(
+            self.summarized_interaction_ids
+        ):
+            raise AgentContractError(
+                "An interaction cannot be both retained and summarized."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class RetryEvent:
     """One transient failed operation, including the exhausted final attempt."""
 
@@ -653,6 +704,7 @@ class EpisodeResult:
     events: list[AgentEvent] = field(default_factory=list)
     export_metadata: dict[str, Any] = field(default_factory=dict)
     branches: list[EpisodeBranch] = field(default_factory=list)
+    compactions: list[ContextCompaction] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate identity fields before tools or scorers observe a record.
@@ -753,6 +805,42 @@ class EpisodeResult:
                 raise AgentContractError(
                     "Branches in one group must start from the same parent interaction."
                 )
+        previous_compaction = 0
+        generated_ids = [
+            interaction.interaction_id
+            for interaction in self.interactions
+            if interaction.turn is not None
+        ]
+        for compaction in self.compactions:
+            if not isinstance(compaction, ContextCompaction):
+                raise AgentContractError(
+                    "Episode compactions must be ContextCompaction records."
+                )
+            compaction.__post_init__()
+            if (
+                compaction.turn_index <= previous_compaction
+                or compaction.turn_index > len(self.turns)
+            ):
+                raise AgentContractError(
+                    "Compaction turn indices must be ordered generated-turn boundaries."
+                )
+            if (
+                compaction.turn_index < len(self.turns)
+                and tuple(self.turns[compaction.turn_index].prompt_tokens)
+                != compaction.compacted_prompt_tokens
+            ):
+                raise AgentContractError(
+                    "Compaction tokens differ from the sampled turn prompt."
+                )
+            prior_ids = set(generated_ids[: compaction.turn_index])
+            if not set(
+                compaction.retained_interaction_ids
+                + compaction.summarized_interaction_ids
+            ).issubset(prior_ids):
+                raise AgentContractError(
+                    "Compaction provenance refers to a non-prior interaction."
+                )
+            previous_compaction = compaction.turn_index
 
     @property
     def trainable(self) -> bool:
@@ -830,6 +918,14 @@ class ConversationRenderer(Protocol):
     def render(
         self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
     ) -> list[int]: ...
+
+
+class ConversationCompactor(Protocol):
+    """Replace old message blocks without changing recorded sampled actions."""
+
+    async def compact(
+        self, messages: Sequence[Mapping[str, Any]], episode: EpisodeResult
+    ) -> Any: ...
 
 
 class ActionParser(Protocol):

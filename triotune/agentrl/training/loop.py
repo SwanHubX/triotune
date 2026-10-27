@@ -9,6 +9,7 @@ weights. It adds no new policy-loss or reward mathematics.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ from ...utils.dataloader import iter_batches, num_batches
 from ..config import AgentConfig
 from ..rollout.workflow import AgentRolloutBatch, AgentRolloutWorkflow
 from ..runtime.sampling import SamplingSnapshot
+from ..types import AgentContractError
 from .evaluation import evaluation_metrics, paired_task_metrics
 
 
@@ -51,10 +53,12 @@ if TYPE_CHECKING:
 
 
 class AgentTrainingLoop:
-    """Collect before updating; one snapshot covers all turns and prompt groups.
+    """Train from fixed snapshots with optional bounded collection overlap.
 
-    This loop does not overlap optimizer updates with collection. The supplied
-    PPOTrainer owns all model clients, optimizers, checkpoints and reporting.
+    The default path finishes collection before updating. Asynchronous mode
+    overlaps completed-snapshot sampling with one serialized PPO update and
+    validates the resulting policy age before consumption. The supplied trainer
+    still owns all model clients, optimizers, checkpoints, and reporting.
     """
 
     def __init__(
@@ -107,7 +111,7 @@ class AgentTrainingLoop:
         snapshot = await self.snapshot_factory()
         # Hold one policy fixed across all evaluation batches so the aggregate
         # describes a single model state, even when the dataset is streamed.
-        episodes, trajectories, exports, groups = [], [], [], {}
+        episodes, trajectories, exports, groups, branch_groups = [], [], [], {}, {}
         row_offset, dropped = 0, 0
         task_ids = set()
         batch_size = config.eval_batch_size or config.batch_size
@@ -141,13 +145,19 @@ class AgentTrainingLoop:
                 trajectories.extend(batch.trajectories)
                 exports.extend(batch.exports)
                 groups.update(batch.groups)
+                branch_groups.update(batch.branch_groups)
                 dropped += batch.dropped_groups
                 row_offset += len(batch_rows)
                 progress.update(1)
         if not episodes:
             raise ValueError("Agent evaluation dataset is empty.")
         self.last_eval_batch = AgentRolloutBatch(
-            episodes, trajectories, dropped, exports=exports, groups=groups
+            episodes,
+            trajectories,
+            dropped,
+            exports=exports,
+            groups=groups,
+            branch_groups=branch_groups,
         )
         metrics = self.last_eval_batch.metrics(prefix="eval/agent")
         metrics.update(
@@ -176,7 +186,9 @@ class AgentTrainingLoop:
         )
         return None if seed is None else seed + offset
 
-    async def _collect(self, rows) -> AgentRolloutBatch:
+    async def _collect(
+        self, rows, snapshot: SamplingSnapshot | None = None
+    ) -> AgentRolloutBatch:
         """Collect prompt groups and optionally refill uninformative groups.
 
         The source iterator is consumed once. Dynamic sampling reuses the
@@ -185,7 +197,7 @@ class AgentTrainingLoop:
         even though their trajectories do not enter the optimizer batch.
         """
         config = self.trainer.args
-        snapshot = await self.snapshot_factory()
+        snapshot = snapshot or await self.snapshot_factory()
         episodes, accepted, exports, groups, branch_groups = [], [], [], {}, {}
         self.last_train_snapshot = snapshot
         group_count, empty_batches, dropped, refills = 0, 0, 0, 0
@@ -220,7 +232,7 @@ class AgentTrainingLoop:
             )
             groups.update(batch.groups)
             branch_groups.update(batch.branch_groups)
-            group_count += len({t.group_id for t in generated})
+            group_count += len({t.reward_group_id or t.group_id for t in generated})
             empty_batches = 0 if generated else empty_batches + 1
             if empty_batches >= config.max_empty_batches:
                 raise RuntimeError(
@@ -235,6 +247,103 @@ class AgentTrainingLoop:
             groups,
             branch_groups,
         )
+
+    async def _update(self, batch, snapshot, progress, *, max_staleness=0):
+        """Consume one completed batch and record its exact sampling provenance."""
+        trainer = self.trainer
+        self.last_train_snapshot = snapshot
+        previous_optimizer_steps = trainer.state.optimizer_steps
+        metrics = await trainer.step(batch.trajectories, max_staleness=max_staleness)
+        self.last_train_batch = batch
+        self.update_history.append(
+            {
+                "step": trainer.state.global_step,
+                "snapshot_ids": sorted({e.snapshot_id for e in batch.episodes}),
+                "policy_versions": sorted(
+                    {str(e.policy_version) for e in batch.episodes}
+                ),
+                "optimizer_steps": trainer.state.optimizer_steps
+                - previous_optimizer_steps,
+                "action_tokens": sum(
+                    sum(t.effective_action_weights) for t in batch.trajectories
+                ),
+                "context_tokens": sum(
+                    len(t.loss_mask) - sum(t.loss_mask) for t in batch.trajectories
+                ),
+                "metrics": dict(metrics),
+            }
+        )
+        await trainer.publish_metrics(batch.metrics())
+        progress.update(1)
+        if (
+            trainer.eval_dataset is not None
+            and trainer.args.eval_steps > 0
+            and trainer.state.global_step % trainer.args.eval_steps == 0
+        ):
+            await self.evaluate()
+
+    async def _train_overlapped(self, rows, progress):
+        """Pipeline fixed-snapshot collection with one serialized PPO update.
+
+        Prefetched tasks own immutable SamplingSnapshot objects created before
+        their corresponding optimizer overlap. Batches are consumed in launch
+        order, which bounds numeric policy age by configured queue capacity and
+        avoids starving an older behavior policy behind a faster newer request.
+        Pending collection is cancelled and drained on every terminal path so
+        tools, scorers, and PyTRIO futures do not outlive the training loop.
+        """
+        trainer = self.trainer
+        capacity = self.config.rollout_prefetch_capacity
+        pending = []
+
+        async def launch(snapshot):
+            if type(snapshot.policy_version) is not int:
+                raise AgentContractError(
+                    "Asynchronous rollouts require numeric policy_version provenance."
+                )
+            task = asyncio.create_task(self._collect(rows, snapshot))
+            pending.append((snapshot, task))
+
+        snapshot = await self.snapshot_factory()
+        if type(snapshot.policy_version) is not int:
+            raise AgentContractError(
+                "Asynchronous rollouts require numeric policy_version provenance."
+            )
+        current = await self._collect(rows, snapshot)
+        try:
+            while current.trajectories and (
+                trainer.args.max_steps is None
+                or trainer.state.global_step < trainer.args.max_steps
+            ):
+                while len(pending) < capacity:
+                    await launch(snapshot)
+                await self._update(
+                    current,
+                    snapshot,
+                    progress,
+                    max_staleness=self.config.max_policy_staleness,
+                )
+                if (
+                    trainer.args.max_steps is not None
+                    and trainer.state.global_step >= trainer.args.max_steps
+                ):
+                    break
+
+                next_snapshot, task = pending.pop(0)
+                current = await task
+                snapshot = next_snapshot
+                # Export a replacement only after the optimizer finishes. The
+                # new task can overlap the next update, while older queued tasks
+                # retain their original version and are checked when consumed.
+                replacement = await self.snapshot_factory()
+                await launch(replacement)
+                if not current.trajectories and current.episodes:
+                    await trainer.publish_metrics(current.metrics())
+        finally:
+            for _, task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
 
     async def train(self) -> PPOState:
         """Run collection, updates, configured evaluations, and final saving.
@@ -272,42 +381,19 @@ class AgentTrainingLoop:
                     config.max_steps is None
                     or trainer.state.global_step < config.max_steps
                 ):
+                    if self.config.async_rollouts:
+                        await self._train_overlapped(rows, progress)
+                        break
                     batch = await self._collect(rows)
                     if not batch.trajectories:
                         if batch.episodes:
                             await trainer.publish_metrics(batch.metrics())
                         break
-                    # All model/tool interactions finish before parameters can
-                    # change. The next _collect call obtains a new snapshot.
-                    previous_optimizer_steps = trainer.state.optimizer_steps
-                    metrics = await trainer.step(batch.trajectories)
-                    self.last_train_batch = batch
-                    self.update_history.append(
-                        {
-                            "step": trainer.state.global_step,
-                            "snapshot_ids": sorted(
-                                {e.snapshot_id for e in batch.episodes}
-                            ),
-                            "optimizer_steps": trainer.state.optimizer_steps
-                            - previous_optimizer_steps,
-                            "action_tokens": sum(
-                                sum(t.loss_mask) for t in batch.trajectories
-                            ),
-                            "context_tokens": sum(
-                                len(t.loss_mask) - sum(t.loss_mask)
-                                for t in batch.trajectories
-                            ),
-                            "metrics": dict(metrics),
-                        }
+                    await self._update(
+                        batch,
+                        self.last_train_snapshot,
+                        progress,
                     )
-                    await trainer.publish_metrics(batch.metrics())
-                    progress.update(1)
-                    if (
-                        trainer.eval_dataset is not None
-                        and config.eval_steps > 0
-                        and trainer.state.global_step % config.eval_steps == 0
-                    ):
-                        await self.evaluate()
             if trainer.state.global_step == initial_step:
                 raise ValueError("No trainable agent batch was collected.")
             if not config.save_every or trainer.state.global_step % config.save_every:

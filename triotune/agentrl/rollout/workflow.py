@@ -85,6 +85,17 @@ class AgentRolloutBatch:
                     for state in self.branch_groups.values()
                 )
             ),
+            f"{prefix}/context_compactions": float(
+                sum(len(episode.compactions) for episode in episodes)
+            ),
+            f"{prefix}/compacted_prompt_tokens_saved": float(
+                sum(
+                    compaction.original_prompt_tokens
+                    - len(compaction.compacted_prompt_tokens)
+                    for episode in episodes
+                    for compaction in episode.compactions
+                )
+            ),
             f"{prefix}/retry_count": float(
                 sum(event.retried for e in episodes for event in e.retries)
             ),
@@ -207,36 +218,44 @@ class AgentRolloutWorkflow:
         self.shared_prefix_policy = shared_prefix_policy
         self.accept_sample = accept_sample
         self._resource_started = False
+        # One workflow-wide semaphore bounds overlapping collect calls from the
+        # asynchronous training pipeline. A per-call semaphore would multiply
+        # tool and sampling pressure by the prefetch depth.
+        self._capacity = asyncio.Semaphore(max_concurrency)
+        self._capacity_limit = max_concurrency
+        self._lifecycle_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start session-scoped scorer and tool resources."""
-        if self._resource_started:
-            return
-        start = getattr(self.runner, "start", None)
-        if callable(start):
-            await start()
-        logger_start = getattr(self.logger, "start", None)
-        if callable(logger_start):
-            result = logger_start()
-            if inspect.isawaitable(result):
-                await result
-        self._resource_started = True
+        async with self._lifecycle_lock:
+            if self._resource_started:
+                return
+            start = getattr(self.runner, "start", None)
+            if callable(start):
+                await start()
+            logger_start = getattr(self.logger, "start", None)
+            if callable(logger_start):
+                result = logger_start()
+                if inspect.isawaitable(result):
+                    await result
+            self._resource_started = True
 
     async def close(self) -> None:
         """Close resources owned by the underlying episode runner."""
-        if not self._resource_started:
-            return
-        logger_close = getattr(self.logger, "close", None) or getattr(
-            self.logger, "aclose", None
-        )
-        if callable(logger_close):
-            result = logger_close()
-            if inspect.isawaitable(result):
-                await result
-        close = getattr(self.runner, "close", None)
-        if callable(close):
-            await close()
-        self._resource_started = False
+        async with self._lifecycle_lock:
+            if not self._resource_started:
+                return
+            logger_close = getattr(self.logger, "close", None) or getattr(
+                self.logger, "aclose", None
+            )
+            if callable(logger_close):
+                result = logger_close()
+                if inspect.isawaitable(result):
+                    await result
+            close = getattr(self.runner, "close", None)
+            if callable(close):
+                await close()
+            self._resource_started = False
 
     async def __aenter__(self):
         await self.start()
@@ -265,17 +284,25 @@ class AgentRolloutWorkflow:
         """
         if type(n_samples) is not int or n_samples < 1:
             raise ValueError("n_samples must be a positive integer.")
+        if self._capacity_limit != self.max_concurrency:
+            # Preserve the historically mutable max_concurrency attribute for
+            # callers that tune capacity between collection calls. Changing it
+            # while calls are already active is unsupported because replacing a
+            # live semaphore would split one global resource budget.
+            if type(self.max_concurrency) is not int or self.max_concurrency < 1:
+                raise ValueError("max_concurrency must be a positive integer.")
+            self._capacity = asyncio.Semaphore(self.max_concurrency)
+            self._capacity_limit = self.max_concurrency
         await self.start()
         minimum = self.min_usable_group_size or n_samples
         if minimum > n_samples:
             raise ValueError("min_usable_group_size must not exceed n_samples.")
-        semaphore = asyncio.Semaphore(self.max_concurrency)
         # Namespace groups per collection call. Identical row contents in
         # separate calls must not accidentally merge into one GRPO group.
         namespace = uuid4().hex
 
         async def run(row, row_index, sample_index):
-            async with semaphore:
+            async with self._capacity:
                 group_id = f"{namespace}:{row_index}"
                 rollout_id = f"{namespace}:rollout:{row_index}:{sample_index}"
                 context = ExecutionContext(
@@ -436,6 +463,150 @@ class AgentRolloutWorkflow:
             raise EpisodeCollectionError(batch)
         return batch
 
+    async def collect_iter(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        snapshot: SamplingSnapshot,
+        *,
+        n_samples: int = 1,
+        seed: int | None = None,
+        is_eval: bool = False,
+        strict: bool = True,
+        max_pending_groups: int | None = None,
+    ):
+        """Yield completed prompt groups without waiting for the slowest row.
+
+        Each yielded batch is a complete collector transaction for one input
+        row, including candidate-group validation and export filtering. It is a
+        safe recovery boundary: callers may persist yielded batches and resume
+        later from input rows that were never scheduled. In-flight groups are
+        cancelled and drained when iteration stops; they are not replayed
+        automatically because tools may have non-idempotent side effects.
+
+        ``max_pending_groups`` limits scheduled row groups independently from
+        the workflow-wide model/tool semaphore. This keeps task objects and
+        retained row payloads bounded even for streaming datasets.
+        """
+        if max_pending_groups is None:
+            max_pending_groups = self.max_concurrency
+        if type(max_pending_groups) is not int or max_pending_groups < 1:
+            raise ValueError("max_pending_groups must be a positive integer.")
+        await self.start()
+        indexed = iter(enumerate(rows))
+        pending = {}
+
+        def schedule():
+            while len(pending) < max_pending_groups:
+                try:
+                    index, row = next(indexed)
+                except StopIteration:
+                    return
+                group_seed = (
+                    None
+                    if seed is None
+                    else seed + index * n_samples * self.runner.limits.max_turns
+                )
+                task = asyncio.create_task(
+                    self.collect(
+                        [row],
+                        snapshot,
+                        n_samples=n_samples,
+                        seed=group_seed,
+                        is_eval=is_eval,
+                        strict=strict,
+                    )
+                )
+                pending[task] = index
+
+        schedule()
+        try:
+            while pending:
+                done, _ = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    index = pending.pop(task)
+                    batch = await task
+                    # The source index is diagnostic only and does not replace
+                    # collector-owned group, rollout, or sample identities.
+                    for state in batch.groups.values():
+                        state["source_index"] = index
+                    yield batch
+                schedule()
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @staticmethod
+    def merge_batches(*batches: AgentRolloutBatch) -> AgentRolloutBatch:
+        """Combine completed collector transactions without changing identity.
+
+        This is the safe unit for partial-rollout recovery. A caller persists
+        batches already yielded by ``collect_iter`` and later merges them with
+        newly collected, previously unscheduled rows. In-flight episodes are not
+        reconstructed or replayed, so non-idempotent tool calls remain outside
+        the recovery boundary.
+        """
+        episodes, trajectories, exports = [], [], []
+        groups, branch_groups = {}, {}
+        dropped = refills = 0
+        rollout_ids, episode_ids = set(), set()
+        for batch in batches:
+            if not isinstance(batch, AgentRolloutBatch):
+                raise TypeError("merge_batches accepts AgentRolloutBatch objects.")
+            collisions = set(groups).intersection(batch.groups)
+            branch_collisions = set(branch_groups).intersection(batch.branch_groups)
+            export_ids = {export.logical_rollout_id for export in batch.exports}
+            batch_episode_ids = {episode.episode_id for episode in batch.episodes}
+            if (
+                collisions
+                or branch_collisions
+                or rollout_ids.intersection(export_ids)
+                or episode_ids.intersection(batch_episode_ids)
+            ):
+                raise AgentContractError(
+                    "Recovered collection batches contain duplicate identities."
+                )
+            episodes.extend(batch.episodes)
+            trajectories.extend(batch.trajectories)
+            exports.extend(batch.exports)
+            groups.update(copy.deepcopy(batch.groups))
+            branch_groups.update(copy.deepcopy(batch.branch_groups))
+            rollout_ids.update(export_ids)
+            episode_ids.update(batch_episode_ids)
+            dropped += batch.dropped_groups
+            refills += batch.refill_batches
+        return AgentRolloutBatch(
+            episodes,
+            trajectories,
+            dropped,
+            refills,
+            exports,
+            groups,
+            branch_groups,
+        )
+
+    async def resume(
+        self,
+        partial: AgentRolloutBatch,
+        rows: Sequence[Mapping[str, Any]],
+        snapshot: SamplingSnapshot,
+        **collect_kwargs,
+    ) -> AgentRolloutBatch:
+        """Collect unstarted rows under the original snapshot and merge results."""
+        expected = {
+            (episode.snapshot_id, episode.policy_version)
+            for episode in partial.episodes
+        }
+        if expected and expected != {(snapshot.snapshot_id, snapshot.policy_version)}:
+            raise AgentContractError(
+                "Partial collection can resume only with its original snapshot."
+            )
+        resumed = await self.collect(rows, snapshot, **collect_kwargs)
+        return self.merge_batches(partial, resumed)
+
     @staticmethod
     def _validate_context(episode, context):
         """Require executor output to retain the collector's trusted identity."""
@@ -589,7 +760,6 @@ class AgentRolloutWorkflow:
             for name in (
                 "rollout_id",
                 "episode_id",
-                "group_id",
                 "sample_index",
                 "snapshot_id",
                 "policy_version",
@@ -597,9 +767,17 @@ class AgentRolloutWorkflow:
             ):
                 if getattr(row, name) != getattr(context, name):
                     raise AgentContractError(f"Export changed candidate {name}.")
-            if row.prompt_tokens != list(episode.turns[0].prompt_tokens):
+            if row.reward_group_id is None:
+                if row.group_id != context.group_id:
+                    raise AgentContractError("Export changed candidate group_id.")
+            elif row.reward_group_id != context.group_id:
                 raise AgentContractError(
-                    "Fragments must share the candidate's initial prompt."
+                    "Compacted fragment changed its reward group identity."
+                )
+            first_interaction = source_turns[row.interaction_ids[0]]
+            if row.prompt_tokens != list(first_interaction.prompt_tokens):
+                raise AgentContractError(
+                    "Fragment prompt differs from its first interaction request."
                 )
             if tuple(exported.fragment_map[row.fragment_id]) != row.interaction_ids:
                 raise AgentContractError(

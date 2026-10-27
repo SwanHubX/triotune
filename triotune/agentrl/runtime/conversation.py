@@ -8,16 +8,21 @@ replace the default JSON protocol without changing sampling or PPO code.
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import json
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from ..types import (
     ActionParseError,
     AgentAction,
     AgentContractError,
+    EpisodeResult,
     Generation,
     ToolCall,
     ToolResult,
@@ -38,6 +43,301 @@ def _unique_object(pairs):
     return value
 
 
+class PrefixCache:
+    """Bound exact conversation serializations in a thread-safe LRU cache.
+
+    Rendering the same system prompt and tool schema for many candidates can be
+    material CPU work even when model sampling remains independent. The cache
+    stores only tokenizer output; it never caches a sampled continuation or a
+    behavior log probability. Keys are canonical JSON descriptions supplied by
+    the renderer, and returned token lists are copied so callers cannot mutate
+    cached provenance shared by concurrent episodes.
+    """
+
+    def __init__(self, max_entries: int = 256):
+        if type(max_entries) is not int or max_entries < 1:
+            raise ValueError("PrefixCache max_entries must be a positive integer.")
+        self.max_entries = max_entries
+        self._entries: OrderedDict[str, tuple[int, ...]] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> list[int] | None:
+        """Return a detached cached prefix and update LRU order atomically."""
+        with self._lock:
+            value = self._entries.pop(key, None)
+            if value is None:
+                self.misses += 1
+                return None
+            self._entries[key] = value
+            self.hits += 1
+            return list(value)
+
+    def put(self, key: str, tokens: Sequence[int]) -> None:
+        """Store validated immutable IDs and evict the oldest exact request."""
+        validate_tokens(tokens, name="cached prefix")
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = tuple(tokens)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """Drop cached tokenizations without changing cumulative hit counters."""
+        with self._lock:
+            self._entries.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionPlan:
+    """Return compacted messages plus auditable interaction disposition."""
+
+    messages: tuple[dict[str, Any], ...]
+    retained_interaction_ids: tuple[str, ...]
+    summarized_interaction_ids: tuple[str, ...]
+    removed_messages: int
+
+
+class ContextCompactor:
+    """Summarize old tool exchanges while retaining selected interaction blocks.
+
+    Messages are partitioned at assistant boundaries and paired with recorded
+    generated interactions. Initial system/user instructions are always kept.
+    The newest ``keep_recent_interactions`` blocks, explicitly preserved blocks,
+    and interactions with tool errors remain literal. Consecutive omitted blocks
+    become summary messages in their original position.
+
+    A custom summarizer receives ``(interactions, previous_summary_messages)``
+    and may be synchronous or asynchronous. It returns text, one message, or a
+    message sequence. Summary messages are marked only inside the runtime; the
+    renderer removes private marker keys before invoking the tokenizer. This
+    permits later compactions to replace earlier summaries instead of growing an
+    unbounded chain, without exposing control metadata to model templates.
+    """
+
+    def __init__(
+        self,
+        *,
+        keep_recent_interactions: int = 2,
+        summarizer=None,
+        preserve=None,
+        max_summary_chars: int = 4096,
+    ):
+        if type(keep_recent_interactions) is not int or keep_recent_interactions < 1:
+            raise ValueError("keep_recent_interactions must be a positive integer.")
+        if type(max_summary_chars) is not int or max_summary_chars < 1:
+            raise ValueError("max_summary_chars must be a positive integer.")
+        if summarizer is not None and not callable(summarizer):
+            raise TypeError("Context summarizer must be callable or None.")
+        if preserve is not None and not callable(preserve):
+            raise TypeError("Interaction preservation hook must be callable or None.")
+        self.keep_recent_interactions = keep_recent_interactions
+        self.summarizer = summarizer
+        self.preserve = preserve
+        self.max_summary_chars = max_summary_chars
+
+    @staticmethod
+    def _default_summary(interactions, previous):
+        """Produce a deterministic tool-result summary without model inference."""
+        records = []
+        for message in previous:
+            records.append({"previous_summary": message.get("content", "")})
+        for interaction in interactions:
+            records.append(
+                {
+                    "interaction_id": interaction.interaction_id,
+                    "tool_calls": [
+                        {"call_id": call.call_id, "name": call.name}
+                        for call in interaction.tool_calls
+                    ],
+                    "tool_results": [
+                        asdict(result) for result in interaction.tool_results
+                    ],
+                }
+            )
+        return json.dumps(
+            {"compacted_interactions": records},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+    async def _summarize(self, interactions, previous):
+        method = self.summarizer or self._default_summary
+        if inspect.iscoroutinefunction(method):
+            result = await method(tuple(interactions), tuple(previous))
+        else:
+            result = await asyncio.to_thread(
+                method, tuple(interactions), tuple(previous)
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        if isinstance(result, str):
+            messages = [{"role": "user", "content": result}]
+        elif isinstance(result, Mapping):
+            messages = [dict(result)]
+        elif isinstance(result, Sequence) and not isinstance(result, (str, bytes)):
+            messages = [dict(message) for message in result]
+        else:
+            raise AgentContractError(
+                "Context summarizer must return text or chat message mappings."
+            )
+        if not messages or any(
+            message.get("role") not in {"system", "user", "tool"}
+            or not isinstance(message.get("content"), str)
+            for message in messages
+        ):
+            raise AgentContractError(
+                "Context summaries require nonempty system/user/tool messages."
+            )
+        for message in messages:
+            message["content"] = message["content"][: self.max_summary_chars]
+            message["_triotune_summary"] = True
+            message["_triotune_summarized_ids"] = tuple(
+                dict.fromkeys(
+                    interaction_id
+                    for previous_message in previous
+                    for interaction_id in previous_message.get(
+                        "_triotune_summarized_ids", ()
+                    )
+                )
+            ) + tuple(interaction.interaction_id for interaction in interactions)
+        return messages
+
+    async def compact(
+        self, messages: Sequence[Mapping[str, Any]], episode: EpisodeResult
+    ) -> CompactionPlan:
+        """Replace eligible historical blocks and preserve chronological order."""
+        original_items = [dict(message) for message in messages]
+        previous_summaries = [
+            message
+            for message in original_items
+            if message.get("_triotune_summary") is True
+        ]
+        previously_summarized_order = tuple(
+            dict.fromkeys(
+                interaction_id
+                for message in previous_summaries
+                for interaction_id in message.get("_triotune_summarized_ids", ())
+            )
+        )
+        previously_summarized = set(previously_summarized_order)
+        items = [
+            message
+            for message in original_items
+            if message.get("_triotune_summary") is not True
+        ]
+        assistant_indices = [
+            index
+            for index, message in enumerate(items)
+            if message.get("role") == "assistant"
+        ]
+        interactions = [
+            interaction
+            for interaction in episode.interactions
+            if interaction.turn is not None
+            and interaction.interaction_id not in previously_summarized
+        ]
+        if len(assistant_indices) != len(interactions):
+            raise AgentContractError(
+                "Conversation assistants do not align with recorded interactions."
+            )
+        if not interactions:
+            return CompactionPlan(
+                tuple(original_items), (), previously_summarized_order, 0
+            )
+
+        initial = items[: assistant_indices[0]]
+        blocks = []
+        for index, start in enumerate(assistant_indices):
+            end = (
+                assistant_indices[index + 1]
+                if index + 1 < len(assistant_indices)
+                else len(items)
+            )
+            blocks.append((interactions[index], items[start:end]))
+
+        recent = {
+            interaction.interaction_id
+            for interaction, _ in blocks[-self.keep_recent_interactions :]
+        }
+        retained = set(recent)
+        for interaction, _ in blocks:
+            explicitly_preserved = False
+            if self.preserve is not None:
+                explicitly_preserved = (
+                    await self.preserve(interaction)
+                    if inspect.iscoroutinefunction(self.preserve)
+                    else await asyncio.to_thread(self.preserve, interaction)
+                )
+                if inspect.isawaitable(explicitly_preserved):
+                    explicitly_preserved = await explicitly_preserved
+                if type(explicitly_preserved) is not bool:
+                    raise AgentContractError(
+                        "Interaction preservation hook must return a boolean."
+                    )
+            preserve = (
+                any(result.is_error for result in interaction.tool_results)
+                or explicitly_preserved
+            )
+            if preserve:
+                retained.add(interaction.interaction_id)
+        omitted = [
+            interaction
+            for interaction, _ in blocks
+            if interaction.interaction_id not in retained
+        ]
+        if not omitted:
+            return CompactionPlan(
+                tuple(original_items),
+                tuple(retained),
+                previously_summarized_order,
+                0,
+            )
+
+        output = list(initial)
+        pending = []
+        summary_history = list(previous_summaries)
+
+        async def flush():
+            nonlocal summary_history
+            if not pending:
+                return
+            summary = await self._summarize(pending, summary_history)
+            output.extend(summary)
+            summary_history = []
+            pending.clear()
+
+        for interaction, block in blocks:
+            if interaction.interaction_id in retained:
+                await flush()
+                output.extend(block)
+            else:
+                pending.append(interaction)
+        await flush()
+        removed = len(original_items) - len(output)
+        if removed <= 0:
+            raise AgentContractError(
+                "Context compaction must remove at least one message."
+            )
+        return CompactionPlan(
+            tuple(output),
+            tuple(
+                interaction.interaction_id
+                for interaction in interactions
+                if interaction.interaction_id in retained
+            ),
+            tuple(
+                dict.fromkeys(
+                    previously_summarized_order
+                    + tuple(interaction.interaction_id for interaction in omitted)
+                )
+            ),
+            removed,
+        )
+
+
 class ChatTemplateRenderer:
     """Render exact request tokens; trajectory export checks prefix stability.
 
@@ -47,7 +347,12 @@ class ChatTemplateRenderer:
     """
 
     def __init__(
-        self, tokenizer: Any, *, advertise_tools: bool = True, **template_kwargs: Any
+        self,
+        tokenizer: Any,
+        *,
+        advertise_tools: bool = True,
+        prefix_cache: PrefixCache | None = None,
+        **template_kwargs: Any,
     ):
         """Bind the tokenizer and model-specific template options.
 
@@ -60,6 +365,19 @@ class ChatTemplateRenderer:
             )
         self.tokenizer, self.template_kwargs = tokenizer, template_kwargs
         self.advertise_tools = advertise_tools
+        self.prefix_cache = prefix_cache
+
+    @staticmethod
+    def _public_messages(messages):
+        """Remove runtime-only metadata before calling a model chat template."""
+        return [
+            {
+                key: value
+                for key, value in dict(message).items()
+                if not key.startswith("_triotune_")
+            }
+            for message in messages
+        ]
 
     def render(
         self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]
@@ -70,11 +388,34 @@ class ChatTemplateRenderer:
         integer IDs here makes this serialization the actual sampling input;
         the trajectory exporter later checks that older output IDs survive.
         """
+        messages = self._public_messages(messages)
         kwargs = dict(self.template_kwargs)
         if tools and self.advertise_tools:
             kwargs["tools"] = list(tools)
+        cache_key = None
+        if self.prefix_cache is not None:
+            try:
+                cache_key = json.dumps(
+                    {
+                        "tokenizer_identity": id(self.tokenizer),
+                        "template_kwargs": self.template_kwargs,
+                        "messages": messages,
+                        "tools": kwargs.get("tools"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                # Non-JSON template extensions remain renderable but cannot be
+                # assigned a stable cross-task cache identity.
+                cache_key = None
+            if cache_key is not None:
+                cached = self.prefix_cache.get(cache_key)
+                if cached is not None:
+                    return cached
         rendered = self.tokenizer.apply_chat_template(
-            list(messages),
+            messages,
             tokenize=True,
             add_generation_prompt=True,
             **kwargs,
@@ -84,6 +425,8 @@ class ChatTemplateRenderer:
             rendered["input_ids"] if isinstance(rendered, Mapping) else rendered
         )
         validate_tokens(tokens, name="rendered prompt")
+        if cache_key is not None:
+            self.prefix_cache.put(cache_key, tokens)
         return tokens
 
 
@@ -104,7 +447,7 @@ class TokenAppendRenderer(ChatTemplateRenderer):
             i for i, message in enumerate(messages) if message["role"] == "assistant"
         )
         marker = "TRIOTUNE_ASSISTANT_BOUNDARY_7e39d2"
-        probe = copy.deepcopy(list(messages))
+        probe = copy.deepcopy(self._public_messages(messages))
         probe[index] = {"role": "assistant", "content": marker}
         kwargs = dict(self.template_kwargs)
         if tools and self.advertise_tools:
@@ -164,7 +507,7 @@ class NativeToolContinuationRenderer(ChatTemplateRenderer):
         validate_tokens(prompt_tokens, name="parent prompt")
         validate_tokens(output_tokens, name="parent output")
         marker = "TRIOTUNE_NATIVE_ACTION_BOUNDARY_12ac69"
-        probe = copy.deepcopy(list(messages))
+        probe = copy.deepcopy(self._public_messages(messages))
         probe[assistant_index] = {
             "role": "assistant",
             "content": marker,

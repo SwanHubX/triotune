@@ -119,6 +119,7 @@ class PPOActor:
         self.optimizer_steps = 0
         self.train_tokens = 0
         self.datum_provenance: tuple[dict, ...] = ()
+        self.datum_prefix_groups: tuple[dict, ...] = ()
 
     async def prepare(self, trajectories: list[Trajectory]) -> PreparedBatch:
         """Recompute optional proximal scores and freeze one actor update batch."""
@@ -131,12 +132,14 @@ class PPOActor:
         prompts = {}
         for t in trajectories:
             t.__post_init__()
-            for group_id in {t.group_id, t.comparison_group_id}:
-                previous = prompts.setdefault(group_id, t.prompt_tokens)
-                if previous != t.prompt_tokens:
-                    raise ValueError(
-                        "One PPO group must identify one identical tokenized prompt."
-                    )
+            # group_id is the physical tokenized-prompt identity. Reward groups
+            # may intentionally span compacted causal segments with different
+            # prompts, but those rows remain separate PyTRIO datums.
+            previous = prompts.setdefault(t.group_id, t.prompt_tokens)
+            if previous != t.prompt_tokens:
+                raise ValueError(
+                    "One PPO group must identify one identical tokenized prompt."
+                )
         validate_policy_versions(trajectories)
         proximal = None
         if config.recompute_logprob or config.use_decoupled_loss:
@@ -197,6 +200,7 @@ class PPOActor:
             for chunk in chunks:
                 data = batch_datums(chunk, native=native_backend)
                 self.datum_provenance = data.provenance
+                self.datum_prefix_groups = data.prefix_groups
                 if native_backend:
                     result = await call_async(
                         self.client,
@@ -265,6 +269,15 @@ class PPOActor:
                 row.setdefault(
                     "train/action_tokens",
                     float(sum(sum(mask) for mask in chunk.masks)),
+                )
+                row.setdefault(
+                    "train/max_shared_prefix_tokens",
+                    float(
+                        max(
+                            (group["prefix_length"] for group in data.prefix_groups),
+                            default=0,
+                        )
+                    ),
                 )
                 row["_loss_weight"] = float(
                     (

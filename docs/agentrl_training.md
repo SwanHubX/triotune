@@ -69,6 +69,63 @@ field. Conflicting token, logprob, causal-position, or prefix evidence is always
 an error. Fragments with no active actions are omitted. Differing initial
 prompts cannot share a PPO group.
 
+## Structured rewards and direct advantages
+
+`RewardLedger.submit()` accepts a whole contribution payload atomically. Values
+sharing a rollout, source, mode, target, and position are reduced using their
+declared `sum`, `mean`, or `last` aggregation. Each value is multiplied by its
+`discount` before reduction; contributions from different sources are added.
+One aggregation group must use one aggregation rule. Different rollouts keep
+independent aggregation populations, including when a runner reuses a ledger.
+
+Use `submission_id` to distinguish retries from new contributions. Within one
+rollout, repeating an ID and the same ordered payload returns no new assignments;
+reusing it with different content raises `AgentContractError` without changing
+the ledger. Different IDs may add values to the same aggregation group.
+
+```python
+from triotune.agentrl import EpisodeScore, RewardAssignment, RewardLedger
+
+ledger = RewardLedger()
+contributions = (
+    RewardAssignment("trajectory", 2.0, aggregation="mean"),
+    RewardAssignment("trajectory", 4.0, aggregation="mean"),
+)
+options = {"logical_rollout_id": "candidate-0", "submission_id": "judge-0"}
+assert ledger.submit(contributions, **options) == contributions
+assert ledger.submit(contributions, **options) == ()
+assert ledger.aggregate()[0] == 3.0
+
+score = EpisodeScore(
+    0.0,
+    False,
+    assignments=ledger.assignments + (
+        RewardAssignment("trajectory", 0.5, mode="advantage", source="prm"),
+    ),
+)
+```
+
+Without an explicit submission ID, legacy rollout/source/mode deduplication
+still applies to trajectory contributions. It compares the entire same-source
+bundle, preserving all values in its first submission. An exact bundle retry is
+ignored; a changed bundle raises instead of silently dropping the new value.
+Process contributions without an ID remain additive. Supply explicit IDs for
+retry-safe process submissions or multiple updates from the same source.
+
+A trajectory assignment with `mode="advantage"` broadcasts its reduced value
+to every active original model-output token, including returned stop tokens.
+It combines additively with token/turn/interaction advantages, does not enter
+reward normalization or GAE, and does not change critic returns or bootstrap.
+The configured final advantage normalization still applies. Tool observations
+and repeated context positions receive zero direct advantage. Individual rows
+and compacted segments retain the value on their own active actions; existing
+shared-action deduplication or weights govern branch prefixes.
+
+`aggregate_assignments()` and `RewardLedger.aggregate()` retain their three-part
+outcome/process/direct result. A trajectory advantage has no turn position and
+is exposed as `direct[None] = (value,)`. The exporter consumes the same reduction
+with exact target positions to construct completion-aligned token advantages.
+
 ## Branch trees
 
 `EpisodeBranch` declares a rollout-local branch suffix. Its
@@ -102,8 +159,10 @@ episode.branches = [
 ```
 
 Branch reward is the complete branch-local outcome, not an increment to the
-episode outcome. Trajectory-level episode assignments are therefore not copied
-onto every branch. Process-reward and direct-advantage assignments are projected
+episode outcome. Trajectory-level episode outcome rewards are therefore not
+copied onto every branch. A trajectory-level direct advantage applies to every
+completed path without changing its branch-local outcome or critic return.
+Process-reward and position-specific direct-advantage assignments are projected
 onto the interactions present in each path and retain their P1 reward mode.
 Each branch group is scoped by logical rollout before PPO normalization, so
 concurrent episodes can reuse readable local labels without merging baselines.
@@ -116,6 +175,70 @@ parent, and completeness independently of candidate-level
 `AgentRolloutBatch.groups`. PPO counts multiple fragments of one branch once for
 reward normalization and sequence reductions, while separate branches of the
 same logical rollout retain their distinct local rewards.
+
+## Context compaction and prefix reuse
+
+Context compaction is opt-in because a summary changes the policy's observable
+state. It can be enabled through `AgentConfig` or supplied as a custom
+`ContextCompactor` to `EpisodeRunner`:
+
+```python
+config = AgentConfig(
+    context_compaction=True,
+    compaction_keep_recent_interactions=2,
+    compaction_summary_chars=2048,
+    prefix_cache_size=256,
+)
+```
+
+`ContextCompactor` keeps initial instructions, recent interaction blocks,
+interactions selected by a preservation hook, and tool-error interactions. Old
+tool exchanges are replaced by deterministic summaries by default. A custom
+synchronous or asynchronous summarizer receives omitted interactions and any
+previous summary messages. It may return text or chat message mappings.
+
+Previously sampled action IDs are never decoded and encoded into a new training
+prefix. A compacted request starts a new causal segment and records its exact
+prompt IDs in `ContextCompaction`. Export emits one physical trajectory per
+segment, with separate prompt group IDs and the original candidate reward group.
+Outcome normalization and sequence loss still count the logical rollout once;
+process rewards and direct advantages are projected to their original segment.
+This segmentation also applies inside P3 branch paths.
+
+`PrefixCache` is a bounded, thread-safe LRU for exact chat-template
+tokenizations. It does not cache generations or log probabilities. PPO datum
+batches expose a local `prefix_groups` sidecar describing maximal shared input
+prefixes. Current PyTRIO accepts standard datum lists and has no portable tree
+attention option, so normal execution safely ignores the sidecar while compatible
+adapters can use it for prefix scheduling. P3 action weights continue to prevent
+shared branch actions from receiving duplicate gradients independently of model
+forward optimization.
+
+## Asynchronous rollout scheduling
+
+```python
+config = AgentConfig(
+    async_rollouts=True,
+    rollout_prefetch_capacity=1,
+    max_policy_staleness=1,
+)
+```
+
+The asynchronous training loop exports a fixed `SamplingSnapshot`, starts the
+next collection from that snapshot, and overlaps it with the current PPO update.
+A logical rollout never changes snapshot. Completed batches are consumed in
+launch order, and `PPOTrainer.step(..., max_staleness=...)` rejects future or
+over-age policy versions before reference scoring, critic work, or optimization.
+Prefetch capacity cannot exceed the configured numeric staleness allowance.
+
+The collector uses one workflow-wide semaphore, so concurrent collect calls do
+not multiply sampling, tool, or scorer capacity. `collect_iter()` yields complete
+prompt groups as they finish and bounds scheduled group tasks separately.
+Completed groups are safe persistence and recovery boundaries.
+`workflow.resume(partial_batch, remaining_rows, original_snapshot)` collects only
+previously unstarted rows and merges identities; a different snapshot is
+rejected. In-flight tool interactions are cancelled and drained rather than
+automatically replayed, because a tool may not be retry-safe.
 
 By default all candidates must be usable. An explicit `min_usable_group_size`
 allows partial groups; the threshold counts candidates, not fragments. Failed

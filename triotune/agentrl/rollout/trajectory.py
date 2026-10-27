@@ -8,42 +8,17 @@ markers remain visible as context but are excluded from policy optimization.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 
 from ...trainer.ppo.trajectory import Trajectory
+from ..training.rewards import _aggregate_assignment_data
 from ..types import AgentContractError, EpisodeResult, EpisodeScore, RolloutExport
 
 
 def _structured_reward_data(score):
     """Aggregate structured submissions while retaining target positions."""
-    grouped = {}
-    for assignment in score.assignments:
-        key = (
-            assignment.mode,
-            assignment.target,
-            assignment.source,
-            assignment.position,
-        )
-        grouped.setdefault(key, []).append(assignment)
-    outcome = 0.0
-    process, direct = {}, {}
-    for (mode, target, _source, position), values in grouped.items():
-        weighted = [float(item.value) * float(item.discount) for item in values]
-        aggregation = values[0].aggregation
-        value = (
-            sum(weighted) / len(weighted)
-            if aggregation == "mean"
-            else weighted[-1]
-            if aggregation == "last"
-            else sum(weighted)
-        )
-        if target == "trajectory":
-            if mode == "reward":
-                outcome += value
-            continue
-        target_map = direct if mode == "advantage" else process
-        target_map[(target, position)] = target_map.get((target, position), 0.0) + value
-    return outcome, process, direct
+    return _aggregate_assignment_data(score.assignments)
 
 
 class EpisodeTrajectoryBuilder:
@@ -84,65 +59,191 @@ class EpisodeTrajectoryBuilder:
         """
         if self.mode == "branch":
             return self._export_branches(episode)
-        whole = self.build(episode)
-        if self.mode == "concat":
-            rows = [whole]
-        else:
-            rows = []
-            for index in range(len(whole.interaction_ids)):
-                end = (
-                    max(i for i, turn in enumerate(whole.turn_ids) if turn == index) + 1
-                )
-                mask = [turn == index for turn in whole.turn_ids[:end]]
-                rows.append(
-                    replace(
-                        whole,
-                        completion_tokens=whole.completion_tokens[:end],
-                        logprobs=whole.logprobs[:end],
-                        loss_mask=mask,
-                        turn_ids=[index if active else -1 for active in mask],
-                        token_rewards=(
-                            [
-                                value if active else 0.0
-                                for value, active in zip(
-                                    whole.token_rewards[:end], mask, strict=True
-                                )
-                            ]
-                            if whole.token_rewards is not None
-                            else None
-                        ),
-                        token_advantages=(
-                            [
-                                value if active else 0.0
-                                for value, active in zip(
-                                    whole.token_advantages[:end], mask, strict=True
-                                )
-                            ]
-                            if whole.token_advantages is not None
-                            else None
-                        ),
-                        fragment_id=f"{whole.rollout_id}:turn:{index}",
-                        interaction_ids=whole.interaction_ids[: index + 1],
-                        parent_interaction_id=(
-                            whole.interaction_ids[index - 1] if index else None
-                        ),
-                        action_keys=whole.action_keys[:end],
-                        truncated=whole.truncated
-                        if index == len(episode.turns) - 1
-                        else False,
-                    )
-                )
+        rows = self._path_rows(
+            episode,
+            fragment_prefix=episode.rollout_id or episode.episode_id,
+            individual=self.mode == "individual",
+        )
+        compacted = len({row.context_segment for row in rows}) > 1
         return RolloutExport(
             trajectories=rows,
-            logical_rollout_id=whole.rollout_id,
+            logical_rollout_id=episode.rollout_id or episode.episode_id,
             fragment_map={row.fragment_id: row.interaction_ids for row in rows},
-            group_id=whole.group_id,
+            group_id=episode.group_id,
             metadata={
                 "mode": self.mode,
                 "outcome_scope": "rollout",
-                "shared_prefix": "context_only",
+                "shared_prefix": "context_only" if not compacted else "segments",
+                "context_segments": 1
+                + sum(
+                    compaction.turn_index < len(episode.turns)
+                    for compaction in episode.compactions
+                ),
             },
         )
+
+    @staticmethod
+    def _slice_score(episode, indices):
+        """Remap turn-scoped P1 signals onto one compacted causal segment."""
+        positions = {source: target for target, source in enumerate(indices)}
+        process = {
+            positions[index]: values
+            for index, values in episode.score.process_rewards.items()
+            if index in positions
+        }
+        assignments = []
+        for assignment in episode.score.assignments:
+            if assignment.target == "trajectory":
+                assignments.append(assignment)
+                continue
+            position = assignment.position
+            if assignment.target == "token":
+                if not isinstance(position, tuple) or position[0] not in positions:
+                    continue
+                position = (positions[position[0]], position[1])
+            else:
+                if type(position) is not int or position not in positions:
+                    continue
+                position = positions[position]
+            assignments.append(replace(assignment, position=position))
+        return EpisodeScore(
+            reward=episode.score.reward,
+            success=episode.score.success,
+            components=dict(episode.score.components),
+            process_rewards=process,
+            assignments=tuple(assignments),
+        )
+
+    @staticmethod
+    def _slice_episode(episode, start, stop):
+        """Detach a segment from external parents while preserving action IDs."""
+        generated = [
+            interaction
+            for interaction in episode.interactions
+            if interaction.turn is not None
+        ]
+        interactions = []
+        for offset, interaction in enumerate(generated[start:stop]):
+            if offset == 0:
+                interaction = replace(
+                    interaction,
+                    context=replace(interaction.context, parent_interaction_id=None),
+                )
+            interactions.append(interaction)
+        return replace(
+            episode,
+            turns=list(episode.turns[start:stop]),
+            interactions=interactions,
+            score=EpisodeTrajectoryBuilder._slice_score(
+                episode, tuple(range(start, stop))
+            ),
+            branches=[],
+            compactions=[],
+        )
+
+    @staticmethod
+    def _prompt_group(group_id, prompt_tokens):
+        """Create a stable physical group for one exact compacted prompt."""
+        digest = hashlib.sha256(
+            ",".join(str(token) for token in prompt_tokens).encode("ascii")
+        ).hexdigest()[:20]
+        return f"{group_id}:prompt:{digest}"
+
+    @staticmethod
+    def _individual_rows(whole, turn_count, fragment_prefix):
+        """Split one causal segment into independently active turn rows."""
+        rows = []
+        for index in range(turn_count):
+            end = max(i for i, turn in enumerate(whole.turn_ids) if turn == index) + 1
+            mask = [turn == index for turn in whole.turn_ids[:end]]
+            rows.append(
+                replace(
+                    whole,
+                    completion_tokens=whole.completion_tokens[:end],
+                    logprobs=whole.logprobs[:end],
+                    loss_mask=mask,
+                    turn_ids=[index if active else -1 for active in mask],
+                    token_rewards=(
+                        [
+                            value if active else 0.0
+                            for value, active in zip(
+                                whole.token_rewards[:end], mask, strict=True
+                            )
+                        ]
+                        if whole.token_rewards is not None
+                        else None
+                    ),
+                    token_advantages=(
+                        [
+                            value if active else 0.0
+                            for value, active in zip(
+                                whole.token_advantages[:end], mask, strict=True
+                            )
+                        ]
+                        if whole.token_advantages is not None
+                        else None
+                    ),
+                    fragment_id=f"{fragment_prefix}:turn:{index}",
+                    interaction_ids=whole.interaction_ids[: index + 1],
+                    parent_interaction_id=(
+                        whole.interaction_ids[index - 1]
+                        if index
+                        else whole.parent_interaction_id
+                    ),
+                    action_keys=whole.action_keys[:end],
+                    truncated=whole.truncated if index == turn_count - 1 else False,
+                )
+            )
+        return rows
+
+    def _path_rows(self, episode, *, fragment_prefix, individual=False):
+        """Build exact-token rows separated at every recorded context reset."""
+        starts = [0] + [
+            compaction.turn_index
+            for compaction in episode.compactions
+            if compaction.turn_index < len(episode.turns)
+        ]
+        for index in range(1, len(episode.turns)):
+            previous = episode.turns[index - 1]
+            prefix = previous.prompt_tokens + previous.generation.tokens
+            if tuple(episode.turns[index].prompt_tokens[: len(prefix)]) != prefix:
+                starts.append(index)
+        starts = sorted(set(starts))
+        stops = starts[1:] + [len(episode.turns)]
+        generated = [
+            interaction
+            for interaction in episode.interactions
+            if interaction.turn is not None
+        ]
+        rows = []
+        for segment, (start, stop) in enumerate(zip(starts, stops, strict=True)):
+            sliced = (
+                episode
+                if len(starts) == 1
+                else self._slice_episode(episode, start, stop)
+            )
+            whole = self.build(sliced)
+            whole.context_segment = segment
+            whole.parent_interaction_id = (
+                generated[start].parent_interaction_id if start else None
+            )
+            whole.fragment_id = f"{fragment_prefix}:segment:{segment}"
+            if len(starts) > 1:
+                whole.reward_group_id = episode.group_id
+                whole.group_id = self._prompt_group(
+                    episode.group_id, whole.prompt_tokens
+                )
+            whole.__post_init__()
+            rows.extend(
+                self._individual_rows(
+                    whole,
+                    stop - start,
+                    f"{fragment_prefix}:segment:{segment}",
+                )
+                if individual
+                else [whole]
+            )
+        return rows
 
     @staticmethod
     def _branch_path(episode: EpisodeResult, branch) -> tuple[str, ...]:
@@ -169,11 +270,11 @@ class EpisodeTrajectoryBuilder:
     def _branch_score(episode: EpisodeResult, path: tuple[str, ...], branch):
         """Project global process signals onto one branch-local turn sequence.
 
-        Branch reward is already the complete local outcome, so trajectory-level
-        assignments from the episode are not added again. Turn, interaction,
-        token reward, and direct-advantage assignments are retained only when
-        their original interaction lies on this path, with positions remapped to
-        the branch-local order. This preserves P1 reward/advantage separation.
+        Branch reward is already the complete local outcome, so episode outcome
+        assignments are not added again. Trajectory advantages apply to every
+        completed path. Turn, interaction, and token signals are retained only
+        when their interaction lies on this path, with positions remapped to the
+        branch-local order. This preserves P1 reward/advantage separation.
         """
         generated = [
             item.interaction_id
@@ -196,6 +297,11 @@ class EpisodeTrajectoryBuilder:
         assignments = []
         for assignment in episode.score.assignments:
             if assignment.target == "trajectory":
+                # Branch outcomes replace episode outcome rewards. A direct
+                # trajectory advantage remains a policy-only signal on every
+                # completed path; collector weights still own shared actions.
+                if assignment.mode == "advantage":
+                    assignments.append(assignment)
                 continue
             position = assignment.position
             if assignment.target == "token":
@@ -279,16 +385,20 @@ class EpisodeTrajectoryBuilder:
                 interactions=interactions,
                 score=self._branch_score(episode, path, branch),
                 branches=[],
+                compactions=[],
             )
-            row = self.build(branch_episode)
-            row.fragment_id = f"{rollout_id}:branch:{branch.branch_id}"
-            row.parent_interaction_id = branch.parent_interaction_id
-            row.branch_id = branch.branch_id
-            row.branch_group_id = scoped_group
-            row.branch_completed = True
-            row.shared_prefix_weight = float(branch.shared_prefix_weight)
-            row.__post_init__()
-            rows.append(row)
+            branch_rows = self._path_rows(
+                branch_episode,
+                fragment_prefix=f"{rollout_id}:branch:{branch.branch_id}",
+            )
+            for row in branch_rows:
+                row.parent_interaction_id = branch.parent_interaction_id
+                row.branch_id = branch.branch_id
+                row.branch_group_id = scoped_group
+                row.branch_completed = True
+                row.shared_prefix_weight = float(branch.shared_prefix_weight)
+                row.__post_init__()
+                rows.append(row)
         if not rows:
             raise AgentContractError("Branch export contains no completed branches.")
         for state in group_metadata.values():
@@ -317,6 +427,17 @@ class EpisodeTrajectoryBuilder:
         prefix cannot share the old action probabilities safely.
         """
         if episode.turns:
+            if episode.compactions and episode.compactions[-1].turn_index == len(
+                episode.turns
+            ):
+                if (
+                    tuple(prompt_tokens)
+                    != episode.compactions[-1].compacted_prompt_tokens
+                ):
+                    raise AgentContractError(
+                        "Rendered prompt differs from its compaction record."
+                    )
+                return
             previous = episode.turns[-1]
             prefix = previous.prompt_tokens + previous.generation.tokens
             if tuple(prompt_tokens[: len(prefix)]) != prefix:
@@ -393,7 +514,12 @@ class EpisodeTrajectoryBuilder:
                 rewards[token_index] += structured_process.get(
                     ("token", (index, token_index)), 0.0
                 )
-            direct = [0.0] * len(generation.tokens)
+            # A trajectory advantage is already an estimator output, not a
+            # terminal reward. Broadcast it without GAE/discount propagation;
+            # physical fragment masks prevent repeated context gradients.
+            direct = [structured_advantages.get(("trajectory", None), 0.0)] * len(
+                generation.tokens
+            )
             direct[-1] += sum(
                 structured_advantages.get((target, index), 0.0)
                 for target in ("turn", "interaction")

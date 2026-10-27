@@ -246,8 +246,11 @@ class PPOTrainer:
     async def create_sampling_snapshot(self, *, stop=None) -> SamplingSnapshot:
         """Export current actor weights for an entire custom agent batch.
 
-        Finish using this snapshot before calling step(). The returned ID is
-        provenance, not permission to overlap sampling with optimizer updates.
+        The returned sampling client is a fixed exported policy. Collection may
+        continue from that client while the training client updates newer actor
+        weights, but one logical rollout must never switch snapshots mid-run.
+        Consumers must enforce policy-version staleness when the completed
+        rollout later enters ``step``.
         """
         from ..agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 
@@ -273,7 +276,9 @@ class PPOTrainer:
     # Rollout-batch preparation and actor/critic optimization
     # ------------------------------------------------------------------
 
-    async def step(self, trajectories: list[Trajectory]) -> dict[str, float]:
+    async def step(
+        self, trajectories: list[Trajectory], *, max_staleness: int = 0
+    ) -> dict[str, float]:
         """Update one frozen rollout batch.
 
         The actor and critic consume the same prepared targets.  When both are
@@ -285,7 +290,16 @@ class PPOTrainer:
             raise ValueError("An update requires nonempty trajectories.")
         # Validate provenance before reference scoring or critic work. The
         # actor repeats this check as a defense for callers using it directly.
-        validate_policy_versions(trajectories, current_version=self.state.global_step)
+        validate_policy_versions(
+            trajectories,
+            current_version=self.state.global_step,
+            max_staleness=max_staleness,
+        )
+        policy_ages = [
+            self.state.global_step - trajectory.policy_version
+            for trajectory in trajectories
+            if type(trajectory.policy_version) is int
+        ]
         await self.initialize()
         initial_actor_tokens = self._actor.train_tokens
         initial_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
@@ -380,7 +394,17 @@ class PPOTrainer:
         ]
         overlong_penalties = []
         if self.args.overlong_tokens:
-            for length in (sum(t.loss_mask) for t in trajectories):
+            logical_lengths = {}
+            for index, trajectory in enumerate(trajectories):
+                key = (
+                    trajectory.logical_sequence_id
+                    if trajectory.rollout_id
+                    else ("row", index)
+                )
+                logical_lengths[key] = logical_lengths.get(key, 0) + sum(
+                    trajectory.loss_mask
+                )
+            for length in logical_lengths.values():
                 excess = max(
                     0,
                     length - (self.args.max_tokens - self.args.overlong_tokens),
@@ -416,8 +440,13 @@ class PPOTrainer:
                 "train/action_tokens": float(
                     sum(sum(t.effective_action_weights) for t in batch.trajectories)
                 ),
-                "train/prompt_groups": float(
+                "train/prompt_groups": float(len({t.group_id for t in trajectories})),
+                "train/reward_groups": float(
                     len({t.comparison_group_id for t in trajectories})
+                ),
+                "train/policy_staleness_max": float(max(policy_ages, default=0)),
+                "train/policy_staleness_mean": float(
+                    np.mean(policy_ages) if policy_ages else 0.0
                 ),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
                 "train/learning_rate": self.args.learning_rate,

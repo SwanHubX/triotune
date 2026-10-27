@@ -115,6 +115,12 @@ class Trajectory:
     # branch export uses fractional values only for actions shared by sibling
     # paths; branch-local actions remain at unit weight.
     action_weights: list[float] | None = None
+    # A compacted rollout can contain physical rows with different tokenized
+    # prompts. ``group_id`` remains the strict identical-prompt identity, while
+    # reward_group_id keeps those fragments in the candidate comparison group.
+    # context_segment is the zero-based causal segment within the logical path.
+    reward_group_id: str | None = None
+    context_segment: int = 0
 
     @property
     def logical_sequence_id(self) -> tuple[str, str | None] | tuple[str, int]:
@@ -128,7 +134,7 @@ class Trajectory:
     @property
     def comparison_group_id(self) -> str:
         """Return the reward-comparison group for this branch or trajectory."""
-        return self.branch_group_id or self.group_id
+        return self.branch_group_id or self.reward_group_id or self.group_id
 
     @property
     def effective_action_weights(self) -> list[float]:
@@ -163,6 +169,8 @@ class Trajectory:
                 "branch_group_id",
                 "branch_completed",
                 "shared_prefix_weight",
+                "reward_group_id",
+                "context_segment",
             )
         }
         source["action_keys"] = (
@@ -211,6 +219,7 @@ class Trajectory:
             "parent_interaction_id",
             "branch_id",
             "branch_group_id",
+            "reward_group_id",
         ):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
@@ -224,6 +233,8 @@ class Trajectory:
             self.branch_group_id is not None or self.branch_completed is not None
         ):
             raise ValueError("Branch metadata requires branch_id.")
+        if type(self.context_segment) is not int or self.context_segment < 0:
+            raise ValueError("context_segment must be a nonnegative integer.")
         if self.branch_id is not None and self.branch_completed is not True:
             raise ValueError("Only completed branches may enter PPO trajectories.")
         if (

@@ -31,6 +31,8 @@ from ..types import (
     AgentContractError,
     AgentEvent,
     AgentTurn,
+    ContextCompaction,
+    ConversationCompactor,
     ConversationRenderer,
     EpisodeLimits,
     EpisodeResult,
@@ -264,6 +266,7 @@ class EpisodeRunner:
         score_partial: bool = True,
         reward_ledger: RewardLedger | None = None,
         resource_owner: str = "runner",
+        context_compactor: ConversationCompactor | None = None,
     ):
         """Compose execution adapters and optional model-specific serialization.
 
@@ -276,6 +279,7 @@ class EpisodeRunner:
         self.interaction_scorer = interaction_scorer
         self.failure_classifier = failure_classifier
         self.observations, self.renderer = observations, renderer
+        self.context_compactor = context_compactor
         self.limits, self.prompt_key = limits or EpisodeLimits(), prompt_key
         self.trajectory_builder = trajectory_builder or EpisodeTrajectoryBuilder()
         self.retry = retry or RetryPolicy()
@@ -301,7 +305,12 @@ class EpisodeRunner:
 
     async def start(self) -> None:
         """Start scorer/tool resources once for the runner's session."""
-        await self._boundary.start(self.tools, self.scorer, self.interaction_scorer)
+        await self._boundary.start(
+            self.tools,
+            self.scorer,
+            self.interaction_scorer,
+            self.context_compactor,
+        )
         self._resource_started = self._boundary.started
 
     async def close(self) -> None:
@@ -633,16 +642,65 @@ class EpisodeRunner:
                     renderer.render, messages, self.tools.schemas
                 )
             validate_tokens(prompt_tokens, name="rendered prompt")
+            remaining = limits.max_generated_tokens - generated_tokens
+            if remaining <= 0:
+                episode.status = "token_limit"
+                return
+            desired = min(limits.max_tokens_per_turn, remaining)
+            if (
+                self.context_compactor is not None
+                and episode.turns
+                and len(prompt_tokens) + desired > limits.max_context_tokens
+            ):
+                # A compacted request is a new causal segment. Render it in full
+                # and record its exact IDs before sampling; previous generated
+                # tokens remain untouched in earlier trajectory fragments.
+                plan = await self.context_compactor.compact(messages, episode)
+                if plan.removed_messages:
+                    compacted_messages = [copy.deepcopy(item) for item in plan.messages]
+                    compacted_tokens = await asyncio.to_thread(
+                        renderer.render, compacted_messages, self.tools.schemas
+                    )
+                    validate_tokens(compacted_tokens, name="compacted prompt")
+                    if len(compacted_tokens) >= len(prompt_tokens):
+                        raise AgentContractError(
+                            "Context compaction did not reduce the rendered prompt."
+                        )
+                    compaction = ContextCompaction(
+                        turn_index=len(episode.turns),
+                        original_prompt_tokens=len(prompt_tokens),
+                        compacted_prompt_tokens=tuple(compacted_tokens),
+                        retained_interaction_ids=plan.retained_interaction_ids,
+                        summarized_interaction_ids=plan.summarized_interaction_ids,
+                        removed_messages=plan.removed_messages,
+                    )
+                    episode.compactions.append(compaction)
+                    episode.events.append(
+                        AgentEvent(
+                            context=episode.context,
+                            kind="context_compaction",
+                            details={
+                                "turn_index": compaction.turn_index,
+                                "original_prompt_tokens": len(prompt_tokens),
+                                "compacted_prompt_tokens": len(compacted_tokens),
+                                "removed_messages": plan.removed_messages,
+                                "retained_interaction_ids": list(
+                                    plan.retained_interaction_ids
+                                ),
+                                "summarized_interaction_ids": list(
+                                    plan.summarized_interaction_ids
+                                ),
+                            },
+                        )
+                    )
+                    messages[:] = compacted_messages
+                    prompt_tokens = compacted_tokens
             self.trajectory_builder.validate_prefix(episode, prompt_tokens)
             # Context capacity includes rendered history and observations,
             # whereas the episode output budget counts model generations only.
             context_budget = limits.max_context_tokens - len(prompt_tokens)
             if context_budget <= 0:
                 episode.status = "context_limit"
-                return
-            remaining = limits.max_generated_tokens - generated_tokens
-            if remaining <= 0:
-                episode.status = "token_limit"
                 return
             budget = min(limits.max_tokens_per_turn, remaining, context_budget)
             context = replace(
