@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from triotune.agentrl import ExecutionContext
 from triotune.agentrl.config import RetryPolicy
-from triotune.agentrl.sdk.openai import (
+from triotune.agentrl.integrations.openai import (
     OpenAIClient,
     OpenAIProxyServer,
     OpenAISession,
@@ -660,7 +660,7 @@ class ThirdPartySDKTests(unittest.IsolatedAsyncioTestCase):
         from test_openai_native import FakeSamplingClient, NativeTokenizer, xml_call
 
         from triotune.agentrl import PyTRIOAgentSampler, SamplingSnapshot
-        from triotune.agentrl.sdk.openai import PyTRIOBackend
+        from triotune.agentrl.integrations.openai import PyTRIOBackend
 
         tools = [
             {

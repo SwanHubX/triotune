@@ -31,7 +31,7 @@ from triotune.agentrl import (
     current_execution_context,
 )
 from triotune.agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
-from triotune.agentrl.sdk.openai import (
+from triotune.agentrl.integrations.openai import (
     Agent,
     OpenAIClient,
     OpenAIWorkflow,

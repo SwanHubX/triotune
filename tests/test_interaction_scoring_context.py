@@ -19,7 +19,7 @@ from triotune.agentrl import (
     RewardAssignment,
     current_execution_context,
 )
-from triotune.agentrl.sdk.openai import (
+from triotune.agentrl.integrations.openai import (
     Agent,
     OpenAIClient,
     OpenAISession,

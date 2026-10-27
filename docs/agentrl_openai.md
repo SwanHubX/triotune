@@ -24,7 +24,7 @@ from triotune.agentrl import (
     AgentRolloutWorkflow, AgentTrainingLoop, EpisodeLimits, EpisodeScore,
     EpisodeTrajectoryBuilder, OpenAIEpisodeExecutor, function_tool,
 )
-from triotune.agentrl.sdk.openai import Agent, OpenAIClient, OpenAIWorkflow, PyTRIOBackend
+from triotune.agentrl.integrations.openai import Agent, OpenAIClient, OpenAIWorkflow, PyTRIOBackend
 
 MODEL = "Qwen/Qwen3.5-4B"
 
@@ -89,7 +89,7 @@ partial-episode scoring; system failures and rejected candidates cannot train.
 The native `scorer` is the primary outcome/success scorer. Explicit SDK reward
 submissions, including SDK workflow scorers, are additional contributions and
 are converted once into native RewardAssignments. SDK source names are scoped
-under `sdk/assignment/` to keep independent judges' aggregation populations
+under `openai/assignment/` to keep independent judges' aggregation populations
 separate. Do not submit the same outcome through both scorers. Native interaction
 scorers, scorer timeouts/retries, acceptance/group policies, JSONL reward traces,
 fragment maps, shared-action masking, normalization, GAE, and loss weighting all
@@ -222,7 +222,7 @@ as SDK generation options or taken from model tool arguments.
 ```python
 from triotune.agentrl import ExecutionContext
 from triotune.agentrl.runtime.sampling import SamplingSnapshot
-from triotune.agentrl.sdk.openai import OpenAISession, OpenAIWorkflow
+from triotune.agentrl.integrations.openai import OpenAISession, OpenAIWorkflow
 
 
 async def record_candidate(
@@ -271,7 +271,7 @@ names retain text-only sampling and explicitly reject tool requests. No model
 weights or sampling clients are created by the adapter.
 
 ```python
-from triotune.agentrl.sdk.openai import Agent, OpenAIClient, PyTRIOBackend
+from triotune.agentrl.integrations.openai import Agent, OpenAIClient, PyTRIOBackend
 
 
 async def run_native_candidate(snapshot, context, tools):
@@ -450,7 +450,7 @@ For a user-defined asynchronous agent, use a client-only workflow:
 ```python
 import json
 
-from triotune.agentrl.sdk.openai import OpenAIClient, OpenAIWorkflow
+from triotune.agentrl.integrations.openai import OpenAIClient, OpenAIWorkflow
 
 
 async def run_external_agent(upstream_sdk, model, question):

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from triotune.agentrl import ExecutionContext, PyTRIOAgentSampler, SamplingSnapshot
 from triotune.agentrl.runtime.conversation import NativeToolContinuationRenderer
-from triotune.agentrl.sdk.openai import (
+from triotune.agentrl.integrations.openai import (
     Agent,
     OpenAIClient,
     OpenAIProxyServer,

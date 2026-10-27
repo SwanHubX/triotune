@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from triotune.agentrl import ExecutionContext, RuntimeBoundary
 from triotune.agentrl.config import RetryPolicy
-from triotune.agentrl.sdk.openai import Agent, OpenAIClient, function_tool
+from triotune.agentrl.integrations.openai import Agent, OpenAIClient, function_tool
 from triotune.agentrl.types import ToolSystemError
 
 

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from triotune.agentrl import FunctionToolExecutor
 from triotune.agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
-from triotune.agentrl.sdk.openai import (
+from triotune.agentrl.integrations.openai import (
     Agent,
     OpenAIChatObservationFormatter,
     OpenAIClient,

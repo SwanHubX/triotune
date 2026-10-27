@@ -17,7 +17,7 @@ from triotune.agentrl import (
     current_execution_context,
     function_tool,
 )
-from triotune.agentrl.sdk.openai import OpenAIWorkflow
+from triotune.agentrl.integrations.openai import OpenAIWorkflow
 from triotune.agentrl.runtime.tools import FunctionToolExecutor
 
 

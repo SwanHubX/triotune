@@ -34,7 +34,7 @@ from .runtime.conversation import (
 from .runtime.runner import EpisodeRunner, RuntimeBoundary
 from .runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
 from .runtime.tools import FunctionTool, FunctionToolExecutor
-from .sdk.openai import (
+from .integrations.openai import (
     Agent,
     ExternalOpenAIBackend,
     OpenAIClient,
@@ -45,6 +45,13 @@ from .sdk.openai import (
     Qwen35ToolParser,
     function_tool,
 )
+
+import sys as _sys
+from . import integrations as _integrations
+from .integrations import openai as _openai_integration
+
+_sys.modules.setdefault(__name__ + ".sdk", _integrations)
+_sys.modules.setdefault(__name__ + ".sdk.openai", _openai_integration)
 from .training.evaluation import evaluation_metrics, paired_task_metrics
 from .training.loop import AgentTrainingLoop
 from .training.rewards import (
