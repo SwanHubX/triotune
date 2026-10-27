@@ -1,0 +1,34 @@
+# Two optimizer updates with real native-tool or official SDK executions.
+# Run via tests/recipes/remote_baseline.py with explicit --remote opt-in.
+algorithm: reinforce
+model:
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 8
+training:
+  batch_size: 2
+  max_steps: 2
+  seed: 42
+optimizer:
+  learning_rate: 0.00004
+rollout:
+  num_generations: 1
+  max_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+  chat_template_kwargs: {enable_thinking: false}
+# REINFORCE keeps the outcome signal when all candidates answer correctly;
+# group-relative centering would erase that useful small-batch baseline.
+actor:
+  reward_norm: null
+  adv_norm: {mean_level: null, std_level: null}
+evaluation:
+  before_train: true
+  after_train: true
+  steps: 0
+  batch_size: 2
+  max_batches: 1
+checkpoint:
+  save_every: 0
+reporting:
+  report_to: null
+  logging_step: 1

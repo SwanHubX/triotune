@@ -1,0 +1,36 @@
+# Standard PPO with an independent trainable critic, two updates only.
+# The acceptance runner supplies fixed arithmetic rows and records all defaults.
+algorithm: ppo
+model:
+  name: Qwen/Qwen3.5-4B
+  lora_rank: 8
+training:
+  batch_size: 2
+  max_steps: 2
+  seed: 42
+optimizer:
+  learning_rate: 0.00004
+rollout:
+  num_generations: 1
+  max_tokens: 64
+  temperature: 1.0
+  top_p: 1.0
+  chat_template_kwargs: {enable_thinking: false}
+critic:
+  enabled: true
+  optimizer:
+    learning_rate: 0.00004
+actor:
+  reward_norm: null
+  adv_norm: {mean_level: batch, std_level: batch}
+evaluation:
+  before_train: true
+  after_train: true
+  steps: 0
+  batch_size: 2
+  max_batches: 1
+checkpoint:
+  save_every: 0
+reporting:
+  report_to: null
+  logging_step: 1

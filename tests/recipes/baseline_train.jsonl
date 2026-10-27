@@ -1,0 +1,4 @@
+{"task_id":"train-0","question":"What is 2 + 3?","answer":"5","rejected":"6"}
+{"task_id":"train-1","question":"What is 6 * 7?","answer":"42","rejected":"41"}
+{"task_id":"train-2","question":"What is 18 / 3?","answer":"6","rejected":"5"}
+{"task_id":"train-3","question":"What is 11 - 4?","answer":"7","rejected":"8"}
