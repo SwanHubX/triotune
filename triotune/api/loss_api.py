@@ -590,6 +590,12 @@ class Objective(Protocol):
     ) -> Any: ...
 
 
+class PPOObjective(Protocol):
+    """Build a local PPO loss callback for a frozen prepared batch."""
+
+    def make_loss(self, batch: Any, config: Any, diagnostics: Any = None) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class BuiltinPyTrioObjective:
     """Adapter that submits one validated built-in objective to PyTRIO.
@@ -736,6 +742,7 @@ __all__ = [
     "LossName",
     "LossSpec",
     "Objective",
+    "PPOObjective",
     "PolicyLossInput",
     "SupervisedLossInput",
     "forward_backward",

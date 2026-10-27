@@ -14,7 +14,8 @@ import math
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import numpy as np
 import pytrio as trio
@@ -27,7 +28,7 @@ from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
-from .ppo.contracts import PPOState, Trajectory
+from .ppo.advantages import PPOAlgorithmPlan
 from .ppo.critic import Critic, PyTRIOCritic
 from .ppo.rollout import (
     filter_informative_groups,
@@ -35,6 +36,10 @@ from .ppo.rollout import (
     generate_rollouts,
     score_reference,
 )
+from .ppo.trajectory import PPOState, Trajectory, validate_policy_versions
+
+if TYPE_CHECKING:
+    from ..agentrl.runtime.sampling import SamplingSnapshot
 
 
 class PPOTrainer:
@@ -69,6 +74,8 @@ class PPOTrainer:
         tokenizer=None,
         reference_client=None,
         service_client=None,
+        algorithm_plan: PPOAlgorithmPlan | None = None,
+        plan: PPOAlgorithmPlan | None = None,
     ) -> None:
         """Create a lazy PPO trainer and validate actor/critic ownership.
 
@@ -82,13 +89,17 @@ class PPOTrainer:
         if reference_model is None and self.args.reference is not None:
             reference_model = self.args.reference.name
         if lora_rank is None:
-            lora_rank = configured_model.lora_rank if configured_model is not None else 32
+            lora_rank = (
+                configured_model.lora_rank if configured_model is not None else 32
+            )
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
         if reference_model is not None and (
             not isinstance(reference_model, str) or not reference_model.strip()
         ):
-            raise ValueError("reference_model must be a non-empty model ID when provided.")
+            raise ValueError(
+                "reference_model must be a non-empty model ID when provided."
+            )
         if (
             isinstance(lora_rank, bool)
             or not isinstance(lora_rank, int)
@@ -119,6 +130,15 @@ class PPOTrainer:
         self._client, self._tokenizer = training_client, tokenizer
         self._reference, self._service = reference_client, service_client
         self._critic_client = critic_training_client
+        if algorithm_plan is not None and plan is not None:
+            raise ValueError("Supply either algorithm_plan or plan, not both.")
+        configured_plan = getattr(self.args, "algorithm_plan", None)
+        if (
+            sum(value is not None for value in (algorithm_plan, plan, configured_plan))
+            > 1
+        ):
+            raise ValueError("Supply only one PPO algorithm plan.")
+        self.algorithm_plan = algorithm_plan or plan or configured_plan
         self._owns_critic = self.args.use_critic and critic is None
         self._actor = None
         self._sampling = None
@@ -202,7 +222,7 @@ class PPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
-        self._actor = PPOActor(self._client, self.args)
+        self._actor = PPOActor(self._client, self.args, self.algorithm_plan)
 
     async def _references(self, trajectories):
         """Populate missing reference logprobs when KL control is enabled."""
@@ -223,11 +243,42 @@ class PPOTrainer:
             )
         await score_reference(self._reference, trajectories)
 
+    async def create_sampling_snapshot(self, *, stop=None) -> SamplingSnapshot:
+        """Export current actor weights for an entire custom agent batch.
+
+        The returned sampling client is a fixed exported policy. Collection may
+        continue from that client while the training client updates newer actor
+        weights, but one logical rollout must never switch snapshots mid-run.
+        Consumers must enforce policy-version staleness when the completed
+        rollout later enters ``step``.
+        """
+        from ..agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
+
+        await self.initialize()
+        self._sampling = await call_async(
+            self._client, "save_weights_and_get_sampling_client"
+        )
+        return SamplingSnapshot(
+            f"step-{self.state.global_step}-{uuid4().hex}",
+            PyTRIOAgentSampler(self._sampling, self._tokenizer, stop=stop),
+            self._tokenizer,
+            policy_version=self.state.global_step,
+        )
+
+    async def publish_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Publish custom workflow metrics through the trainer-owned reporter."""
+        await self.initialize()
+        payload = self._metrics.publish(metrics, step=self.state.global_step)
+        self.state.metrics.update(payload)
+        return payload
+
     # ------------------------------------------------------------------
     # Rollout-batch preparation and actor/critic optimization
     # ------------------------------------------------------------------
 
-    async def step(self, trajectories: list[Trajectory]) -> dict[str, float]:
+    async def step(
+        self, trajectories: list[Trajectory], *, max_staleness: int = 0
+    ) -> dict[str, float]:
         """Update one frozen rollout batch.
 
         The actor and critic consume the same prepared targets.  When both are
@@ -237,6 +288,18 @@ class PPOTrainer:
         """
         if not trajectories:
             raise ValueError("An update requires nonempty trajectories.")
+        # Validate provenance before reference scoring or critic work. The
+        # actor repeats this check as a defense for callers using it directly.
+        validate_policy_versions(
+            trajectories,
+            current_version=self.state.global_step,
+            max_staleness=max_staleness,
+        )
+        policy_ages = [
+            self.state.global_step - trajectory.policy_version
+            for trajectory in trajectories
+            if type(trajectory.policy_version) is int
+        ]
         await self.initialize()
         initial_actor_tokens = self._actor.train_tokens
         initial_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
@@ -277,7 +340,13 @@ class PPOTrainer:
         total_critic_tokens = int(getattr(self.critic, "train_tokens", 0))
         actor_tokens = total_actor_tokens - initial_actor_tokens
         critic_tokens = total_critic_tokens - initial_critic_tokens
-        rewards = [t.reward for t in trajectories]
+        # Outcome statistics describe logical candidates; token usage and
+        # physical trajectory counts continue to describe actual remote work.
+        logical = {
+            t.logical_sequence_id if t.rollout_id else ("row", i): t
+            for i, t in enumerate(trajectories)
+        }
+        rewards = [t.reward for t in logical.values()]
         active_logprobs = [
             logprob
             for trajectory in batch.trajectories
@@ -302,12 +371,12 @@ class PPOTrainer:
         reward_components = {
             name: [
                 trajectory.reward_components[name]
-                for trajectory in trajectories
+                for trajectory in logical.values()
                 if name in trajectory.reward_components
             ]
             for name in {
                 name
-                for trajectory in trajectories
+                for trajectory in logical.values()
                 for name in trajectory.reward_components
             }
         }
@@ -325,7 +394,17 @@ class PPOTrainer:
         ]
         overlong_penalties = []
         if self.args.overlong_tokens:
-            for length in lengths:
+            logical_lengths = {}
+            for index, trajectory in enumerate(trajectories):
+                key = (
+                    trajectory.logical_sequence_id
+                    if trajectory.rollout_id
+                    else ("row", index)
+                )
+                logical_lengths[key] = logical_lengths.get(key, 0) + sum(
+                    trajectory.loss_mask
+                )
+            for length in logical_lengths.values():
                 excess = max(
                     0,
                     length - (self.args.max_tokens - self.args.overlong_tokens),
@@ -352,8 +431,23 @@ class PPOTrainer:
                     np.mean([t.truncated for t in trajectories])
                 ),
                 "train/trajectories": float(len(trajectories)),
-                "train/action_tokens": float(sum(sum(mask) for mask in batch.masks)),
+                "train/logical_rollouts": float(
+                    len(
+                        {t.rollout_id or ("row", i) for i, t in enumerate(trajectories)}
+                    )
+                ),
+                "train/logical_sequences": float(len(logical)),
+                "train/action_tokens": float(
+                    sum(sum(t.effective_action_weights) for t in batch.trajectories)
+                ),
                 "train/prompt_groups": float(len({t.group_id for t in trajectories})),
+                "train/reward_groups": float(
+                    len({t.comparison_group_id for t in trajectories})
+                ),
+                "train/policy_staleness_max": float(max(policy_ages, default=0)),
+                "train/policy_staleness_mean": float(
+                    np.mean(policy_ages) if policy_ages else 0.0
+                ),
                 "train/optimizer_steps": float(self.state.optimizer_steps),
                 "train/learning_rate": self.args.learning_rate,
                 "usage/actor_train_tokens": float(actor_tokens),
@@ -394,9 +488,7 @@ class PPOTrainer:
         if overlong_penalties:
             metrics.update(
                 {
-                    "reward/overlong_penalty_mean": float(
-                        np.mean(overlong_penalties)
-                    ),
+                    "reward/overlong_penalty_mean": float(np.mean(overlong_penalties)),
                     "rollout/overlong_fraction": float(
                         np.mean([value > 0 for value in overlong_penalties])
                     ),
@@ -533,12 +625,7 @@ class PPOTrainer:
                 )
                 generated = filtered
                 if (
-                    len(
-                        {
-                            trajectory.group_id
-                            for trajectory in accepted + generated
-                        }
-                    )
+                    len({trajectory.group_id for trajectory in accepted + generated})
                     < self.args.batch_size
                 ):
                     refill_count += 1
@@ -608,9 +695,7 @@ class PPOTrainer:
         if not callable(self.reward_fn):
             raise ValueError("evaluate() requires reward_fn.")
         await self.initialize()
-        sampler = await call_async(
-            self._client, "save_weights_and_get_sampling_client"
-        )
+        sampler = await call_async(self._client, "save_weights_and_get_sampling_client")
         started = time.perf_counter()
         trajectories: list[Trajectory] = []
         prompt_count = 0
@@ -743,9 +828,7 @@ class PPOTrainer:
                     "usage/sample_output_tokens": float(
                         self._sample_output_tokens - initial_sample_output
                     ),
-                    "usage/sample_input_tokens_total": float(
-                        self._sample_input_tokens
-                    ),
+                    "usage/sample_input_tokens_total": float(self._sample_input_tokens),
                     "usage/sample_output_tokens_total": float(
                         self._sample_output_tokens
                     ),
@@ -803,9 +886,7 @@ class PPOTrainer:
             elapsed = time.perf_counter() - started
             summary = {
                 "time/train_runtime": elapsed,
-                "time/train_steps_per_second": (
-                    self.state.global_step - initial_step
-                )
+                "time/train_steps_per_second": (self.state.global_step - initial_step)
                 / elapsed,
                 "usage/train_tokens_total": self.state.metrics.get(
                     "usage/train_tokens_total", 0.0

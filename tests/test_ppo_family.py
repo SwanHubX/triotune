@@ -61,6 +61,18 @@ def objective(config, trajectories, values, advantages=None):
 
 
 class AdvantageTests(unittest.TestCase):
+    def test_actor_rejects_mixed_policy_versions_before_update(self):
+        actor = PPOActor(None, raw_config())
+        with self.assertRaisesRegex(ValueError, "policy_version"):
+            asyncio.run(
+                actor.prepare(
+                    [
+                        trajectory(policy_version=1),
+                        trajectory(group="other", policy_version=2),
+                    ]
+                )
+            )
+
     def test_singleton_group_normalization_uses_areal_fallbacks(self):
         self.assertEqual(
             normalize([[1, 3]], ["a"], NormConfig("group", None, True)), [[0, 0]]

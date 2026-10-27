@@ -35,6 +35,8 @@ Triotune 为若干基于 PyTRIO 的训练算法提供类似 Trainer 的使用方
 
 在底层 PyTRIO 客户端支持的前提下，PPO、DPO 和 OPD 提供异步训练路径。公共工具统一处理文本、token ID 和聊天消息输入，以及 checkpoint 命名和 SwanLab 指标记录。
 
+triotune.agentrl 提供多轮工具智能体的执行、采样、轨迹导出、评分和评估接口，复用现有 PPO trainer。
+
 ## 📰 近期动态
 
 - **2026-10-19：** Triotune 0.1.1 统一了数据集预处理格式，并将发行包和源码目录重命名为 triotune，同时新增模块化 PPO、在策略蒸馏流程及基于 YAML 的训练配方配置。
@@ -94,7 +96,6 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 PyTRIO 当前支持以下模型：
 
 - Qwen/Qwen3.5-4B
-- Qwen/Qwen3.5-9B
 - Qwen/Qwen3.8-27B
 
 ## 🧩 数据契约
@@ -116,7 +117,7 @@ PyTRIO 当前支持以下模型：
 
 ## Token 用量指标
 
-PyTRIO 记录 training tokens 、prefill tokens 和 sampler tokens 。Triotune 在 SwanLab 中记录对应数量及累计值，采样优先使用 PyTRIO 返回的计数，训练按实际提交的计算请求累计。两端通常一致，但本地回退计数、失败或重试请求可能造成偏差，最终以 PyTRIO 服务端记录为准。
+[PyTRIO](https://pytrio.com/dashboard) 记录 training tokens 、prefill tokens 和 sampler tokens 。Triotune 在 SwanLab 中记录对应数量及累计值，采样优先使用 PyTRIO 返回的计数，训练按实际提交的计算请求累计。两端通常一致，但本地回退计数、失败或重试请求可能造成偏差，最终以 PyTRIO 服务端记录为准。
 
 ## 🐍 Python API
 
@@ -141,6 +142,7 @@ asyncio.run(
 ## 文档
 
 - [训练器说明](triotune/trainer/README.md)
+- [AgentRL 训练说明](docs/agenrl/README_CN.md)
 - [PPO 算法原理](docs/algorithms/ppo_series_CN.md)
 - [GRPO 算法原理](docs/algorithms/grpo_series_CN.md)
 

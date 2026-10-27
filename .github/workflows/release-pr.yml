@@ -92,7 +92,7 @@ jobs:
         env:
           UV_DEFAULT_INDEX: https://pypi.org/simple
         run: |
-          uv sync --locked
+          uv sync --locked --extra openai-proxy
           # Loss 单元测试需要 torch；CPU wheel 即可，无需 CUDA 或远端训练服务。
           uv pip install 'torch>=2.3' --index-url https://download.pytorch.org/whl/cpu
 

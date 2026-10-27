@@ -8,7 +8,7 @@ clients supplied by the caller.
 from . import utils
 from .api.client_api import call, call_async, wait, wait_async
 from .trainer import DPOConfig, DPOTrainer, OPDConfig, OPDTrainer
-from .trainer import PPOConfig, PPOTrainer, RenderedPrompt, render_prompt
+from .trainer import PPOAlgorithmPlan, PPOConfig, PPOTrainer, RenderedPrompt, render_prompt
 
 __all__ = [
     "DPOConfig",
@@ -16,6 +16,7 @@ __all__ = [
     "OPDConfig",
     "OPDTrainer",
     "PPOConfig",
+    "PPOAlgorithmPlan",
     "PPOTrainer",
     "RenderedPrompt",
     "call",

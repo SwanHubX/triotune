@@ -1,4 +1,4 @@
-"""AReaL policy objectives expressed through PyTRIO's logprob gradient bridge.
+"""PPO-family policy objectives through PyTRIO's logprob gradient bridge.
 
 The SDK forwards remotely, differentiates this callback locally, then sends
 ``weights=-d(loss)/d(logprob)`` to remote weighted cross-entropy backward.
@@ -8,8 +8,8 @@ No model parameters or full vocabulary logits are downloaded.
 from collections import defaultdict
 
 from ...api.cli_args import PPOConfig
-from .contracts import PreparedBatch
 from .datum import IGNORE_INDEX
+from .trajectory import PreparedBatch
 
 
 def make_loss_fn(
@@ -32,17 +32,66 @@ def make_loss_fn(
 
         if len(datums) != len(batch.trajectories) or len(logprobs) != len(datums):
             raise ValueError("Custom loss needs one logprob tensor per trajectory.")
+        sequence_targets = {}
+        if config.importance_sampling_level == "sequence":
+            pooled_delta, pooled_advantage, pooled_weight = (
+                defaultdict(list),
+                defaultdict(list),
+                defaultdict(list),
+            )
+            for i, (t, adv, prox, mask, full_lp) in enumerate(
+                zip(
+                    batch.trajectories,
+                    batch.advantages,
+                    batch.proximal_logprobs,
+                    batch.masks,
+                    logprobs,
+                    strict=True,
+                )
+            ):
+                lp = full_lp.reshape(-1)
+                if lp.numel() != len(t.prompt_tokens) + len(t.completion_tokens) - 1:
+                    raise ValueError("Custom loss logprobs are not causally aligned.")
+                lp = lp[len(t.prompt_tokens) - 1 :]
+                valid = torch.tensor(mask, dtype=torch.bool, device=lp.device)
+                previous = lp.new_tensor(prox)[valid]
+                keep = torch.ones_like(previous, dtype=torch.bool)
+                correction = (previous - lp.new_tensor(t.logprobs)[valid]).exp()
+                if config.rejection_lower is not None:
+                    keep &= correction >= config.rejection_lower
+                if config.rejection_upper is not None:
+                    keep &= correction <= config.rejection_upper
+                key = t.logical_sequence_id if t.rollout_id else ("row", i)
+                pooled_delta[key].append((lp[valid] - previous)[keep])
+                pooled_advantage[key].append(lp.new_tensor(adv)[valid][keep])
+                pooled_weight[key].append(
+                    lp.new_tensor(t.effective_action_weights)[valid][keep]
+                )
+            for key, rows in pooled_delta.items():
+                deltas_for_rollout = torch.cat(rows)
+                advantages_for_rollout = torch.cat(pooled_advantage[key])
+                weights_for_rollout = torch.cat(pooled_weight[key])
+                denom = weights_for_rollout.sum().clamp_min(1e-12)
+                sequence_targets[key] = (
+                    ((deltas_for_rollout * weights_for_rollout).sum() / denom).exp(),
+                    (advantages_for_rollout * weights_for_rollout).sum() / denom,
+                )
         sums, counts, deltas, ratios, clipped, rejected = [], [], [], [], [], []
+        row_weights = batch.loss_weights or [1.0] * len(batch.trajectories)
+        if len(row_weights) != len(batch.trajectories):
+            raise ValueError("loss_weights must align with trajectories.")
         # Evaluate each trajectory independently so variable-length completion
         # masks remain aligned before the configured reduction is applied.
-        for t, adv, prox, mask, datum, full_lp in zip(
-            batch.trajectories,
-            batch.advantages,
-            batch.proximal_logprobs,
-            batch.masks,
-            datums,
-            logprobs,
-            strict=True,
+        for row_index, (t, adv, prox, mask, datum, full_lp) in enumerate(
+            zip(
+                batch.trajectories,
+                batch.advantages,
+                batch.proximal_logprobs,
+                batch.masks,
+                datums,
+                logprobs,
+                strict=True,
+            )
         ):
             lp = full_lp.reshape(-1)
             if lp.numel() != len(t.prompt_tokens) + len(t.completion_tokens) - 1:
@@ -57,7 +106,8 @@ def make_loss_fn(
                 )
             lp = lp[len(t.prompt_tokens) - 1 :]
             valid = torch.tensor(mask, dtype=torch.bool, device=lp.device)
-            n = int(valid.sum())
+            token_weight = lp.new_tensor(t.effective_action_weights)[valid]
+            n = float(token_weight.sum())
             counts.append(n)
             # Keep zero dependencies for fully masked rows: the SDK requires a
             # gradient tensor for every datum, including deliberately ignored rows.
@@ -76,14 +126,16 @@ def make_loss_fn(
                     keep &= correction <= config.rejection_upper
             delta = current - previous
             if config.importance_sampling_level == "sequence":
-                # AReaL averages both log ratios and advantages over retained
-                # actions before broadcasting the sequence objective to tokens.
-                denom = keep.sum().clamp_min(1)
-                ratio = (
-                    (delta.masked_fill(~keep, 0).sum() / denom).exp().expand_as(delta)
-                )
-                advantage = (advantage.masked_fill(~keep, 0).sum() / denom).expand_as(
-                    delta
+                # A sequence ratio covers the logical candidate, including
+                # every fragment in this minibatch. Group-preserving batching
+                # keeps its pieces together, so fragment boundaries cannot
+                # change the geometric ratio or mean candidate advantage.
+                seq_ratio, seq_advantage = sequence_targets[
+                    t.logical_sequence_id if t.rollout_id else ("row", row_index)
+                ]
+                ratio, advantage = (
+                    seq_ratio.expand_as(delta),
+                    seq_advantage.expand_as(delta),
                 )
             else:
                 ratio = delta.exp()
@@ -118,8 +170,8 @@ def make_loss_fn(
                 if config.c_clip is not None:
                     terms = torch.minimum(terms, config.c_clip * advantage.abs())
             # Filter the numerator only; all reductions retain original counts.
-            terms = (terms * correction).masked_fill(~keep, 0)
-            sums.append(terms.sum() + lp.sum() * 0)
+            terms = (terms * correction * token_weight).masked_fill(~keep, 0)
+            sums.append(row_weights[row_index] * terms.sum() + lp.sum() * 0)
             deltas.append(delta.detach())
             ratios.append(ratio.detach())
             clipped.append(clip.detach())
@@ -127,27 +179,54 @@ def make_loss_fn(
         if not sum(counts):
             raise ValueError("Custom loss has no active action tokens.")
         active = [
-            (s, n, t.group_id)
-            for s, n, t in zip(sums, counts, batch.trajectories, strict=True)
+            (
+                s,
+                n,
+                t.comparison_group_id,
+                t.logical_sequence_id if t.rollout_id else ("row", i),
+                row_weights[i],
+            )
+            for i, (s, n, t) in enumerate(
+                zip(sums, counts, batch.trajectories, strict=True)
+            )
             if n
         ]
+        # Sequence reductions treat all fragments of one branch (or one linear
+        # rollout) as one candidate. Fractional shared-prefix weights contribute
+        # to both numerator and denominator, so duplicating a path cannot change
+        # its aggregate objective solely by adding another physical row.
+        rollout_sums, rollout_counts = {}, defaultdict(float)
+        for s, n, _, rollout, weight in active:
+            rollout_sums[rollout] = rollout_sums.get(rollout, 0) + s
+            rollout_counts[rollout] += n * weight
         zero = sum(sums) * 0
         if config.loss_aggregation == "token_mean":
-            objective = sum(sums) / sum(counts)
+            objective = sum(sums) / max(
+                sum(n * w for n, w in zip(counts, row_weights)), 1e-12
+            )
         elif config.loss_aggregation == "seq_mean":
-            objective = sum(s / n for s, n, _ in active) / len(active) + zero
-        elif config.loss_aggregation == "prompt_mean":
-            group_tokens = defaultdict(int)
-            for _, n, group in active:
-                group_tokens[group] += n
             objective = (
-                sum(s / group_tokens[group] for s, _, group in active)
+                sum(
+                    s / max(rollout_counts[key], 1e-12)
+                    for key, s in rollout_sums.items()
+                )
+                / len(rollout_sums)
+                + zero
+            )
+        elif config.loss_aggregation == "prompt_mean":
+            group_tokens = defaultdict(float)
+            for _, n, group, _, weight in active:
+                group_tokens[group] += n * weight
+            objective = (
+                sum(s / max(group_tokens[group], 1e-12) for s, _, group, _, _ in active)
                 / len(group_tokens)
                 * batch.prompt_mean_scale
                 + zero
             )
         else:
-            objective = sum(sums) / (len(active) * config.loss_aggregation_divisor)
+            objective = sum(sums) / (
+                len(rollout_sums) * config.loss_aggregation_divisor
+            )
         if not torch.isfinite(objective):
             raise FloatingPointError(
                 "Policy loss is nonfinite; check logprob ratios and rewards."
@@ -166,9 +245,7 @@ def make_loss_fn(
             "policy/ratio_std": all_ratios.std(unbiased=False).item(),
             "policy/ratio_p95": torch.quantile(all_ratios.float(), 0.95).item(),
             "policy/ratio_max": all_ratios.max().item(),
-            "policy/update_approx_kl": (
-                all_ratios - 1 - all_deltas
-            ).mean().item(),
+            "policy/update_approx_kl": (all_ratios - 1 - all_deltas).mean().item(),
             "policy/clip_fraction": torch.cat(clipped).float().mean().item(),
             "policy/clip_fraction_low": (all_ratios < low).float().mean().item(),
             "policy/clip_fraction_high": (all_ratios > high).float().mean().item(),

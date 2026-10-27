@@ -157,6 +157,39 @@ def compute_turn_level_gae(
     return advantages, returns
 
 
+def compute_trajectory_level_gae(
+    rewards: Sequence[float],
+    values: Sequence[float],
+    mask: Sequence[bool],
+    *,
+    discount: float = 1.0,
+    gae_lambda: float = 1.0,
+    truncated: bool = False,
+) -> tuple[list[float], list[float]]:
+    """Compute one GAE step for the complete generated trajectory.
+
+    All active token rewards form one outcome.  The first active value is the
+    trajectory baseline and the final bootstrap is used only for truncation;
+    the resulting targets are broadcast to active tokens for token alignment.
+    """
+
+    _validate_gae_inputs(rewards, values, mask, discount, gae_lambda)
+    active = [index for index, is_active in enumerate(mask) if is_active]
+    advantages = [0.0] * len(rewards)
+    returns = [0.0] * len(rewards)
+    if not active:
+        return advantages, returns
+    value = values[active[0]]
+    bootstrap = values[-1] if truncated else 0.0
+    delta = sum(rewards[index] for index in active) + discount * bootstrap - value
+    advantage = delta
+    target = advantage + value
+    for index in active:
+        advantages[index] = advantage
+        returns[index] = target
+    return advantages, returns
+
+
 def compute_gae(
     rewards: Sequence[float],
     values: Sequence[float],
@@ -189,4 +222,13 @@ def compute_gae(
             gae_lambda=gae_lambda,
             truncated=truncated,
         )
-    raise ValueError("timestep_unit must be 'token' or 'turn'.")
+    if timestep_unit == "trajectory":
+        return compute_trajectory_level_gae(
+            rewards,
+            values,
+            mask,
+            discount=discount,
+            gae_lambda=gae_lambda,
+            truncated=truncated,
+        )
+    raise ValueError("timestep_unit must be 'token', 'turn' or 'trajectory'.")

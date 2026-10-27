@@ -12,10 +12,10 @@ import numpy as np
 from ...api.cli_args import PPOConfig
 from ...api.client_api import call_async, optimizer_params
 from ...utils.token_usage import compute_train_tokens
-from .advantages import prepare_advantages
-from .contracts import PreparedBatch, Trajectory
+from .advantages import PPOAlgorithmPlan, prepare_advantages
 from .datum import batch_datums, build_datum, completion_logprobs
 from .loss import make_loss_fn
+from .trajectory import PreparedBatch, Trajectory, validate_policy_versions
 
 
 def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
@@ -52,9 +52,7 @@ def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
     ratio = np.exp(np.clip(delta, -700, 700))
     low = 1 - config.eps_clip
     high = 1 + (
-        config.eps_clip
-        if config.eps_clip_higher is None
-        else config.eps_clip_higher
+        config.eps_clip if config.eps_clip_higher is None else config.eps_clip_higher
     )
     return {
         "policy/ratio": float(np.mean(ratio)),
@@ -76,6 +74,7 @@ def _native_policy_metrics(result, batch: PreparedBatch, config: PPOConfig):
 # Prompt-group batching and remote actor optimization
 # ---------------------------------------------------------------------------
 
+
 def minibatches(batch: PreparedBatch, count: int):
     """Keep prompt groups intact, including variable response counts.
 
@@ -85,7 +84,7 @@ def minibatches(batch: PreparedBatch, count: int):
     groups = {}
     for i, t in enumerate(batch.trajectories):
         if any(batch.masks[i]):
-            groups.setdefault(t.group_id, []).append(i)
+            groups.setdefault(t.comparison_group_id, []).append(i)
     if count > len(groups):
         raise ValueError("ppo_n_minibatches must not exceed active prompt groups.")
     units = list(groups.values())
@@ -103,6 +102,8 @@ def minibatches(batch: PreparedBatch, count: int):
                 )
             ]
         )
+        if batch.loss_weights:
+            chunk_batch.loss_weights = [batch.loss_weights[i] for i in indices]
         chunk_batch.prompt_mean_scale = count * len(chunk) / len(groups)
         yield chunk_batch
 
@@ -110,12 +111,15 @@ def minibatches(batch: PreparedBatch, count: int):
 class PPOActor:
     """Prepare frozen policy targets and execute actor updates through PyTRIO."""
 
-    def __init__(self, client, config: PPOConfig):
+    def __init__(self, client, config: PPOConfig, plan: PPOAlgorithmPlan | None = None):
         """Bind one remote training client and its immutable PPO configuration."""
 
         self.client, self.config = client, config
+        self.plan = plan or getattr(config, "algorithm_plan", None)
         self.optimizer_steps = 0
         self.train_tokens = 0
+        self.datum_provenance: tuple[dict, ...] = ()
+        self.datum_prefix_groups: tuple[dict, ...] = ()
 
     async def prepare(self, trajectories: list[Trajectory]) -> PreparedBatch:
         """Recompute optional proximal scores and freeze one actor update batch."""
@@ -128,11 +132,15 @@ class PPOActor:
         prompts = {}
         for t in trajectories:
             t.__post_init__()
+            # group_id is the physical tokenized-prompt identity. Reward groups
+            # may intentionally span compacted causal segments with different
+            # prompts, but those rows remain separate PyTRIO datums.
             previous = prompts.setdefault(t.group_id, t.prompt_tokens)
             if previous != t.prompt_tokens:
                 raise ValueError(
-                    "One group_id must identify one identical tokenized prompt."
+                    "One PPO group must identify one identical tokenized prompt."
                 )
+        validate_policy_versions(trajectories)
         proximal = None
         if config.recompute_logprob or config.use_decoupled_loss:
             datums = [build_datum(t) for t in trajectories]
@@ -152,7 +160,7 @@ class PPOActor:
                 replace(t, logprobs=lp)
                 for t, lp in zip(trajectories, proximal, strict=True)
             ]
-        batch = prepare_advantages(trajectories, config)
+        batch = prepare_advantages(trajectories, config, self.plan)
         if proximal is not None:
             batch.proximal_logprobs = proximal
         return batch
@@ -164,10 +172,36 @@ class PPOActor:
         chunks = list(minibatches(batch, config.ppo_n_minibatches))
         metrics = []
         diagnostics = []
+        native_backend = (
+            config.loss_backend == "native"
+            and not (
+                self.plan
+                and (
+                    self.plan.loss_weight_policy is not None
+                    or self.plan.objective is not None
+                )
+            )
+            and all(
+                all(
+                    weight == 1.0
+                    for weight, active in zip(
+                        trajectory.effective_action_weights,
+                        mask,
+                        strict=True,
+                    )
+                    if active
+                )
+                for trajectory, mask in zip(
+                    batch.trajectories, batch.masks, strict=True
+                )
+            )
+        )
         for _ in range(config.update_epochs):
             for chunk in chunks:
-                data = batch_datums(chunk, native=config.loss_backend == "native")
-                if config.loss_backend == "native":
+                data = batch_datums(chunk, native=native_backend)
+                self.datum_provenance = data.provenance
+                self.datum_prefix_groups = data.prefix_groups
+                if native_backend:
                     result = await call_async(
                         self.client,
                         "forward_backward",
@@ -185,14 +219,22 @@ class PPOActor:
                         auto_shift=False,
                     )
                 else:
+                    objective = self.plan.objective if self.plan else None
+                    factory = (
+                        getattr(objective, "make_loss", objective)
+                        if objective is not None
+                        else make_loss_fn
+                    )
+                    if not callable(factory):
+                        factory = make_loss_fn
                     result = await call_async(
                         self.client,
                         "forward_backward_custom",
                         data,
-                        loss_fn=make_loss_fn(chunk, config, diagnostics),
+                        loss_fn=factory(chunk, config, diagnostics),
                     )
                 # PyTRIO custom loss submits a forward, then a forward_backward.
-                passes = 1 if config.loss_backend == "native" else 2
+                passes = 1 if native_backend else 2
                 self.train_tokens += passes * compute_train_tokens(data)
                 # The custom SDK path needs its current forward result to build
                 # backward weights. Do not mutate policy weights between them.
@@ -201,7 +243,7 @@ class PPOActor:
                 )
                 self.optimizer_steps += 1
                 row = dict(result.metrics)
-                if config.loss_backend == "native":
+                if native_backend:
                     native = _native_policy_metrics(result, chunk, config)
                     diagnostics.append(
                         {
@@ -228,10 +270,52 @@ class PPOActor:
                     "train/action_tokens",
                     float(sum(sum(mask) for mask in chunk.masks)),
                 )
+                row.setdefault(
+                    "train/max_shared_prefix_tokens",
+                    float(
+                        max(
+                            (group["prefix_length"] for group in data.prefix_groups),
+                            default=0,
+                        )
+                    ),
+                )
                 row["_loss_weight"] = float(
-                    row["train/action_tokens"]
+                    (
+                        sum(
+                            weight * sum(trajectory.effective_action_weights)
+                            for trajectory, weight, mask in zip(
+                                chunk.trajectories,
+                                chunk.loss_weights or [1.0] * len(chunk.masks),
+                                chunk.masks,
+                                strict=True,
+                            )
+                        )
+                        if config.loss_aggregation == "token_mean"
+                        else sum(
+                            weight
+                            for weight, mask in zip(
+                                chunk.loss_weights or [1.0] * len(chunk.masks),
+                                chunk.masks,
+                                strict=True,
+                            )
+                            if any(mask)
+                        )
+                    )
+                    if self.plan and self.plan.loss_weight_policy is not None
+                    else sum(
+                        sum(trajectory.effective_action_weights)
+                        for trajectory in chunk.trajectories
+                    )
                     if config.loss_aggregation == "token_mean"
-                    else sum(any(mask) for mask in chunk.masks)
+                    else len(
+                        {
+                            t.logical_sequence_id if t.rollout_id else ("row", i)
+                            for i, (t, mask) in enumerate(
+                                zip(chunk.trajectories, chunk.masks, strict=True)
+                            )
+                            if any(mask)
+                        }
+                    )
                     if config.loss_aggregation in {"seq_mean", "constant"}
                     else 1.0
                 )
@@ -286,9 +370,7 @@ class PPOActor:
                     "policy/ratio_std": float(np.std(ratios)),
                     "policy/ratio_p95": float(np.quantile(ratios, 0.95)),
                     "policy/ratio_max": float(np.max(ratios)),
-                    "policy/update_approx_kl": float(
-                        np.mean(ratios - 1 - deltas)
-                    ),
+                    "policy/update_approx_kl": float(np.mean(ratios - 1 - deltas)),
                     "policy/clip_fraction": float(np.mean(clipped)),
                     "policy/clip_fraction_low": float(np.mean(ratios < low)),
                     "policy/clip_fraction_high": float(np.mean(ratios > high)),

@@ -64,6 +64,7 @@ from .opd.teacher_phase import OPDTeacherPhase
 from .opd_trainer import OPDTrainer
 from .sft.state import SFTState
 from .sft_trainer import SFTTrainer
+from .ppo.advantages import PPOAlgorithmPlan
 
 # Historical flat imports resolve to the actual modules, preserving object
 # identity, pickled types, and patches of module attributes such as tqdm.
@@ -174,6 +175,7 @@ __all__ = [
     "ModelConfig",
     "OptimizerConfig",
     "PPOActorConfig",
+    "PPOAlgorithmPlan",
     "PPOConfig",
     "PPOCriticConfig",
     "PPORolloutConfig",
