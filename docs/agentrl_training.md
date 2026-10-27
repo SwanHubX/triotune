@@ -14,8 +14,25 @@ the context before calling `EpisodeExecutor.run(..., context=context)`.
 Tools and synchronous functions can call `current_execution_context()` without
 accepting identity in model-generated arguments. Context is isolated between
 asyncio tasks and propagated to `asyncio.to_thread`. Process adapters must
-serialize and establish it explicitly. Scorers receive the episode context;
-loggers receive the same trusted context while writing a completed episode.
+serialize and establish it explicitly. Episode scorers and completed-episode
+loggers use the root context. Interaction scorers use the exact child
+`interaction.context`, including its interaction ID and parent ID. That scope
+surrounds the entire scoring retry/deadline operation, so PRM calls, nested
+logging, worker-thread fallbacks, and retry events retain the same identity.
+Both EpisodeRunner and OpenAIWorkflow restore the enclosing context after each
+interaction, including on exceptions, timeout, and cancellation. SDK terminal
+scoring and acceptance hooks use the session root context before the workflow
+restores its caller's scope; shared scorers and clients carry no mutable identity.
+
+```python
+from triotune.agentrl import RewardAssignment, current_execution_context
+
+
+async def score_interaction(row, episode, interaction):
+    context = current_execution_context()
+    assert context == interaction.context
+    return RewardAssignment("interaction", 0.1)
+```
 
 Each model request has an `Interaction`, including failed requests without a
 generation. It records the parent ID, half-open input/output token spans,

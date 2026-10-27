@@ -392,14 +392,23 @@ class EpisodeRunner:
                 except TypeError:
                     return await method(row, interaction)
 
-            result = await self._operation(
-                episode,
-                "interaction_scoring",
-                index,
-                score_one,
-                timeout=self.scorer_timeout,
-                retry_policy=self.scorer_retry or self.retry,
-            )
+            # Scope the entire retry/deadline operation, not just score_one:
+            # wait_for tasks and PRM calls inherit this child identity, while
+            # retry events emitted by the boundary retain the same interaction.
+            # Reset the token on every exit so the next interaction, terminal
+            # reward submission, and enclosing caller recover their own scope.
+            context_token = _execution_context.set(interaction.context)
+            try:
+                result = await self._operation(
+                    episode,
+                    "interaction_scoring",
+                    index,
+                    score_one,
+                    timeout=self.scorer_timeout,
+                    retry_policy=self.scorer_retry or self.retry,
+                )
+            finally:
+                _execution_context.reset(context_token)
             if result is None:
                 continue
             if isinstance(result, EpisodeScore):

@@ -322,25 +322,38 @@ class OpenAIWorkflow:
         marks this result unaccepted and raises; it cannot silently enter PPO.
         """
         session = result.session
+        # Agent/callback execution has already restored its caller's context.
+        # Establish this session's root for terminal scoring and acceptance;
+        # interaction scoring temporarily narrows it to the matching child.
+        # The final reset also preserves nested callers on failure/cancellation.
+        context_token = _execution_context.set(session.context)
         try:
             if self.interaction_scorer is not None:
                 method = getattr(
                     self.interaction_scorer, "score", self.interaction_scorer
                 )
                 for index, interaction in enumerate(session.interactions):
-                    value = await self.boundary.operation(
-                        session,
-                        "interaction_scoring",
-                        index,
-                        lambda method=method, interaction=interaction: method(
-                            input, result, interaction
-                        ),
-                        timeout=self.scorer_timeout,
-                        retry_policy=self.scorer_retry,
-                    )
-                    await self._submit_interaction_score(
-                        session, interaction, index, value
-                    )
+                    # Keep PRM retries, timeout tasks, and reward submission in
+                    # one child scope. ContextVars remain task-local and are
+                    # copied by call_async's synchronous worker fallback; no
+                    # shared scorer or sampling-client identity is mutated.
+                    interaction_token = _execution_context.set(interaction.context)
+                    try:
+                        value = await self.boundary.operation(
+                            session,
+                            "interaction_scoring",
+                            index,
+                            lambda method=method, interaction=interaction: method(
+                                input, result, interaction
+                            ),
+                            timeout=self.scorer_timeout,
+                            retry_policy=self.scorer_retry,
+                        )
+                        await self._submit_interaction_score(
+                            session, interaction, index, value
+                        )
+                    finally:
+                        _execution_context.reset(interaction_token)
             if self.scorer is not None:
                 method = getattr(self.scorer, "score", self.scorer)
                 score = await self.boundary.operation(
@@ -389,6 +402,8 @@ class OpenAIWorkflow:
                 )
             )
             raise
+        finally:
+            _execution_context.reset(context_token)
 
     async def _submit_interaction_score(
         self, session, interaction, index, value
