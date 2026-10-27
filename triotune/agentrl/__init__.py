@@ -44,6 +44,8 @@ from .integrations.openai import (
     PyTRIOBackend,
     Qwen35ToolParser,
     function_tool,
+    NativeToolFormat,
+    register_tool_format,
 )
 
 import sys as _sys
@@ -110,6 +112,8 @@ from .types import (
 # stable import surface. Runtime state remains owned by the objects callers
 # construct; importing the package does not start clients or execute tools.
 __all__ = [
+    "NativeToolFormat",
+    "register_tool_format",
     "ActionParseError",
     "ActionParser",
     "Agent",

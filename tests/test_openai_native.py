@@ -408,7 +408,7 @@ class NativeToolsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(schema=bad), self.assertRaises(AgentContractError):
                 Qwen35ToolParser.check_schema(bad)
 
-    async def test_none_choice_and_unknown_model_tools_are_explicit(self):
+    async def test_none_choice_and_unknown_template_tools_are_explicit(self):
         client, _, session = self.setup_backend(["</think>\nanswer<|im_end|>"])
         response = await client.create_chat_completion(
             messages=[{"role": "user", "content": "go"}],
@@ -433,8 +433,13 @@ class NativeToolsTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(sampler.calls), 1)
         client, sampler, session = self.setup_backend([])
+        tokenizer = copy.copy(client.backend.snapshot.tokenizer)
+        tokenizer.chat_template = "unknown tool grammar"
         adapter = OpenAIClient(
-            backend=PyTRIOBackend(client.backend.snapshot, model="unknown-format")
+            backend=PyTRIOBackend(
+                replace(client.backend.snapshot, tokenizer=tokenizer),
+                model="unknown-format",
+            )
         )
         with self.assertRaises(AgentContractError):
             await adapter.create_chat_completion(

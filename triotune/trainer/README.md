@@ -1,105 +1,104 @@
-# Trainer 模块
+# Trainer module
 
-PPO 算法族的组件位于 [`ppo/`](./ppo/)：上一级的 `rl_trainer.py` 负责同一异步训练循环，配置可切换
-PPO、GRPO、RLOO、Dr.GRPO、LitePPO、GSPO、SAPO、CISPO 和 DAPO。
-其算法配置及模块实现保存在该目录；标准 PPO 默认创建独立的 PyTRIO actor/critic 训练客户端，详见接口能力说明。
+PPO algorithm components are located in [ppo/](./ppo/): rl_trainer.py in the parent directory manages the shared asynchronous training loop, with configuration selecting
+PPO, GRPO, RLOO, Dr.GRPO, LitePPO, GSPO, SAPO, CISPO, or DAPO.
+Algorithm configuration and implementations reside in this directory; standard PPO creates independent PyTRIO actor/critic training clients by default. See the interface capability description for details.
 
-多轮工具智能体使用 [`triotune.agentrl`](../agentrl/__init__.py) 中的 `AgentTrainingLoop`，
-通过公开的 `PPOTrainer.create_sampling_snapshot()`、`step()` 和 `publish_metrics()`
-接入相同训练核心。执行、动作解析、工具、评分与轨迹导出接口均由
-`triotune.agentrl` 子包公开。
-本地应用和接口说明见 `output/agentrl/` 中的计算器与 Agent RL 文档。
+Multi-turn tool-using agents use AgentTrainingLoop from triotune.agentrl to access the same training core through the public
+PPOTrainer.create_sampling_snapshot, step, and publish_metrics methods.
+Execution, action parsing, tools, scoring, and trajectory export interfaces are all exposed by triotune.agentrl.
+For training steps and interface documentation, see the [AgentRL documentation](../../docs/agenrl/README.md).
 
-## 目录与职责
+## Directory structure and responsibilities
 
 
 ```text
 triotune/
 ├── api/
-│   ├── cli_args.py      # 公共配置与算法参数契约
-│   └── client_api.py    # Training/Sampling client 调用契约
+│   ├── cli_args.py      # Public configuration and algorithm parameter contracts
+│   └── client_api.py    # Training/Sampling client call contracts
 ├── dataset/
-│   ├── prompt.py        # 文本、token 和聊天输入渲染
-│   ├── prepare.py       # 固定行格式的校验、分词、mask 与长度处理
-│   └── examples.py      # 各算法共享的标准化训练样本
+│   ├── prompt.py        # Rendering of text, token, and chat inputs
+│   ├── prepare.py       # Validation, tokenization, masking, and length handling for fixed row formats
+│   └── examples.py      # Standardized training examples shared across algorithms
 ├── utils/
-│   ├── checkpoint.py    # checkpoint 命名、保存和响应校验
-│   ├── dataloader.py    # 流式数据集的 batch 迭代
-│   ├── datums.py        # 通用 PyTRIO Datum 外壳构造
-│   ├── reporting.py     # 兼容旧调用的进程隔离 secondary-run reporter
-│   ├── scoring.py       # 固定 completion 的 logprob 评分与对齐
-│   └── metrics.py       # 指标规范化、JSONL 历史、窗口聚合与 SwanLab 提交
+│   ├── checkpoint.py    # Checkpoint naming, saving, and response validation
+│   ├── dataloader.py    # Batch iteration over streaming datasets
+│   ├── datums.py        # Construction of generic PyTRIO Datum wrappers
+│   ├── reporting.py     # Process-isolated secondary-run reporter for legacy calls
+│   ├── scoring.py       # Logprob scoring and alignment for fixed completions
+│   └── metrics.py       # Metric normalization, JSONL history, window aggregation, and SwanLab submission
 └── trainer/
-    ├── __init__.py      # 公开导出与历史模块路径兼容
-    ├── dpo_trainer.py   # DPO 训练编排
-    ├── sft_trainer.py   # SFT 训练编排
-    ├── opd_trainer.py   # OPD 训练编排
-    ├── rl_trainer.py    # PPO-family 训练编排
+    ├── __init__.py      # Public exports and compatibility with historical module paths
+    ├── dpo_trainer.py   # DPO training orchestration
+    ├── sft_trainer.py   # SFT training orchestration
+    ├── opd_trainer.py   # OPD training orchestration
+    ├── rl_trainer.py    # PPO-family training orchestration
     ├── dpo/
-    │   ├── state.py          # trainer 状态与 step 结果
-    │   ├── datum.py          # 偏好 completion 的因果对齐与 mask
-    │   └── loss.py           # 成对 DPO 目标、隐式奖励与评估指标
+    │   ├── state.py          # Trainer state and step results
+    │   ├── datum.py          # Causal alignment and masking for preference completions
+    │   └── loss.py           # Pairwise DPO objective, implicit rewards, and evaluation metrics
     ├── sft/
     │   └── state.py
     ├── opd/
-    │   ├── contracts.py      # OPD 阶段数据与执行协议
-    │   ├── execution.py      # 不可变执行计划与并发事务
-    │   ├── rollout.py        # 学生 on-policy 采样
-    │   ├── teacher_phase.py  # 路由固定 teacher 并聚合 token score
-    │   ├── loss.py           # sampled reverse-KL 信号与远端 surrogate
-    │   ├── datum.py          # next-token 对齐与 prompt mask
-    │   └── targets.py        # teacher score 到训练 target 的转换
-    └── ppo/                  # PPO-family 算法组件
-        └── trajectory.py     # PPO 轨迹、准备批次和 trainer 状态
+    │   ├── contracts.py      # OPD stage data and execution protocols
+    │   ├── execution.py      # Immutable execution plans and concurrent transactions
+    │   ├── rollout.py        # Student on-policy sampling
+    │   ├── teacher_phase.py  # Fixed-teacher routing and token score aggregation
+    │   ├── loss.py           # Sampled reverse-KL signals and remote surrogate
+    │   ├── datum.py          # Next-token alignment and prompt masking
+    │   └── targets.py        # Conversion of teacher scores into training targets
+    └── ppo/                  # PPO-family algorithm components
+        └── trajectory.py     # PPO trajectories, prepared batches, and trainer state
 ```
 
-| 模块 | 职责 |
+| Module | Responsibility |
 | --- | --- |
-| [公开入口](./__init__.py) | 导出 trainer、配置和类型，并集中映射历史的平铺模块路径。 |
-| [配置契约](../api/cli_args.py) | 按模型、训练／验证数据源、训练循环、优化器、保存、评估、日志、rollout、actor/critic、reference/teacher 等职责定义可组合配置；DPO、SFT、OPD、PPO 顶层对象可表示完整实验，同时保留依赖注入兼容性。 |
-| [客户端契约](../api/client_api.py) | 统一 TrainingClient、SamplingClient 的同步／异步调用、future 解析及 SDK 参数构造；client 刷新时机由算法决定。 |
-| [输入渲染](../dataset/prompt.py) | 校验文本、token 列表和聊天消息，统一调用 tokenizer。 |
-| [数据处理](../dataset/prepare.py) | 将固定格式的数据行统一处理成 prompt、监督序列或偏好对，并完成 token、mask、EOS 与长度校验。 |
-| [训练样本](../dataset/examples.py) | 提供 `PromptExample`、`SupervisedExample` 和 `PreferenceExample`，隔离数据准备与 PyTRIO 远端客户端。 |
-| [指标公共实现](../utils/metrics.py) | 接收算法产生的任意数值指标，统一完成校验、命名、`log_dir` JSONL 历史、窗口聚合、SwanLab 提交、checkpoint URI 记录和 run 结束。 |
-| [保存公共实现](../utils/checkpoint.py) | 同步／异步保存与路径校验；保存频率及状态更新由各算法决定。 |
-| [批处理公共实现](../utils/dataloader.py) | 对 dataset 输出的样本做惰性 batch 切分，并限制验证 batch 数；不负责分词或 Datum。 |
-| [Datum 公共实现](../utils/datums.py) | 将已完成算法对齐的 token 与 loss inputs 物化为 PyTRIO Datum；不决定 GRPO/OPD 的训练字段。 |
-| [评分公共实现](../utils/scoring.py) | 通过 sampling client 为固定 completion 计算 token logprob，并统一校验完整序列与 completion 的位置对齐；DPO、OPD 和 PPO 可复用。 |
-| [DPO 编排](./dpo_trainer.py)、[Datum](./dpo/datum.py)、[损失](./dpo/loss.py) | trainer 调用通用偏好数据处理并负责固定参考评分与远端更新；算法模块分别实现偏好 completion 的因果对齐、成对目标和训练／评估指标。 |
-| [SFT 编排](./sft_trainer.py) | 调用通用 SFT 数据处理，然后构造交叉熵 Datum、提交流水线并按批次顺序发布结果。 |
-| [OPD 编排](./opd_trainer.py)、[执行计划](./opd/execution.py) | Trainer 负责数据集、client、指标归约、update、checkpoint 和日志生命周期；不可变执行计划组合可替换的 rollout、teacher、target 与 loss 阶段。 |
-| [PPO-family 编排](./rl_trainer.py)、[算法组件](./ppo/) | 组织 rollout、reference/value、冻结目标、actor/critic 并发更新、checkpoint 和日志生命周期；包括 GRPO 预设。 |
-| [OPD rollout](./opd/rollout.py)、[teacher phase](./opd/teacher_phase.py) | 学生按当前 behavior policy 采样；路由组内的固定 teacher 给同一 token 序列评分，并聚合为加权几何 ensemble。当前可跨 prompt 重叠调用，但接口不依赖训练／推理 colocate。 |
-| [OPD loss](./opd/loss.py)、[target](./opd/targets.py)、[Datum](./opd/datum.py) | 计算 `log p_teacher - log p_behavior` token 信号，可选 discounted credit，保留 behavior logprob，并构造 PyTRIO policy loss 所需的 next-token 对齐字段；默认通过 CISPO 将 IS ratio 单侧截断到 5.0。 |
-| [OPD contracts](./opd/contracts.py) | 隔离 SDK response 并校验阶段间数据；OPD trainer 以 completion token 为分母归约蒸馏指标，验证阶段使用流式 totals，不保留完整远端 Datum 列表。 |
+| [Public entry point](./__init__.py) | Exports trainers, configuration, and types, and centrally maps historical flat module paths. |
+| [Configuration contracts](../api/cli_args.py) | Defines composable configuration by responsibility: models, training/validation data sources, training loops, optimizers, saving, evaluation, logging, rollout, actor/critic, and reference/teacher. Top-level DPO, SFT, OPD, and PPO objects can represent complete experiments while retaining dependency injection compatibility. |
+| [Client contracts](../api/client_api.py) | Unifies synchronous/asynchronous TrainingClient and SamplingClient calls, future resolution, and SDK parameter construction; each algorithm determines when to refresh clients. |
+| [Input rendering](../dataset/prompt.py) | Validates text, token lists, and chat messages, and provides a common tokenizer invocation path. |
+| [Data preparation](../dataset/prepare.py) | Converts rows with fixed formats into prompts, supervised sequences, or preference pairs, and validates tokens, masks, EOS, and lengths. |
+| [Training examples](../dataset/examples.py) | Provides PromptExample, SupervisedExample, and PreferenceExample, separating data preparation from remote PyTRIO clients. |
+| [Shared metrics](../utils/metrics.py) | Accepts arbitrary numerical metrics from algorithms and handles validation, naming, log_dir JSONL history, window aggregation, SwanLab submission, checkpoint URI recording, and run finalization. |
+| [Shared saving](../utils/checkpoint.py) | Handles synchronous/asynchronous saving and path validation; each algorithm determines save cadence and state updates. |
+| [Shared batching](../utils/dataloader.py) | Lazily batches examples from datasets and limits validation batches; does not handle tokenization or Datum construction. |
+| [Shared Datum construction](../utils/datums.py) | Materializes tokens and loss inputs already aligned by an algorithm into PyTRIO Datum objects; does not determine GRPO/OPD training fields. |
+| [Shared scoring](../utils/scoring.py) | Computes token logprobs for fixed completions through a sampling client and validates positional alignment between the full sequence and completion; reusable by DPO, OPD, and PPO. |
+| [DPO orchestration](./dpo_trainer.py), [Datum](./dpo/datum.py), [loss](./dpo/loss.py) | The trainer invokes shared preference data preparation and manages fixed-reference scoring and remote updates; algorithm modules implement causal alignment of preference completions, the pairwise objective, and training/evaluation metrics. |
+| [SFT orchestration](./sft_trainer.py) | Invokes shared SFT data preparation, constructs cross-entropy Datum objects, submits the pipeline, and publishes results in batch order. |
+| [OPD orchestration](./opd_trainer.py), [execution plans](./opd/execution.py) | The trainer manages datasets, clients, metric reduction, updates, checkpoints, and the logging lifecycle; immutable execution plans compose replaceable rollout, teacher, target, and loss stages. |
+| [PPO-family orchestration](./rl_trainer.py), [algorithm components](./ppo/) | Coordinates rollout, reference/value scoring, frozen targets, concurrent actor/critic updates, checkpoints, and the logging lifecycle; includes the GRPO preset. |
+| [OPD rollout](./opd/rollout.py), [teacher phase](./opd/teacher_phase.py) | The student samples under the current behavior policy; fixed teachers within the routed group score the same token sequence, and their scores are aggregated into a weighted geometric ensemble. Calls can currently overlap across prompts, but the interface does not depend on colocated training and inference. |
+| [OPD loss](./opd/loss.py), [targets](./opd/targets.py), [Datum](./opd/datum.py) | Computes the log p_teacher - log p_behavior token signal, supports optional discounted credit, preserves behavior logprobs, and constructs the next-token alignment fields required by PyTRIO policy loss; CISPO caps the IS ratio at 5.0 on one side by default. |
+| [OPD contracts](./opd/contracts.py) | Isolates SDK responses and validates data between stages; the OPD trainer reduces distillation metrics using completion tokens as the denominator, and validation uses streaming totals without retaining the full list of remote Datum objects. |
 
-SFT、DPO、OPD 和 PPO-family 的完整训练入口均显示 train step 进度；所有 evaluation
-入口按 batch 显示独立进度。数据源可求长度时展示准确总 batch 数，流式 iterable 则展示已完成 batch 与速率。
+The full SFT, DPO, OPD, and PPO-family training entry points display training-step progress; all evaluation
+entry points display separate batch progress. Data sources with a known length show the exact total number of batches; streaming iterables show completed batches and throughput.
 
-指标按其自然样本数聚合：语言模型损失按有效 token、DPO 按 pair、PPO policy/critic
-按有效 action、OPD 蒸馏指标按 completion token 加权；标准差通过一二阶矩合并，而不是
-直接平均各 batch 的标准差。PPO/OPD 的 KL 与 entropy 字段带有 `sampled` 时仅表示已采样
-action 上的估计，不代表完整词表分布统计。
-SFT 始终从交叉熵报告 perplexity；`train/token_accuracy` 仅在 PyTRIO 后端返回
-`token_accuracy`/`accuracy` 时透传，因为目标 token logprob 本身不足以判断全词表 argmax。
+Metrics are aggregated using their natural sample counts: language-model loss is weighted by valid tokens, DPO by pairs, PPO policy/critic
+by valid actions, and OPD distillation metrics by completion tokens. Standard deviations are combined using first and second moments,
+rather than by directly averaging per-batch standard deviations. PPO/OPD KL and entropy fields containing sampled are estimates over sampled
+actions and do not represent full-vocabulary distribution statistics.
+SFT always reports perplexity from cross-entropy; train/token_accuracy is passed through only when the PyTRIO backend returns
+token_accuracy/accuracy, because target-token logprobs alone cannot determine the argmax over the full vocabulary.
 
 ```text
-dataset/ 单条样本 → utils/dataloader.py batch → 算法对齐 → utils/datums.py Datum
+dataset/ single example → utils/dataloader.py batch → algorithm alignment → utils/datums.py Datum
 ```
 
-`dataset/` 负责从 mapping、JSONL 或已有 iterable 加载原始行，并转换成标准样本；batch 切分、Datum 外壳构造属于运行时
-数据管线。PPO-family/OPD 的 logprob、advantage、teacher score 和 prompt mask 仍由算法
-模块决定。
+dataset/ loads raw rows from mappings, JSONL, or existing iterables and converts them into standardized examples; batching and Datum wrapper construction belong to the runtime
+data pipeline. PPO-family/OPD logprobs, advantages, teacher scores, and prompt masks are still determined by the algorithm
+modules.
 
 
 
-## Trainer 输入数据格式
+## Trainer input data formats
 
 ```python
-# PPO-family / OPD：每行传入一个生成 prompt。
-# 字段名默认是 messages，可分别通过 PPOConfig.rollout.prompt_key 和
-# OPDConfig.rollout.prompt_key 修改。字段值支持纯文本、token ID 或聊天消息。
+# PPO-family / OPD: each row supplies one generation prompt.
+# The field defaults to messages and can be changed through PPOConfig.rollout.prompt_key
+# or OPDConfig.rollout.prompt_key. Values support plain text, token IDs, or chat messages.
 prompt_rows = [
     {"messages": "Explain why the sky is blue."},
     {"messages": [151644, 8948, 198]},
@@ -111,9 +110,9 @@ prompt_rows = [
     },
 ]
 
-# DPO：每行传入共享 prompt、优选回答和拒绝回答。
-# messages 支持纯文本、token ID 或聊天消息；chosen/rejected 支持纯文本、
-# token ID，或与聊天 prompt 配套的 assistant 消息列表。
+# DPO: each row supplies a shared prompt, a chosen response, and a rejected response.
+# messages supports plain text, token IDs, or chat messages; chosen/rejected supports plain text,
+# token IDs, or assistant message lists paired with the chat prompt.
 preference_rows = [
     {"messages": "What is 2 + 2?", "chosen": "4", "rejected": "5"},
     {
@@ -124,7 +123,7 @@ preference_rows = [
     {"messages": [101, 102], "chosen": [103, 104], "rejected": [105, 106]},
 ]
 
-# SFT：同一数据集可使用以下任一种行格式。
+# SFT: a dataset can use any one of the following row formats.
 sft_text_rows = [{"text": "Question: 2 + 2? Answer: 4"}]
 sft_chat_rows = [
     {
@@ -144,7 +143,7 @@ sft_token_rows = [
 ]
 ```
 
-## Dataset 向 Trainer 传输的标准格式
+## Standard format passed from Dataset to Trainer
 
 ```python
 from triotune.dataset import prepare_rows
@@ -156,8 +155,8 @@ prompt_examples = prepare_rows(prompt_rows, tokenizer, format="prompt")
 # SFT
 supervised_examples = prepare_rows(sft_pair_rows, tokenizer, format="sft")
 # SupervisedExample(input_ids: list[int], labels: list[int])
-# labels 中的 -100 表示该 token 不参与 loss。
-# 发送给 PyTRIO 时：
+# -100 in labels indicates that the token does not contribute to loss.
+# When sent to PyTRIO:
 # model_input = input_ids[:-1]
 # target_tokens = labels[1:]
 
@@ -168,10 +167,10 @@ preference_examples = prepare_rows(
     format="preference",
 )
 # PreferenceExample(prompt: list[int], chosen: list[int], rejected: list[int])
-# chosen/rejected 会分别拼接 prompt，并将 prompt 对应标签设为 -100。
+# chosen/rejected are each appended to the prompt, with prompt labels set to -100.
 ```
 
-## 数据集 JSONL 传输示例
+## Dataset JSONL transfer example
 
 ```jsonl
 {"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}]}
@@ -179,7 +178,7 @@ preference_examples = prepare_rows(
 ```
 
 
-## SFT 训练
+## SFT training
 
 ```python
 import asyncio
@@ -197,7 +196,7 @@ trainer = SFTTrainer(
 state = asyncio.run(trainer.train())
 ```
 
-## GRPO 训练
+## GRPO training
 
 ```python
 import asyncio
@@ -217,7 +216,7 @@ trainer = PPOTrainer(
 state = asyncio.run(trainer.train())
 ```
 
-## DPO 训练
+## DPO training
 
 ```bash
 uv sync --extra dpo
@@ -242,7 +241,7 @@ trainer = DPOTrainer(
 state = trainer.train()
 ```
 
-## OPD 训练
+## OPD training
 
 ```python
 from triotune.trainer import OPDConfig, OPDTrainer, TrainingConfig
@@ -250,14 +249,14 @@ from triotune.trainer import OPDConfig, OPDTrainer, TrainingConfig
 trainer = OPDTrainer(
     model="student-base-model-id",
     teacher_model="teacher-base-model-id",
-    # teacher_model_path="trio://...",  # 可选的教师 LoRA checkpoint。
+    # teacher_model_path="trio://...",  # Optional teacher LoRA checkpoint.
     args=OPDConfig(training=TrainingConfig(batch_size=4, max_steps=100)),
     train_dataset=prompt_rows,
 )
 state = trainer.train()
 ```
 
-默认 OPD 执行链是：
+The default OPD execution chain is:
 
 ```text
 student rollout
@@ -269,8 +268,8 @@ student rollout
   → optimizer step
 ```
 
-单 teacher 继续使用上面的兼容接口。多 teacher 通过显式 spec 和 group 配置，
-数据行只携带组名，不接触模型 client 或算法字段：
+A single teacher continues to use the compatible interface above. Multiple teachers are configured through explicit specs and groups;
+data rows carry only group names and do not interact with model clients or algorithm fields:
 
 ```python
 from triotune.trainer import OPDConfig, OPDTrainer

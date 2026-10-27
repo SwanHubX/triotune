@@ -35,8 +35,8 @@ The current trainers are:
 
 PPO, DPO, and OPD include asynchronous training paths where the underlying PyTRIO client supports them. Shared utilities handle text, token-ID, and chat-message inputs, checkpoint naming, and SwanLab metrics.
 
-For multi-turn tool-using agents, `triotune.agent` provides replaceable execution,
-sampling, trajectory export, scoring, and evaluation interfaces over the existing PPO trainer.
+For multi-turn tool-using agents, triotune.agentrl provides execution, sampling,
+trajectory export, scoring, and evaluation interfaces over the existing PPO trainer.
 
 ## 📰 News
 
@@ -97,7 +97,6 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 PyTRIO currently supports the following models:
 
 - Qwen/Qwen3.5-4B
-- Qwen/Qwen3.5-9B
 - Qwen/Qwen3.8-27B
 
 ## 🧩 Data contracts
@@ -119,7 +118,7 @@ See the [trainer guide](triotune/trainer/README.md) for validation rules and com
 
 ## Token usage metrics
 
-PyTRIO records training tokens , prefill tokens , sampler tokens. Triotune reports these counts and their running totals in SwanLab, preferring PyTRIO's sampling counters and accumulating training usage from submitted compute requests. The counts normally agree, but fallback counting, failed requests, or retries may cause differences; PyTRIO's server-side records are authoritative.
+[PyTRIO](https://pytrio.com/dashboard) records training tokens , prefill tokens , sampler tokens. Triotune reports these counts and their running totals in SwanLab, preferring PyTRIO's sampling counters and accumulating training usage from submitted compute requests. The counts normally agree, but fallback counting, failed requests, or retries may cause differences; PyTRIO's server-side records are authoritative.
 
 ## 🐍 Python API
 
@@ -144,6 +143,7 @@ asyncio.run(
 ## Documentation
 
 - [Trainer guide](triotune/trainer/README.md)
+- [AgentRL training guide](docs/agenrl/README.md)
 - [PPO algorithm guide](docs/algorithms/ppo_series.md)
 - [GRPO algorithm guide](docs/algorithms/grpo_series.md)
 

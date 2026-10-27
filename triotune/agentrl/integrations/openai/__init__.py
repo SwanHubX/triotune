@@ -25,8 +25,11 @@ from .proxy_server import OpenAIProxyServer
 from .session import OpenAIInteraction, OpenAISession, OpenAITrajectoryExport, OpenAITraceBranch
 from .workflow import OpenAIWorkflow, SDKRunResult
 from .episode import OpenAIEpisodeExecutor
+from .tool_formats import NativeToolFormat, register_tool_format
 
 __all__ = [
+    "NativeToolFormat",
+    "register_tool_format",
     "Agent",
     "AgentRunResult",
     "ExternalOpenAIBackend",

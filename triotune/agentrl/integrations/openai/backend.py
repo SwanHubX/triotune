@@ -22,7 +22,6 @@ from uuid import uuid4
 
 from ...runtime.conversation import (
     ChatTemplateRenderer,
-    NativeToolContinuationRenderer,
     _reject_constant,
     _unique_object,
 )
@@ -38,7 +37,8 @@ from ...types import (
     ExecutionContext,
     validate_tokens,
 )
-from .native import ModelOutput, ModelOutputParser, Qwen35ToolParser
+from .native import ModelOutput, ModelOutputParser
+from .tool_formats import resolve_tool_format, tokenizer_chat_template
 
 
 class OpenAIBackend(Protocol):
@@ -223,10 +223,10 @@ class PyTRIOBackend:
     controls that would change PPO behavior-policy semantics, and never
     accepts a model name other than the one bound at construction time.
 
-    Qwen/Qwen3.5-4B selects the native XML tool adapter automatically. A local
-    alias can opt in through model_format='qwen3.5' with the matching tokenizer.
-    Unknown model formats retain the earlier text-only sampling behavior and
-    explicitly reject tools rather than treating raw calls as final answers.
+    Tool formats are selected from tokenizer metadata or chat templates, with
+    optional explicit selection. Registered and installed format adapters
+    supply parsers, schema validation, and exact-token continuation renderers.
+    Unknown templates stay text-only and reject native tool requests.
     """
 
     def __init__(
@@ -264,26 +264,17 @@ class PyTRIOBackend:
         self.template_kwargs = dict(template_kwargs or {})
         # Reuse renderer validation for reserved tokenize/generation controls.
         ChatTemplateRenderer(snapshot.tokenizer, **self.template_kwargs)
-        if model_format not in {None, "qwen3.5"}:
-            raise AgentContractError("Unsupported model tool format.")
-        self.native_tools = (
-            model_format == "qwen3.5"
-            or model == "Qwen/Qwen3.5-4B"
-            or isinstance(output_parser, Qwen35ToolParser)
+        self.tool_format, self.tool_format_source, self._native_template = resolve_tool_format(
+            snapshot.tokenizer, model_format,
         )
+        self.model_format = self.tool_format.name if self.tool_format is not None else None
+        self.native_tools = self.tool_format is not None
+        self.output_parser = output_parser
         if self.native_tools:
-            template = getattr(snapshot.tokenizer, "chat_template", "")
-            if not isinstance(template, str) or any(
-                marker not in template
-                for marker in ("<tool_call>", "<function=", "<parameter=")
-            ):
-                raise AgentContractError(
-                    "Qwen3.5 tools require the matching tokenizer template."
-                )
-            self._native_template = template
-        self.output_parser = output_parser or (
-            Qwen35ToolParser(snapshot.tokenizer) if self.native_tools else None
-        )
+            if self.output_parser is None:
+                self.output_parser = self.tool_format.parser_factory(snapshot.tokenizer)
+            if not callable(getattr(self.output_parser, "parse_generation", None)):
+                raise AgentContractError("Tool-format parser must implement parse_generation.")
         if snapshot.policy_version is None:
             raise AgentContractError(
                 "PyTRIO backend requires a snapshot with policy_version."
@@ -310,6 +301,10 @@ class PyTRIOBackend:
                 "Session provenance does not match the bound PyTRIO snapshot."
             )
         session.bind_sampling_source(snapshot=self.snapshot, model=self.model)
+        for interaction in session.interactions:
+            evidence = interaction.response.get("_triotune_sampling", {})
+            if "model_format" in evidence and evidence["model_format"] != self.model_format:
+                raise AgentContractError("Session tool format changed within a rollout.")
         return context
 
     @staticmethod
@@ -536,13 +531,12 @@ class PyTRIOBackend:
             index = end
         return canonical
 
-    @staticmethod
-    def _native_tools(payload):
+    def _native_tools(self, payload):
         """Normalize function schemas and reject unsupported policy controls."""
         choice = payload.get("tool_choice", "auto")
         if choice not in ("auto", "none"):
             raise AgentContractError(
-                "Qwen3.5 supports only tool_choice='auto' or 'none'."
+                "Native tools support only tool_choice='auto' or 'none'."
             )
         raw = payload.get("tools", [])
         if not isinstance(raw, (list, tuple)):
@@ -588,7 +582,7 @@ class PyTRIOBackend:
                 raise AgentContractError(
                     "Native function parameters must be an object schema."
                 )
-            Qwen35ToolParser.check_schema(schema)
+            self.tool_format.schema_validator(schema)
             function.pop("strict", None)
             tools.append({"type": "function", "function": function})
         if len({item["function"]["name"] for item in tools}) != len(tools):
@@ -613,7 +607,7 @@ class PyTRIOBackend:
             return self._canonical_messages(payload.get("messages"))
         if payload.get("previous_response_id") is not None:
             raise AgentContractError(
-                "Qwen3.5 Responses requires full history, not previous_response_id."
+                "Native Responses requires full history, not previous_response_id."
             )
         value = payload.get("input")
         if isinstance(value, str):
@@ -726,7 +720,7 @@ class PyTRIOBackend:
 
     def _native_prompt(self, endpoint, payload, session, *, preflight: bool = False):
         """Verify parent messages, tools, and results before token-safe appending."""
-        if self.snapshot.tokenizer.chat_template != self._native_template:
+        if tokenizer_chat_template(self.snapshot.tokenizer) != self._native_template:
             raise AgentContractError("The bound native tokenizer template was changed.")
         if self.renderer is not None or "_triotune_input_ids" in payload:
             raise AgentContractError(
@@ -736,17 +730,25 @@ class PyTRIOBackend:
             self._native_messages(endpoint, payload),
             self._native_tools(payload),
         )
-        renderer = NativeToolContinuationRenderer(
+        renderer = self.tool_format.renderer_factory(
             self.snapshot.tokenizer, **self.template_kwargs
         )
+        if any(not callable(getattr(renderer, method, None)) for method in ("render", "render_after_tool")):
+            raise AgentContractError("Tool-format renderer must implement render and render_after_tool.")
         advertised_tools = tools if payload.get("tool_choice", "auto") == "auto" else []
+
+        def render_initial():
+            tokens = renderer.render(messages, advertised_tools)
+            validate_tokens(tokens, name="native prompt")
+            return list(tokens), messages, tools
+
         if preflight and session.interactions:
             # The client has not allocated this request yet, so parent lineage
             # is intentionally resolved by OpenAISession.start_request().
             # Validate the layout and template without guessing that parent.
-            return renderer.render(messages, advertised_tools), messages, tools
+            return render_initial()
         if not session.interactions:
-            return renderer.render(messages, advertised_tools), messages, tools
+            return render_initial()
         current = session.interactions[-1]
         parent_id = current.parent_interaction_id
         if parent_id is None:
@@ -754,7 +756,7 @@ class PyTRIOBackend:
                 raise AgentContractError(
                     "Native continuation requires a verified parent interaction."
                 )
-            return renderer.render(messages, advertised_tools), messages, tools
+            return render_initial()
         parent = session.get_interaction(parent_id)
         evidence = parent.response.get("_triotune_sampling", {})
         original_messages = evidence.get("model_messages")
@@ -825,7 +827,11 @@ class PyTRIOBackend:
             prompt_tokens=parent.input_ids,
             output_tokens=parent.output_ids,
         )
-        return tokens, messages, tools
+        validate_tokens(tokens, name="native continuation")
+        expected = list(parent.input_ids) + list(parent.output_ids)
+        if list(tokens[:len(expected)]) != expected:
+            raise AgentContractError("Tool-format renderer changed the sampled prefix.")
+        return list(tokens), messages, tools
 
     def validate_request(
         self, endpoint: str, payload: Mapping[str, Any], *, session: Any
@@ -1028,6 +1034,8 @@ class PyTRIOBackend:
             ),
             "snapshot_id": self.snapshot.snapshot_id,
             "policy_version": self.snapshot.policy_version,
+            "model_format": self.model_format,
+            "tool_format_source": self.tool_format_source,
             "raw_text": parsed.raw_text,
             "reasoning": parsed.reasoning,
             "parse_error": parse_error,

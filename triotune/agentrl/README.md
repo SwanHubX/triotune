@@ -1,41 +1,33 @@
-# Agent RL
+# AgentRL
 
-[中文](README_CN.md) | English
+[中文说明](README_CN.md) | [完整训练文档](../../docs/agenrl/README.md)
 
-## Overview
+The triotune.agentrl package connects a tool-using agent to the existing
+PPO-family trainer. PyTRIO owns model sampling, optimization, metrics, and
+checkpoint storage; this package owns the episode protocol, tools, scoring, and
+exact-token trajectory export.
 
-triotune.agentrl connects tool-using agents to the existing PPOTrainer. It supports synchronous, multi-turn execution, trajectory collection, reward assignment, training updates and evaluation. PyTRIO handles model execution, optimization and checkpoint storage.
+## What is trained
 
-## How it works
+One candidate follows this loop:
 
-1. Export one fixed policy snapshot for a batch of tasks.
-2. Generate an action, parse tool calls, execute tools and append observations until the episode ends.
-3. Preserve original output tokens and behavior log probabilities. Build a Trajectory with action masks and turn IDs; observations and template tokens provide context without policy loss.
-4. Assign outcome and optional process rewards, then call trainer.step() to update the policy.
-5. Refresh the snapshot for the next batch. Evaluate through the same execution and scoring logic.
+1. PyTRIO exports one fixed sampling snapshot.
+2. The agent generates an action, calls a registered tool, and reads its
+   observation until the episode finishes.
+3. The runner keeps original output tokens and behavior log probabilities.
+   Prompt templates and tool observations are context, so they do not receive
+   policy loss.
+4. A scorer assigns outcome and optional process rewards.
+5. AgentTrainingLoop passes validated trajectories to trainer.step, then takes a
+   fresh snapshot for the next batch.
 
-Each episode receives provenance before execution: `rollout_id` identifies a logical task,
-`episode_id` identifies one candidate attempt, `group_id` identifies the relative-reward group,
-`sample_index` identifies the candidate position, and `snapshot_id`/`policy_version` identify
-the sampling policy. The exporter carries these fields into each PPO `Trajectory` for scoring,
-diagnostics, and mixed-policy checks.
-
-Recoverable model action errors become observations or scored failures. Infrastructure failures never become zero-reward training examples. Retries are bounded, and tool retries require an explicit declaration that repeated execution is safe.
-
-## Modules
-
-| Location | Responsibility |
-|---|---|
-| config.py | Agent limits, retries, evaluation settings and adapter composition |
-| types.py | Execution records, protocols and boundary validation |
-| runtime/ | Conversation rendering, episode execution, sampling and tools |
-| rollout/ | Grouped collection and exact-token trajectory construction |
-| training/ | Training loop, reward composition and evaluation metrics |
-| diagnostics/ | Episode logs and tokenizer preflight checks |
+This preserves candidate identity, reward groups, policy versions, and action
+alignment. It also separates recoverable model mistakes from infrastructure
+failures so a service outage does not become a misleading zero-reward sample.
 
 ## Quick start
 
-From the repository root, install dependencies and configure PyTRIO credentials:
+From the repository root:
 
 ```bash
 uv sync --locked --extra ppo
@@ -44,37 +36,29 @@ uv run python examples/agent/calculator/train.py --mode probe
 uv run python examples/agent/calculator/train.py --mode train
 ```
 
-The calculator uses [config.yaml](../../examples/agent/calculator/config.yaml), defaults to Qwen/Qwen3.5-4B and runs two updates. Reports and episode logs are saved under output/calculator-agent/. Use the checkpoint URI from train-report.json for independent evaluation:
+The runnable calculator workflow is in
+[examples/agent/calculator](../../examples/agent/calculator). For the complete
+training recipe, configuration choices, and diagnostics, read
+[docs/agenrl/README.md](../../docs/agenrl/README.md).
 
-```bash
-uv run python examples/agent/calculator/train.py --mode evaluate --checkpoint "trio://YOUR_RUN/weights/YOUR_CHECKPOINT"
-```
+## Package boundaries
 
-## Custom agents
+| Package area | Responsibility |
+| --- | --- |
+| config.py | Limits, retries, renderers, export mode, evaluation, and workflow composition |
+| runtime/ | Conversation rendering, sampling, episode execution, and tools |
+| rollout/ | Grouped collection and exact-token trajectory construction |
+| training/ | Agent training loop, reward composition, and evaluation metrics |
+| diagnostics/ | Episode logs and tokenizer preflight checks |
+| integrations/openai/ | OpenAI-compatible execution and the PyTRIO trajectory bridge |
 
-Create a PPOTrainer with training and evaluation rows, a tool executor and an episode scorer. Run this composition inside an async function, with trainer, tools and scorer supplied by the application:
+Use the detailed contracts for reward assignment, branches, context
+compaction, policy age, and group filtering in
+[agentrl_training.md](../../docs/agenrl/agentrl_training.md). OpenAI session
+ownership, replay, recovery, and third-party forwarding are documented in
+[agentrl_openai.md](../../docs/agenrl/agentrl_openai.md).
 
-```python
-from triotune.agentrl import AgentConfig, AgentTrainingLoop
-
-config = AgentConfig(
-    limits={"max_turns": 5},
-    retry={"max_attempts": 3, "retry_tools": True},
-    log_path="output/agentrl/episodes.jsonl",
-)
-snapshot = await trainer.create_sampling_snapshot(stop=config.stop)
-workflow = config.build_workflow(
-    tokenizer=snapshot.tokenizer,
-    tools=tools,
-    scorer=scorer,
-)
-state = await AgentTrainingLoop(trainer, workflow, config=config).train()
-```
-
-The default input field is messages. Tools can use FunctionToolExecutor; scorers return EpisodeScore with a terminal reward, a success flag and optional token-aligned process rewards. CompositeScorer, ToolCostScorer and TurnRewardScorer combine outcome, cost and process signals.
-
-The default adapters use JSON actions such as {"tool_calls":[{"name":"calculate","arguments":{"operation":"add","a":2,"b":3}}]} and {"final":"5"}. Explain the action protocol and tools in the system message. Set AgentConfig.prompt_key for another input field, or replace adapters through the public protocols.
-
-## Current scope
-
-Sampling uses temperature=1 and top_p=1 to preserve the PPO log-probability contract. The default renderer appends context to original sampled tokens; check tokenizer compatibility before using another model. Explicit interaction-tree branches can export counterfactual PPO paths with branch-local rewards and weighted shared prefixes. Optional context compaction creates exact-token trajectory segments, and bounded asynchronous scheduling overlaps fixed-snapshot collection with PPO updates. General trace replay remains outside the current implementation.
+Sampling uses temperature 1 and top-p 1 to preserve the PPO log-probability
+contract. Begin with synchronous collection and a fixed snapshot; enable
+bounded asynchronous collection only after the synchronous workflow passes its
+tokenizer and probe checks.

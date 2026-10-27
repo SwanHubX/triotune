@@ -1,40 +1,24 @@
-# Agent RL
+# AgentRL
 
-中文 | [English](README.md)
+[English](README.md) | [完整训练文档](../../docs/agenrl/README_CN.md)
 
-## 概述
+triotune.agentrl 将使用工具的智能体接入现有 PPO 系列训练器。PyTRIO 负责模型采样、优化、指标和 checkpoint；本包负责 episode 协议、工具、评分以及精确 token 轨迹导出。
 
-triotune.agentrl 将使用工具的智能体接入现有 PPOTrainer，支持同步多轮执行、轨迹采集、奖励分配、训练更新和评估。模型执行、优化与 checkpoint 存储由 PyTRIO 负责。
+## 训练内容
 
-## 工作原理
+一个候选会按以下循环执行：
 
-1. 为一批任务导出固定的策略快照。
-2. 生成动作、解析工具调用、执行工具并追加观察，直到 episode 结束。
-3. 保留原始输出 token 和行为策略的 log probability，构造带动作掩码和轮次 ID 的 Trajectory；观察和模板 token 提供上下文，不参与策略损失。
-4. 分配结果奖励和可选的过程奖励，再调用 trainer.step() 更新策略。
-5. 为下一批任务刷新快照，并通过相同的执行与评分逻辑进行评估。
+1. PyTRIO 导出一个固定的采样策略快照。
+2. 智能体生成动作、调用注册工具并读取观察，直到 episode 结束。
+3. runner 保留模型原始输出 token 和行为策略 log probability。prompt 模板和工具观察只作为上下文，不参与策略损失。
+4. scorer 分配终局奖励以及可选的过程奖励。
+5. AgentTrainingLoop 将校验后的轨迹交给 trainer.step，再为下一批数据创建新的快照。
 
-每个 Agent episode 在开始执行前就获得固定来源信息：`rollout_id` 标识逻辑任务，
-`episode_id` 标识一次候选尝试，`group_id` 标识相对奖励组，`sample_index` 标识候选位置，
-`snapshot_id` 和 `policy_version` 标识采样策略。这些字段会随导出的 `Trajectory` 进入 PPO，
-便于评分、诊断和检查混合策略数据。
-
-可恢复的模型动作错误会成为观察或被评分的失败。基础设施故障不会成为零奖励训练样本。重试次数有上限，工具重试还需要显式声明重复执行安全。
-
-## 模块
-
-| 位置 | 职责 |
-|---|---|
-| config.py | Agent 限制、重试、评估设置和适配器组装 |
-| types.py | 执行记录、替换协议和边界校验 |
-| runtime/ | 对话渲染、episode 执行、采样和工具 |
-| rollout/ | 分组采集和原始 token 轨迹构造 |
-| training/ | 训练循环、奖励组合和评估指标 |
-| diagnostics/ | Episode 日志和 tokenizer 运行前检查 |
+这样可以保留候选身份、奖励分组、策略版本和动作对齐关系，并把可恢复的模型错误与基础设施故障分开，避免服务故障变成误导性的零奖励样本。
 
 ## 快速开始
 
-在仓库根目录安装依赖，并配置 PyTRIO 凭据：
+在仓库根目录执行：
 
 ```bash
 uv sync --locked --extra ppo
@@ -43,37 +27,19 @@ uv run python examples/agent/calculator/train.py --mode probe
 uv run python examples/agent/calculator/train.py --mode train
 ```
 
-计算器使用 [config.yaml](../../examples/agent/calculator/config.yaml)，默认模型为 Qwen/Qwen3.5-4B，执行两次更新。报告和 episode 日志保存在 output/calculator-agent/。使用 train-report.json 中的 checkpoint URI 进行独立评估：
+可运行的计算器 workflow 位于 [examples/agent/calculator](../../examples/agent/calculator)。完整训练步骤、配置选择和诊断方式见 [docs/agenrl/README_CN.md](../../docs/agenrl/README_CN.md)。
 
-```bash
-uv run python examples/agent/calculator/train.py --mode evaluate --checkpoint "trio://YOUR_RUN/weights/YOUR_CHECKPOINT"
-```
+## 包边界
 
-## 自定义智能体
+| 包目录 | 职责 |
+| --- | --- |
+| config.py | 限制、重试、渲染器、导出模式、评估和 workflow 组装 |
+| runtime/ | 对话渲染、采样、episode 执行和工具 |
+| rollout/ | 分组采集和精确 token 轨迹构造 |
+| training/ | Agent 训练循环、奖励组合和评估指标 |
+| diagnostics/ | episode 日志和 tokenizer 训练前检查 |
+| integrations/openai/ | OpenAI 兼容执行和 PyTRIO 轨迹桥接 |
 
-创建带有训练和评估数据的 PPOTrainer、工具执行器和 episode 评分器。在 async 函数内执行以下组装代码，其中 trainer、tools 和 scorer 由应用提供：
+奖励提交、分支、上下文压缩、策略年龄和分组过滤见 [agentrl_training_CN.md](../../docs/agenrl/agentrl_training_CN.md)。OpenAI session 所有权、回放、恢复和第三方转发见 [agentrl_openai_CN.md](../../docs/agenrl/agentrl_openai_CN.md)。
 
-```python
-from triotune.agentrl import AgentConfig, AgentTrainingLoop
-
-config = AgentConfig(
-    limits={"max_turns": 5},
-    retry={"max_attempts": 3, "retry_tools": True},
-    log_path="output/agentrl/episodes.jsonl",
-)
-snapshot = await trainer.create_sampling_snapshot(stop=config.stop)
-workflow = config.build_workflow(
-    tokenizer=snapshot.tokenizer,
-    tools=tools,
-    scorer=scorer,
-)
-state = await AgentTrainingLoop(trainer, workflow, config=config).train()
-```
-
-默认输入字段为 messages。工具可使用 FunctionToolExecutor；评分器返回 EpisodeScore，包含终局奖励、成功标记和可选的 token 对齐过程奖励。CompositeScorer、ToolCostScorer 和 TurnRewardScorer 用于组合结果、成本与过程信号。
-
-默认适配器使用 JSON 动作，例如 {"tool_calls":[{"name":"calculate","arguments":{"operation":"add","a":2,"b":3}}]} 和 {"final":"5"}。请在 system 消息中说明动作协议和工具。其他输入字段可通过 AgentConfig.prompt_key 设置，也可通过公开协议替换适配器。
-
-## 当前范围
-
-采样使用 temperature=1 和 top_p=1，以满足 PPO 的 log probability 契约。默认渲染器将上下文追加到原始采样 token，使用其他模型前需检查 tokenizer 兼容性。第三方 SDK 代理、分支轨迹、上下文压缩和采样训练重叠不在当前实现范围内。
+采样 temperature 和 top-p 固定为 1，以满足 PPO 的 log probability 契约。先使用同步采集和固定快照；完成 tokenizer 与 probe 检查后，再开启有界异步采集。
