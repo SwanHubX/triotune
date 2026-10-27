@@ -1,5 +1,6 @@
 """Reward shaping and advantage calculation for PPO-family algorithms."""
 
+import inspect
 import math
 from collections import defaultdict
 from collections.abc import Sequence
@@ -14,7 +15,12 @@ from .trajectory import PreparedBatch, Trajectory
 
 
 class RewardShaper(Protocol):
-    """Transform one logical trajectory outcome before normalization."""
+    """Shape outcome scalars and completion-aligned process rewards separately.
+
+    Outcome shaping precedes candidate-level reward normalization. Process
+    shaping precedes GAE and leaves direct advantages outside the return target.
+    An explicit ``PPOAlgorithmPlan.process_shaper`` overrides ``shape_process``.
+    """
 
     def shape(self, trajectory: Trajectory, reward: float) -> float: ...
 
@@ -24,7 +30,12 @@ class RewardShaper(Protocol):
 
 
 class RewardNormalizer(Protocol):
-    """Normalize candidate-level rewards with explicit group identities."""
+    """Normalize candidate-level rewards with optional population masks.
+
+    ``masks`` describes entries in ``rows``, not completion-token loss masks.
+    Implementations may additionally declare ``config`` to receive NormConfig;
+    a protocol-only implementation never receives that object as its mask.
+    """
 
     def normalize(
         self,
@@ -75,6 +86,20 @@ class _DefaultReturnEstimator:
         return compute_gae(rewards, values, mask, **kwargs)[1]
 
 
+def _call_shaper(method, trajectory, values):
+    """Select the legacy one-argument or public two-argument call before execution.
+
+    Only signature binding is allowed to fail over. A TypeError raised inside
+    the plugin must propagate unchanged; repeating a stateful plugin could both
+    hide its real error and submit the same shaping side effect twice.
+    """
+    try:
+        inspect.signature(method).bind(trajectory, values)
+    except TypeError:
+        return method(values)
+    return method(trajectory, values)
+
+
 @dataclass(slots=True)
 class PPOAlgorithmPlan:
     """Public dependency-injection plan for PPO reward and objective stages."""
@@ -92,20 +117,23 @@ class PPOAlgorithmPlan:
         if shaper is None:
             return reward
         method = getattr(shaper, "shape", shaper)
-        try:
-            return float(method(trajectory, reward))
-        except TypeError:
-            return float(method(reward))
+        return float(_call_shaper(method, trajectory, reward))
 
     def shape_process(self, trajectory: Trajectory, rewards):
         shaper = self.process_shaper
         if shaper is None:
-            return rewards
-        method = getattr(shaper, "shape", shaper)
-        try:
-            values = method(trajectory, rewards)
-        except TypeError:
-            values = method(rewards)
+            # A combined RewardShaper owns both stages unless a standalone
+            # process shaper was supplied. An outcome-only callable must not
+            # accidentally receive process vectors through its scalar method.
+            method = getattr(self.reward_shaper, "shape_process", None)
+            if method is None:
+                return rewards
+        else:
+            # Prefer the dedicated protocol method while retaining historical
+            # process callables and objects exposing only shape(). Do not chain
+            # this hook with the combined object: each signal is shaped once.
+            method = getattr(shaper, "shape_process", getattr(shaper, "shape", shaper))
+        values = _call_shaper(method, trajectory, rewards)
         values = list(values)
         if len(values) != len(rewards) or any(
             not math.isfinite(float(v)) for v in values
@@ -118,16 +146,28 @@ class PPOAlgorithmPlan:
         if normalizer is None:
             return normalize(rows, group_ids, config, masks)
         method = getattr(normalizer, "normalize", normalizer)
-        try:
-            return method(rows, group_ids, config, masks)
-        except TypeError:
-            try:
-                return method(rows, group_ids, config)
-            except TypeError:
-                try:
-                    return method(rows, group_ids, masks)
-                except TypeError:
-                    return method(rows, group_ids)
+        # Parameter names distinguish the public third argument (masks) from
+        # legacy hooks whose third argument is config. Binding first also keeps
+        # positional-only, keyword-only, partial, and two-argument hooks usable
+        # without executing a plugin repeatedly to guess its signature.
+        signature = inspect.signature(method)
+        bound = signature.bind_partial(rows, group_ids)
+        bound.apply_defaults()
+        for name, value in (("config", config), ("masks", masks)):
+            parameter = signature.parameters.get(name)
+            if parameter is not None and parameter.kind not in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                bound.arguments[name] = value
+        # **kwargs-only adapters receive the public mask argument. Config is
+        # supplied only when explicitly declared, so it cannot be mistaken for
+        # a population mask by a protocol adapter or a forwarding wrapper.
+        if "masks" not in signature.parameters:
+            for parameter in signature.parameters.values():
+                if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                    bound.arguments[parameter.name]["masks"] = masks
+        return method(*bound.args, **bound.kwargs)
 
     def row_weight(self, trajectory: Trajectory, mask: Sequence[bool]) -> float:
         policy = self.loss_weight_policy

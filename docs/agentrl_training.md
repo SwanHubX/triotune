@@ -126,6 +126,53 @@ outcome/process/direct result. A trajectory advantage has no turn position and
 is exposed as `direct[None] = (value,)`. The exporter consumes the same reduction
 with exact target positions to construct completion-aligned token advantages.
 
+## PPO reward plugin interfaces
+
+`PPOAlgorithmPlan` runs reward plugins locally before building PyTRIO datums.
+The public normalizer signature is `normalize(rows, group_ids, masks=None)`.
+These are candidate-level outcome rows, with one normalization observation per
+logical rollout even when it exports several fragments. During outcome
+preparation `masks` is `None`, meaning all outcome entries are valid; it is not
+the completion-token loss mask. A normalizer may explicitly declare `config`
+to receive `NormConfig`. Legacy two-argument and named-`config` hooks remain
+supported; named `config` and `masks` can be positional-only or keyword-only.
+Adapters accepting only `**kwargs` receive `masks`, without an implicit config.
+
+```python
+from triotune.trainer.ppo import PPOAlgorithmPlan, PPOConfig, Trajectory, prepare_advantages
+
+
+class Shaper:
+    def shape(self, trajectory, reward):
+        return reward
+
+    def shape_process(self, trajectory, rewards):
+        return [3.0 * reward for reward in rewards]
+
+
+class Normalizer:
+    def normalize(self, rows, group_ids, masks=None):
+        return [[2.0 * reward for reward in row] for row in rows]
+
+
+plan = PPOAlgorithmPlan(reward_shaper=Shaper(), normalizer=Normalizer())
+row = Trajectory([1], [2], [-1.0], 1.0, "group", token_rewards=[1.0])
+batch = prepare_advantages(
+    [row], PPOConfig(use_critic=False, reward_norm=None, adv_norm=None), plan
+)
+assert batch.returns == [[5.0]]  # Process reward 3 plus normalized outcome 2.
+```
+
+An explicit `process_shaper` overrides `reward_shaper.shape_process`; the two
+are not chained. Process shapers may expose `shape_process(trajectory, rewards)`
+or the legacy `shape(trajectory, rewards)`/callable forms. Legacy single-value
+shaping callables remain supported. Outcome-only shapers are not reused for
+process vectors. Process output must remain finite and completion-aligned;
+direct advantages remain separate from GAE and critic returns. Signature
+selection happens before invoking a hook, so an internal `TypeError` propagates
+without repeating the plugin. The same prepared numeric targets feed both
+custom and native PyTRIO PPO updates; plugin objects are not sent to the SDK.
+
 ## Branch trees
 
 `EpisodeBranch` declares a rollout-local branch suffix. Its
