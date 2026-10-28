@@ -11,7 +11,15 @@ from agent_test_support import AgentTrainingClient
 from recipes.calculator_agent import calculator_rows, calculator_workflow
 
 from triotune import PPOConfig, PPOTrainer
-from triotune.agentrl import AgentTrainingLoop, EpisodeCollectionError
+from triotune.agentrl import (
+    AgentBatchAdvantages,
+    AgentContractError,
+    AgentRolloutBatch,
+    AgentTrainingLoop,
+    EpisodeCollectionError,
+    GiGPOAdvantageProvider,
+    GiGPOConfig,
+)
 from triotune.trainer.ppo import prepare_advantages
 from triotune.trainer.ppo.datum import batch_datums
 from triotune.trainer.ppo.loss import make_loss_fn
@@ -57,6 +65,139 @@ class AgentTrainingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(-100 in datum.loss_fn_inputs["target_tokens"].data for datum in call[1])
         )
+
+    async def test_batch_advantage_provider_runs_once_per_complete_update(self):
+        trainer, client = self.trainer()
+
+        class StateAdvantageProvider:
+            def __init__(self):
+                self.batch_sizes = []
+
+            async def advantages(self, trajectories):
+                self.batch_sizes.append(len(trajectories))
+                return [
+                    [0.5 if active else 0.0 for active in trajectory.loss_mask]
+                    for trajectory in trajectories
+                ]
+
+        provider = StateAdvantageProvider()
+        loop = AgentTrainingLoop(
+            trainer,
+            calculator_workflow(),
+            batch_advantage_provider=provider,
+        )
+        with patch("triotune.agentrl.training.loop.tqdm"):
+            state = await loop.train()
+
+        self.assertEqual(state.global_step, 2)
+        self.assertEqual(provider.batch_sizes, [2, 2])
+        self.assertTrue(
+            all(
+                value == (0.5 if active else 0.0)
+                for trajectory in loop.last_train_batch.trajectories
+                for value, active in zip(
+                    trajectory.token_advantages, trajectory.loss_mask, strict=True
+                )
+            )
+        )
+        # The ordinary custom PPO submission succeeds without a new PyTRIO
+        # loss type; only its already-supported advantage input has changed.
+        self.assertTrue(any(call[0] == "custom" for call in client.calls))
+
+    async def test_gigpo_replacement_advantages_reach_existing_pytrio_loss(self):
+        trainer, client = self.trainer(reward_norm=None, adv_norm=None, kl_ctl=0)
+
+        class TurnAnchorObserver:
+            def observe(self, episode, interaction):
+                return {"turn": len(episode.turns), "task": episode.task_id}
+
+        workflow = calculator_workflow()
+        workflow.runner.anchor_observer = TurnAnchorObserver()
+        loop = AgentTrainingLoop(
+            trainer,
+            workflow,
+            batch_advantage_provider=GiGPOAdvantageProvider(
+                GiGPOConfig(discount=0.95)
+            ),
+        )
+        with patch("triotune.agentrl.training.loop.tqdm"):
+            state = await loop.train()
+
+        self.assertEqual(state.global_step, 2)
+        self.assertTrue(
+            all(
+                trajectory.token_advantage_mode == "replace"
+                for trajectory in loop.last_train_batch.trajectories
+            )
+        )
+        self.assertTrue(any(call[0] == "custom" for call in client.calls))
+
+    async def test_batch_advantages_add_to_existing_direct_signal(self):
+        trainer, _ = self.trainer()
+        policy = await trainer.create_sampling_snapshot()
+        workflow = calculator_workflow()
+        collected = await workflow.collect(calculator_rows()[:1], policy)
+        original = collected.trajectories[0]
+        original.token_advantages = [
+            0.25 if active else 0.0 for active in original.loss_mask
+        ]
+
+        class SyncProvider:
+            def advantages(self, trajectories):
+                return AgentBatchAdvantages(
+                    [
+                        [0.5 if active else 0.0 for active in trajectory.loss_mask]
+                        for trajectory in trajectories
+                    ],
+                    mode="replace",
+                )
+
+        loop = AgentTrainingLoop(
+            trainer, workflow, batch_advantage_provider=SyncProvider()
+        )
+        batch = AgentRolloutBatch(collected.episodes, [original])
+        await loop._add_batch_advantages(batch)
+        self.assertEqual(
+            batch.trajectories[0].token_advantages,
+            [0.75 if active else 0.0 for active in original.loss_mask],
+        )
+        self.assertIsNot(batch.trajectories[0], original)
+        self.assertEqual(batch.trajectories[0].token_advantage_mode, "replace")
+        self.assertEqual(
+            batch.trajectories[0].completion_tokens, original.completion_tokens
+        )
+        await trainer.close()
+
+    async def test_batch_advantage_provider_rejects_misaligned_context_signal(self):
+        trainer, _ = self.trainer()
+        policy = await trainer.create_sampling_snapshot()
+        workflow = calculator_workflow()
+        collected = await workflow.collect(calculator_rows()[:1], policy)
+        trajectory = collected.trajectories[0]
+
+        class InvalidProvider:
+            def __init__(self, values):
+                self.values = values
+
+            def advantages(self, trajectories):
+                return [self.values]
+
+        cases = (
+            [0.0],
+            [float("nan")] * len(trajectory.completion_tokens),
+            [1.0] * len(trajectory.completion_tokens),
+        )
+        for values in cases:
+            loop = AgentTrainingLoop(
+                trainer,
+                workflow,
+                batch_advantage_provider=InvalidProvider(values),
+            )
+            with self.assertRaises(AgentContractError):
+                await loop._add_batch_advantages(
+                    AgentRolloutBatch(collected.episodes, [trajectory])
+                )
+        await trainer.close()
 
     async def test_evaluation_only_never_updates_actor_or_critic(self):
         trainer, client = self.trainer()

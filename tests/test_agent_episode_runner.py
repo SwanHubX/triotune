@@ -16,6 +16,7 @@ from recipes.calculator_agent import (
 from triotune.agentrl import (
     EpisodeCollectionError,
     EpisodeLimits,
+    EpisodeScore,
     FunctionTool,
     FunctionToolExecutor,
     JsonlEpisodeLogger,
@@ -23,8 +24,8 @@ from triotune.agentrl import (
     SamplingSnapshot,
     ToolCall,
     ToolSystemError,
+    current_execution_context,
 )
-from triotune.agentrl import EpisodeScore
 
 
 def snapshot(*, output=None, failure=None):
@@ -36,6 +37,47 @@ def snapshot(*, output=None, failure=None):
 
 
 class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anchor_observations_are_captured_before_each_action(self):
+        policy, _ = snapshot()
+
+        class AnchorObserver:
+            def __init__(self):
+                self.state = {"turn": -1}
+                self.contexts = []
+
+            async def observe(self, episode, interaction):
+                context = current_execution_context()
+                self.contexts.append(context)
+                self.state["turn"] = len(episode.turns)
+                self.state["interaction_id"] = interaction.interaction_id
+                return self.state
+
+        observer = AnchorObserver()
+        workflow = calculator_workflow()
+        workflow.runner.anchor_observer = observer
+        batch = await workflow.collect(calculator_rows()[:1], policy)
+        episode = batch.episodes[0]
+        trajectory = batch.trajectories[0]
+
+        self.assertEqual(len(episode.interactions), 2)
+        self.assertEqual(
+            [anchor["turn"] for anchor in trajectory.anchor_observations], [0, 1]
+        )
+        self.assertEqual(
+            [anchor["interaction_id"] for anchor in trajectory.anchor_observations],
+            [interaction.interaction_id for interaction in episode.interactions],
+        )
+        self.assertEqual(
+            [context.interaction_id for context in observer.contexts],
+            [interaction.interaction_id for interaction in episode.interactions],
+        )
+        # Both callbacks returned the same mutable dictionary. Distinct recorded
+        # values prove that the runner froze each pre-action observation rather
+        # than retaining a reference later changed by the environment.
+        self.assertIsNot(
+            trajectory.anchor_observations[0], trajectory.anchor_observations[1]
+        )
+
     async def test_candidate_identity_is_available_during_scoring(self):
         policy, _ = snapshot()
         observed = []
@@ -128,6 +170,12 @@ class AgentEpisodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(records[0]["snapshot_id"], "snapshot-0")
             self.assertEqual(records[0]["turns"][0]["tool_results"][0]["content"], "5")
             self.assertNotIn("untrusted", records[0]["turns"][0]["generation"]["text"])
+            self.assertNotIn(
+                "anchor_observation", records[0]["interactions"][0]
+            )
+            self.assertNotIn(
+                "anchor_observations", records[0]["export_metadata"]
+            )
 
     async def test_invalid_tool_name_is_observation_and_model_can_recover(self):
         result = await calculator_tools().execute(ToolCall("1", "missing", {}))

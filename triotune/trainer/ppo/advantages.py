@@ -331,8 +331,12 @@ def prepare_advantages(
             raise ValueError(
                 "Critic-based PPO requires T+1 value predictions per trajectory."
             )
-        if config.kl_ctl and trajectory.reference_logprobs is None:
-            raise ValueError("kl_ctl > 0 requires fixed-reference completion logprobs.")
+        if (
+            config.kl_ctl or config.reference_kl_coef
+        ) and trajectory.reference_logprobs is None:
+            raise ValueError(
+                "Reference KL requires fixed-reference completion logprobs."
+            )
         # Keep task/process rewards separate from policy-reference KL.  Token
         # GAE consumes both signals at active tokens. Task rewards enter the turn
         # recurrence, while KL remains a token-local actor penalty and never
@@ -407,10 +411,15 @@ def prepare_advantages(
                 turn_ids=trajectory.turn_ids,
             )
         if trajectory.token_advantages is not None:
-            adv = [
-                value + direct
-                for value, direct in zip(adv, trajectory.token_advantages, strict=True)
-            ]
+            if trajectory.token_advantage_mode == "replace":
+                adv = list(trajectory.token_advantages)
+            else:
+                adv = [
+                    value + direct
+                    for value, direct in zip(
+                        adv, trajectory.token_advantages, strict=True
+                    )
+                ]
         if config.gae_timestep_unit == "turn":
             adv = [value + kl for value, kl in zip(adv, kl_rewards, strict=True)]
         advantages.append(adv)

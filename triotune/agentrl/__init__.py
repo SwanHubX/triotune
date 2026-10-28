@@ -55,6 +55,7 @@ from .integrations import openai as _openai_integration
 _sys.modules.setdefault(__name__ + ".sdk", _integrations)
 _sys.modules.setdefault(__name__ + ".sdk.openai", _openai_integration)
 from .training.evaluation import evaluation_metrics, paired_task_metrics
+from .training.gigpo import GiGPOAdvantageProvider, GiGPOConfig
 from .training.loop import AgentTrainingLoop
 from .training.rewards import (
     CompositeScorer,
@@ -71,10 +72,13 @@ from .types import (
     ActionParseError,
     ActionParser,
     AgentAction,
+    AgentBatchAdvantageProvider,
+    AgentBatchAdvantages,
     AgentContractError,
     AgentEvent,
     AgentSampler,
     AgentTurn,
+    AnchorObservationProvider,
     ContextCompaction,
     ConversationCompactor,
     ConversationRenderer,
@@ -118,6 +122,8 @@ __all__ = [
     "ActionParser",
     "Agent",
     "AgentAction",
+    "AgentBatchAdvantageProvider",
+    "AgentBatchAdvantages",
     "AgentConfig",
     "AgentContractError",
     "AgentEvaluationConfig",
@@ -127,6 +133,7 @@ __all__ = [
     "AgentSampler",
     "AgentTrainingLoop",
     "AgentTurn",
+    "AnchorObservationProvider",
     "OpenAIEpisodeExecutor",
     "ChatTemplateRenderer",
     "CompactionPlan",
@@ -154,6 +161,8 @@ __all__ = [
     "FunctionToolExecutor",
     "Generation",
     "GenerationEvent",
+    "GiGPOAdvantageProvider",
+    "GiGPOConfig",
     "Interaction",
     "InteractionScorer",
     "JsonActionParser",

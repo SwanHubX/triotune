@@ -366,6 +366,13 @@ class TrainingCheckpoint:
         reporting = values.pop("reporting")
         values["logging_step"] = reporting["logging_step"]
         values["training"].pop("max_steps")
+        # Zero disables the opt-in objective and is semantically identical to
+        # checkpoints written before this field existed. Omitting the default
+        # keeps those manifests resumable while enabled runs still record the
+        # coefficient as part of their exact optimization identity.
+        actor = values.get("actor")
+        if isinstance(actor, dict) and not actor.get("reference_kl_coef", 0.0):
+            actor.pop("reference_kl_coef", None)
         self.identity = {
             "config": values,
             "clients": identity,

@@ -263,6 +263,93 @@ Fragment deduplication or branch weights still control shared actions.
 RewardLedger.aggregate returns outcome, process, and direct; a trajectory
 advantage appears as direct[None] = (value,).
 
+### Add a batch-level state advantage
+
+Algorithms such as GiGPO need to compare steps across complete trajectories,
+which a per-trajectory advantage estimator cannot do. Keep that algorithm in an
+AgentRL plugin: capture a trusted environment observation before every action,
+then return only the additional token-aligned advantage for the collected batch.
+
+```python
+from triotune import PPOConfig
+from triotune.agentrl import (
+    AgentTrainingLoop,
+    GiGPOAdvantageProvider,
+    GiGPOConfig,
+    current_execution_context,
+)
+
+
+class EnvironmentAnchors:
+    async def observe(self, episode, interaction):
+        context = current_execution_context()
+        return environment.raw_observation(context.rollout_id)
+
+
+workflow = config.build_workflow(
+    tokenizer=tokenizer,
+    tools=tools,
+    scorer=scorer,
+    anchor_observer=EnvironmentAnchors(),
+)
+loop = AgentTrainingLoop(
+    trainer,
+    workflow,
+    config=config,
+    batch_advantage_provider=GiGPOAdvantageProvider(
+        GiGPOConfig(
+            step_advantage_weight=1.0,
+            discount=0.95,
+            mode="mean_norm",
+            episode_statistic_weighting="trajectory",
+        )
+    ),
+)
+```
+
+Build the trainer from the GRPO preset, but disable its separate reward and
+final advantage normalization because the GiGPO provider computes the complete
+joint advantage:
+
+```python
+ppo = PPOConfig.for_algorithm(
+    "grpo",
+    reward_norm=None,
+    adv_norm=None,
+    use_critic=False,
+    kl_ctl=0,
+    reference_kl_coef=0.01,
+)
+```
+
+The anchor observer runs after the trusted interaction context is installed and
+before policy sampling. Returned mutable observations are deep-copied into
+optional episode export metadata keyed by interaction ID, then exported as
+Trajectory.anchor_observations aligned with interaction_ids. Episodes that
+do not install an observer retain the historical Interaction and JSONL schema.
+Anchors are provenance only: prompts, PyTRIO datums, and loss inputs never
+contain them. When JSONL episode logging is enabled, the provider must return a
+JSON-serializable observation (or an application-owned serialized view of a
+larger state).
+
+The batch provider runs once after a complete update batch is accepted and
+immediately before PPOTrainer.step(). It joins physical fragments by logical
+trajectory, aggregates process rewards by active turn, adds the outcome once to
+the final turn, calculates discounted return-to-go, and forms
+A^E + omega * A^S. Exact matching accepts structural observations; optional
+similarity matching supports text anchors. State singleton groups contribute
+zero. episode_statistic_weighting="trajectory" counts each logical candidate
+once, while "step" reproduces verl-agent's step-row episode statistics.
+
+The provider returns a generic replacement-advantage contract. Existing direct
+advantages are still added, configured adv_norm would still run afterward,
+and the clipped loss and PyTRIO datum path remain unchanged. The provider
+rejects critics, KL-as-reward, late reward transforms, or duplicate
+normalization settings that would otherwise be silently bypassed. An
+independent reference KL objective may be enabled with reference_kl_coef; it
+is evaluated in the custom actor loss and is not part of the frozen GiGPO
+advantage provider.
+
 ### Read reward fields in episode logs
 
 | Logged field | Meaning before PPO processing |

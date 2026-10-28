@@ -212,12 +212,61 @@ class AdvantageTests(unittest.TestCase):
             {"rejection_upper": 2},
             {"c_clip": 1},
             {"gae_timestep_unit": "episode"},
+            {"reference_kl_coef": -1},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 raw_config(**kwargs)
+        with self.assertRaisesRegex(ValueError, "either KL-as-reward"):
+            raw_config(kl_ctl=0.1, reference_kl_coef=0.1)
+        with self.assertRaisesRegex(ValueError, "loss_backend=custom"):
+            raw_config(loss_backend="native", reference_kl_coef=0.1)
 
 
 class PolicyLossTests(unittest.TestCase):
+    def test_independent_low_variance_reference_kl_loss_and_gradients(self):
+        t = trajectory(reference_logprobs=[-2.0, -2.0])
+        coefficient = 0.5
+        loss, gradients, metrics = objective(
+            raw_config(reference_kl_coef=coefficient),
+            [t],
+            [[-1.0, -3.0]],
+            [[0.0, 0.0]],
+        )
+        k3 = [math.exp(-1), math.exp(1) - 2]
+        expected_kl = sum(k3) / 2
+        self.assertAlmostEqual(loss, coefficient * expected_kl)
+        self.assertAlmostEqual(metrics["policy/reference_kl"], expected_kl)
+        self.assertAlmostEqual(
+            metrics["policy/reference_kl_loss"], coefficient * expected_kl
+        )
+        np.testing.assert_allclose(
+            gradients[0],
+            [
+                0.0,
+                coefficient / 2 * (1 - math.exp(-1)),
+                coefficient / 2 * (1 - math.exp(1)),
+            ],
+        )
+
+    def test_reference_kl_uses_loss_mask_and_action_weights(self):
+        t = trajectory(
+            n=3,
+            reference_logprobs=[-2.0] * 3,
+            loss_mask=[True, False, True],
+            action_weights=[2.0, 0.0, 1.0],
+        )
+        _, gradients, metrics = objective(
+            raw_config(reference_kl_coef=1.0),
+            [t],
+            [[-1.0, 100.0, -1.0]],
+            [[0.0, 0.0, 0.0]],
+        )
+        self.assertAlmostEqual(metrics["policy/reference_kl"], math.exp(-1))
+        self.assertEqual(gradients[0][2], 0.0)
+        self.assertAlmostEqual(
+            gradients[0][1] / gradients[0][3], 2.0
+        )
+
     def test_policy_gradients_match_finite_difference(self):
         t = trajectory()
         values = [-0.9, -1.1]
@@ -276,6 +325,8 @@ class PolicyLossTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["policy/clip_fraction_low"], 1 / 3)
         self.assertAlmostEqual(metrics["policy/clip_fraction_high"], 1 / 3)
         self.assertGreater(metrics["policy/update_approx_kl"], 0)
+        self.assertNotIn("policy/reference_kl", metrics)
+        self.assertNotIn("policy/reference_kl_loss", metrics)
 
     def test_gspo_uses_geometric_ratio_and_mean_advantage(self):
         t = trajectory()
@@ -493,6 +544,27 @@ class TrainingClient:
 
 
 class AsyncTrainerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_independent_reference_kl_triggers_fixed_reference_scoring(self):
+        client = TrainingClient()
+        trainer = PPOTrainer(
+            "fake",
+            raw_config(reference_kl_coef=0.1),
+            training_client=client,
+            reference_client=Sampler([]),
+        )
+        value = trajectory()
+        metrics = await trainer.step([value])
+        self.assertEqual(value.reference_logprobs, [-2.0, -2.0])
+        self.assertAlmostEqual(
+            metrics["policy/reference_kl"], math.exp(-1), places=6
+        )
+        self.assertAlmostEqual(
+            metrics["policy/reference_kl_loss"], 0.1 * math.exp(-1), places=6
+        )
+        self.assertEqual(metrics["policy/reference_kl_sampled"], 1.0)
+        self.assertNotIn("reward/kl_penalty_mean", metrics)
+        await trainer.close()
+
     async def test_reporting_uses_configured_logging_interval(self):
         trainer = PPOTrainer(
             "fake",

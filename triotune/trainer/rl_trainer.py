@@ -233,9 +233,9 @@ class PPOTrainer:
         self._checkpoint.restore(self)
 
     async def _references(self, trajectories):
-        """Populate missing reference logprobs when KL control is enabled."""
+        """Populate fixed-reference scores for reward or actor-loss KL."""
 
-        if not self.args.kl_ctl or all(
+        if not (self.args.kl_ctl or self.args.reference_kl_coef) or all(
             t.reference_logprobs is not None for t in trajectories
         ):
             return
@@ -481,19 +481,16 @@ class PPOTrainer:
                 else math.expm1(min(700.0, -difference)) + difference
                 for difference in reference_differences
             ]
-            metrics.update(
-                {
-                    "policy/reference_kl_sampled": sampled_kl,
-                    "reward/kl_penalty_mean": float(
-                        np.mean(
-                            [
-                                -self.args.kl_ctl * max(-10.0, min(10.0, value))
-                                for value in estimated_kl
-                            ]
-                        )
-                    ),
-                }
-            )
+            metrics["policy/reference_kl_sampled"] = sampled_kl
+            if self.args.kl_ctl:
+                metrics["reward/kl_penalty_mean"] = float(
+                    np.mean(
+                        [
+                            -self.args.kl_ctl * max(-10.0, min(10.0, value))
+                            for value in estimated_kl
+                        ]
+                    )
+                )
         if overlong_penalties:
             metrics.update(
                 {

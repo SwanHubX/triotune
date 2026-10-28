@@ -12,6 +12,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Real
+from typing import Any
 
 
 def validate_policy_versions(
@@ -121,6 +122,17 @@ class Trajectory:
     # context_segment is the zero-based causal segment within the logical path.
     reward_group_id: str | None = None
     context_segment: int = 0
+    # AgentRL records one trusted pre-action environment observation for each
+    # interaction. PPO treats these values as opaque provenance: they are
+    # available to an AgentRL batch-level advantage provider but never enter a
+    # PyTRIO datum, loss input, or remote request. The empty tuple preserves
+    # compatibility for ordinary text rollouts and legacy custom producers.
+    anchor_observations: tuple[Any, ...] = ()
+    # Direct advantages normally augment reward/GAE-derived values. Batch-level
+    # algorithms may instead provide the complete policy advantage while still
+    # leaving rewards and critic returns untouched. Appending this switch keeps
+    # every established positional constructor field unchanged.
+    token_advantage_mode: str = "add"
 
     @property
     def logical_sequence_id(self) -> tuple[str, str | None] | tuple[str, int]:
@@ -260,6 +272,14 @@ class Trajectory:
             not isinstance(value, str) or not value for value in self.interaction_ids
         ):
             raise ValueError("interaction_ids must contain unique nonempty strings.")
+        if self.anchor_observations and len(self.anchor_observations) != len(
+            self.interaction_ids
+        ):
+            raise ValueError(
+                "anchor_observations must align with interaction_ids when provided."
+            )
+        if self.token_advantage_mode not in {"add", "replace"}:
+            raise ValueError("token_advantage_mode must be add or replace.")
         if self.action_keys is not None:
             if len(self.action_keys) != n:
                 raise ValueError("action_keys must align with completion tokens.")

@@ -10,9 +10,12 @@ weights. It adds no new policy-loss or reward mathematics.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
+import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from numbers import Real
 from typing import TYPE_CHECKING, Any
 
 from tqdm import tqdm
@@ -23,7 +26,11 @@ from ...utils.dataloader import iter_batches, num_batches
 from ..config import AgentConfig
 from ..rollout.workflow import AgentRolloutBatch, AgentRolloutWorkflow
 from ..runtime.sampling import SamplingSnapshot
-from ..types import AgentContractError
+from ..types import (
+    AgentBatchAdvantageProvider,
+    AgentBatchAdvantages,
+    AgentContractError,
+)
 from .evaluation import evaluation_metrics, paired_task_metrics, paired_task_summary
 
 
@@ -70,6 +77,7 @@ class AgentTrainingLoop:
         *,
         snapshot_factory: Callable[[], Awaitable[SamplingSnapshot]] | None = None,
         config: AgentConfig | None = None,
+        batch_advantage_provider: AgentBatchAdvantageProvider | None = None,
     ):
         """Bind the trainer, execution workflow, and optional snapshot provider.
 
@@ -81,6 +89,19 @@ class AgentTrainingLoop:
         self.trainer, self.workflow = trainer, workflow
         self.config = config or AgentConfig()
         self.snapshot_factory = snapshot_factory or self._snapshot
+        if batch_advantage_provider is not None and not callable(
+            getattr(batch_advantage_provider, "advantages", None)
+        ):
+            raise TypeError("batch_advantage_provider must implement advantages().")
+        validate_trainer = getattr(
+            batch_advantage_provider, "validate_trainer", None
+        )
+        if callable(validate_trainer):
+            # Algorithm-specific providers can reject trainer settings that
+            # would otherwise be silently ignored by a replacement advantage.
+            # Validation is synchronous and side-effect free at construction.
+            validate_trainer(trainer)
+        self.batch_advantage_provider = batch_advantage_provider
         self._last_eval_step: int | None = None
         self._seed_offset = 0
         self.last_eval_batch: AgentRolloutBatch | None = None
@@ -94,6 +115,23 @@ class AgentTrainingLoop:
             identity = self.config.to_dict()
             identity.pop("log_path", None)
             identity["executor"] = f"{type(workflow.runner).__module__}.{type(workflow.runner).__qualname__}"
+            provider_identity = getattr(
+                batch_advantage_provider, "checkpoint_identity", None
+            )
+            if batch_advantage_provider is not None:
+                identity["batch_advantage_provider"] = {
+                    "type": f"{type(batch_advantage_provider).__module__}."
+                    f"{type(batch_advantage_provider).__qualname__}",
+                    "settings": (
+                        provider_identity() if callable(provider_identity) else None
+                    ),
+                }
+            anchor_observer = getattr(workflow.runner, "anchor_observer", None)
+            if anchor_observer is not None:
+                identity["anchor_observer"] = (
+                    f"{type(anchor_observer).__module__}."
+                    f"{type(anchor_observer).__qualname__}"
+                )
             identity["limits"] = asdict(workflow.runner.limits)
             trainer._checkpoint.bind_loop("agent", identity=identity, owner=self)
 
@@ -278,6 +316,8 @@ class AgentTrainingLoop:
         """Consume one completed batch and record its exact sampling provenance."""
         trainer = self.trainer
         self.last_train_snapshot = snapshot
+        if self.batch_advantage_provider is not None:
+            await self._add_batch_advantages(batch)
         previous_optimizer_steps = trainer.state.optimizer_steps
         metrics = await trainer.step(batch.trajectories, max_staleness=max_staleness)
         self.last_train_batch = batch
@@ -313,6 +353,92 @@ class AgentTrainingLoop:
         ):
             await self.evaluate()
         trainer._checkpoint.publish(trainer)
+
+    async def _add_batch_advantages(self, batch: AgentRolloutBatch) -> None:
+        """Validate and attach one provider's batch-level advantages.
+
+        AgentRL changes only ``token_advantages`` in the replacement records;
+        providers must treat their inputs as read-only. Running this hook
+        immediately before ``trainer.step`` gives a provider the complete
+        accepted update batch and executes it exactly once even when the actor
+        later performs multiple minibatches or epochs. The PyTRIO boundary is
+        therefore identical to ordinary PPO/GRPO.
+        """
+
+        provider = self.batch_advantage_provider
+        if provider is None:
+            return
+        rows = provider.advantages(tuple(batch.trajectories))
+        if inspect.isawaitable(rows):
+            rows = await rows
+        mode = "add"
+        if isinstance(rows, AgentBatchAdvantages):
+            mode, rows = rows.mode, rows.values
+        if isinstance(rows, (str, bytes)):
+            raise AgentContractError(
+                "Batch advantages must contain one numeric row per trajectory."
+            )
+        try:
+            rows = list(rows)
+        except TypeError as exc:
+            raise AgentContractError(
+                "Batch advantages must be an iterable of numeric rows."
+            ) from exc
+        if len(rows) != len(batch.trajectories):
+            raise AgentContractError(
+                "Batch advantage rows must align with accepted trajectories."
+            )
+
+        prepared = []
+        for trajectory, values in zip(batch.trajectories, rows, strict=True):
+            if isinstance(values, (str, bytes)):
+                raise AgentContractError(
+                    "Each batch advantage row must be a numeric sequence."
+                )
+            try:
+                values = list(values)
+            except TypeError as exc:
+                raise AgentContractError(
+                    "Each batch advantage row must be an iterable."
+                ) from exc
+            if len(values) != len(trajectory.completion_tokens):
+                raise AgentContractError(
+                    "Batch advantages must align with completion tokens."
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                for value in values
+            ):
+                raise AgentContractError(
+                    "Batch advantages must contain only finite numeric values."
+                )
+            if any(
+                not active and float(value) != 0.0
+                for value, active in zip(values, trajectory.loss_mask, strict=True)
+            ):
+                raise AgentContractError(
+                    "Batch advantages must be zero at inactive context tokens."
+                )
+            existing = trajectory.token_advantages or [0.0] * len(values)
+            combined = [
+                float(base) + float(extra)
+                for base, extra in zip(existing, values, strict=True)
+            ]
+            prepared.append(
+                replace(
+                    trajectory,
+                    token_advantages=combined,
+                    token_advantage_mode=(
+                        "replace"
+                        if mode == "replace"
+                        or trajectory.token_advantage_mode == "replace"
+                        else "add"
+                    ),
+                )
+            )
+        batch.trajectories = prepared
 
     async def _train_overlapped(self, rows, progress):
         """Pipeline fixed-snapshot collection with one serialized PPO update.

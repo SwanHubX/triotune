@@ -517,12 +517,26 @@ Reduce 决定谁在 batch 中拥有同等权重：
 
 ### 固定参考模型 KL
 
-actor.kl_ctl 默认为 0，此时不会请求 reference 评分。设为正数后，trainer 使用
-reference.name；未配置 reference 时使用 actor 的未修改基座模型。kl_estimator 支持
-k1、k2、k3。
+actor.kl_ctl 和 actor.reference_kl_coef 默认都为 0。两者均为零时不会请求 reference
+评分；任一系数启用后，trainer 使用 reference.name，未配置 reference 时使用 actor
+的未修改基座模型。kl_estimator 的 k1、k2、k3 用于 KL-as-reward。
 
 token GAE 会把 KL 惩罚加入 token 奖励后再递推。turn GAE 则只用任务奖励计算 critic
 target，KL 作为 token 局部项加回 actor advantage，避免将细粒度 KL 累加成 turn return。
+
+reference_kl_coef 启用独立的低方差 K3 actor objective：
+
+$$
+d_t = \log \pi_\theta(a_t|s_t)-\log \pi_{\mathrm{ref}}(a_t|s_t),
+\qquad
+K_3(d_t)=e^{-d_t}+d_t-1.
+$$
+
+custom loss 会在每个 minibatch 将 reference_kl_coef * weighted_mean(K3) 直接加到策略
+目标。均值使用 loss_mask 和有效 action weight，不会修改奖励、冻结的 advantage 或 critic
+return。该路径要求 loss_backend: custom，且不能与 kl_ctl 同时启用；PyTRIO 的自定义
+logprob 梯度桥已经足够，不需要完整词表 logits 或服务端 loss 改动。指标记录为
+policy/reference_kl 和 policy/reference_kl_loss。
 
 ## 训练规模与执行边界
 

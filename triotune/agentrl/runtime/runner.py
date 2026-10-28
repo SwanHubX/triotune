@@ -31,6 +31,7 @@ from ..types import (
     AgentContractError,
     AgentEvent,
     AgentTurn,
+    AnchorObservationProvider,
     ContextCompaction,
     ConversationCompactor,
     ConversationRenderer,
@@ -267,6 +268,7 @@ class EpisodeRunner:
         reward_ledger: RewardLedger | None = None,
         resource_owner: str = "runner",
         context_compactor: ConversationCompactor | None = None,
+        anchor_observer: AnchorObservationProvider | None = None,
     ):
         """Compose execution adapters and optional model-specific serialization.
 
@@ -288,6 +290,11 @@ class EpisodeRunner:
         self.failure_classifier = failure_classifier
         self.observations, self.renderer = observations, renderer
         self.context_compactor = context_compactor
+        if anchor_observer is not None and not callable(
+            getattr(anchor_observer, "observe", None)
+        ):
+            raise TypeError("anchor_observer must implement observe().")
+        self.anchor_observer = anchor_observer
         self.limits, self.prompt_key = limits or EpisodeLimits(), prompt_key
         self.trajectory_builder = trajectory_builder or EpisodeTrajectoryBuilder()
         self.retry = retry or RetryPolicy()
@@ -761,6 +768,23 @@ class EpisodeRunner:
             context_token = _execution_context.set(context)
             started = time.perf_counter()
             try:
+                if self.anchor_observer is not None:
+                    # Capture before sampling. Once tools execute, a stateful
+                    # environment may have transitioned and would describe the
+                    # next decision rather than the state that produced this
+                    # action. The active ExecutionContext also prevents an
+                    # environment from relying on model-controlled identity.
+                    anchor = self.anchor_observer.observe(episode, interaction)
+                    if inspect.isawaitable(anchor):
+                        anchor = await anchor
+                    # Store optional algorithm metadata outside Interaction so
+                    # ordinary episodes keep their established dataclass and
+                    # JSONL schema. The trusted interaction ID provides stable
+                    # alignment during concat, individual, compacted, or branch
+                    # trajectory export.
+                    episode.export_metadata.setdefault(
+                        "anchor_observations", {}
+                    )[interaction.interaction_id] = copy.deepcopy(anchor)
                 await self._execute_turn(
                     episode,
                     interaction,

@@ -227,6 +227,66 @@ trajectory advantage 会作用于每个有效的原始模型输出 token。工�
 
 RewardLedger.aggregate 返回 outcome、process 和 direct；trajectory advantage 表示为 direct[None] = (value,)。
 
+### 添加批次级状态 advantage
+
+GiGPO 一类算法需要在完整轨迹之间比较步骤，逐轨迹 advantage estimator 无法完成这项工作。算法本身应保留在 AgentRL 插件中：每次动作前采集可信的原始环境 observation，并针对完整采集批次只返回额外的 token 对齐 advantage。
+
+```python
+from triotune import PPOConfig
+from triotune.agentrl import (
+    AgentTrainingLoop,
+    GiGPOAdvantageProvider,
+    GiGPOConfig,
+    current_execution_context,
+)
+
+
+class EnvironmentAnchors:
+    async def observe(self, episode, interaction):
+        context = current_execution_context()
+        return environment.raw_observation(context.rollout_id)
+
+
+workflow = config.build_workflow(
+    tokenizer=tokenizer,
+    tools=tools,
+    scorer=scorer,
+    anchor_observer=EnvironmentAnchors(),
+)
+loop = AgentTrainingLoop(
+    trainer,
+    workflow,
+    config=config,
+    batch_advantage_provider=GiGPOAdvantageProvider(
+        GiGPOConfig(
+            step_advantage_weight=1.0,
+            discount=0.95,
+            mode="mean_norm",
+            episode_statistic_weighting="trajectory",
+        )
+    ),
+)
+```
+
+trainer 仍以 GRPO preset 构造，但需要关闭独立的 reward 和最终 advantage 归一化，因为 GiGPO provider 会生成完整的联合 advantage：
+
+```python
+ppo = PPOConfig.for_algorithm(
+    "grpo",
+    reward_norm=None,
+    adv_norm=None,
+    use_critic=False,
+    kl_ctl=0,
+    reference_kl_coef=0.01,
+)
+```
+
+anchor observer 会在可信 interaction context 安装之后、策略采样之前运行。返回的可变 observation 会被深拷贝到以 interaction ID 为键的可选 episode export metadata，随后作为与 interaction_ids 对齐的 Trajectory.anchor_observations 导出。未安装 observer 的普通 episode 保持原有 Interaction 和 JSONL schema。anchor 只属于来源信息，不会进入 prompt、PyTRIO datum 或 loss input。启用 JSONL episode 日志时，provider 必须返回可 JSON 序列化的 observation（或由应用自行序列化的大型状态视图）。
+
+batch provider 在完整 update batch 被接受后、调用 PPOTrainer.step() 前执行一次。它会按逻辑 trajectory 拼接物理片段，按有效 turn 聚合过程奖励，将 outcome 只添加到最后一个 turn，计算 discounted return-to-go，并形成 A^E + omega * A^S。精确匹配支持结构化 observation；可选的相似度匹配仅支持文本 anchor。状态 singleton group 的微观优势为零。episode_statistic_weighting="trajectory" 让每条逻辑候选只计一次，"step" 则复现 verl-agent 的 step-row episode 统计。
+
+provider 返回通用的 replacement-advantage 契约。已有 direct advantage 仍会相加，配置的 adv_norm 仍会在之后执行，clipped loss 与 PyTRIO datum 路径不变。provider 会拒绝 critic、KL-as-reward、后置奖励变换或重复归一化等会被静默绕过的配置。独立 reference KL objective 可通过 reference_kl_coef 启用；它在 custom actor loss 中计算，不属于冻结的 GiGPO advantage provider。
+
 ### 读取 episode 日志中的奖励字段
 
 | 日志字段 | PPO 处理前的含义 |

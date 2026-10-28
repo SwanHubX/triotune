@@ -77,6 +77,7 @@ def make_loss_fn(
                     (advantages_for_rollout * weights_for_rollout).sum() / denom,
                 )
         sums, counts, deltas, ratios, clipped, rejected = [], [], [], [], [], []
+        reference_kl_sums, reference_kl_counts = [], []
         row_weights = batch.loss_weights or [1.0] * len(batch.trajectories)
         if len(row_weights) != len(batch.trajectories):
             raise ValueError("loss_weights must align with trajectories.")
@@ -116,6 +117,23 @@ def make_loss_fn(
                 continue
             current, previous = lp[valid], lp.new_tensor(prox)[valid]
             advantage = lp.new_tensor(adv)[valid]
+            if config.reference_kl_coef:
+                if t.reference_logprobs is None:
+                    raise ValueError(
+                        "Independent reference KL requires fixed reference logprobs."
+                    )
+                reference = lp.new_tensor(t.reference_logprobs)[valid]
+                # K3 is a nonnegative, low-variance sampled KL estimator. The
+                # current logprob remains attached to autograd, while reference
+                # scores are frozen constants produced before actor updates.
+                log_ratio = current - reference
+                reference_kl = (-log_ratio).exp() + log_ratio - 1
+                if not torch.isfinite(reference_kl).all():
+                    raise FloatingPointError(
+                        "Independent reference KL is nonfinite; check policy drift."
+                    )
+                reference_kl_sums.append((reference_kl * token_weight).sum())
+                reference_kl_counts.append(n)
             keep = torch.ones_like(current, dtype=torch.bool)
             correction = torch.ones_like(current)
             if config.rejection_lower is not None or config.rejection_upper is not None:
@@ -227,6 +245,15 @@ def make_loss_fn(
             objective = sum(sums) / (
                 len(rollout_sums) * config.loss_aggregation_divisor
             )
+        reference_kl = None
+        if config.reference_kl_coef:
+            # Reference KL uses its own token/action-weighted reduction, like
+            # the reference actor implementation. It remains independent of
+            # PPO sequence/prompt reduction and never changes frozen advantages.
+            reference_kl = sum(reference_kl_sums) / max(
+                sum(reference_kl_counts), 1e-12
+            )
+            objective = objective + config.reference_kl_coef * reference_kl
         if not torch.isfinite(objective):
             raise FloatingPointError(
                 "Policy loss is nonfinite; check logprob ratios and rewards."
@@ -252,6 +279,15 @@ def make_loss_fn(
             "policy/rejected_fraction": torch.cat(rejected).float().mean().item(),
             "train/action_tokens": float(sum(counts)),
         }
+        if reference_kl is not None:
+            metrics.update(
+                {
+                    "policy/reference_kl": reference_kl.detach().item(),
+                    "policy/reference_kl_loss": (
+                        config.reference_kl_coef * reference_kl
+                    ).detach().item(),
+                }
+            )
         if diagnostics is not None:
             diagnostics.append(
                 {
