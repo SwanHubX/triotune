@@ -1,0 +1,15 @@
+# 仅安装原始 WebShop 文本模拟器所需依赖，不安装其训练脚本依赖。
+# 保持 TrioTune 的项目级依赖和锁文件不变。
+# 旧 WebShop 的 Gym API 直接调用，不使用 Gym 的 step/reset 检查 wrapper。
+# Pyserini 0.22.1 需要 Java 11；spaCy 模型另按 README 下载。
+beautifulsoup4>=4.12,<5
+cleantext==1.1.4
+Flask>=2.2,<4
+faiss-cpu>=1.8,<2
+gym==0.26.2
+pyserini==0.22.1
+rank-bm25==0.2.2
+rich>=12,<15
+selenium>=4.2,<5
+spacy>=3.8,<4
+thefuzz>=0.19,<1

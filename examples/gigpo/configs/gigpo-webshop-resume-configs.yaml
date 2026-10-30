@@ -1,0 +1,102 @@
+# 从旧 GiGPO step-50 checkpoint 兼容续训到总 step 100。
+output_dir: ../../../output/webshop-gigpo-qwen3.5-4b-resume-step50-to100-seed42
+
+algorithm: gigpo
+
+data:
+  repo_id: YWZBrandon/webshop-data
+  revision: ce990fff5aee388db2706f07820c578ab68e0453
+  local_files_only: true
+  split_protocol: official
+  seed: 42
+  train_epochs: 1
+  eval_limit: null
+
+environment:
+  source_dir: ../../../.cache/webshop
+  seed: 42
+
+trainer:
+  model:
+    name: Qwen/Qwen3.5-4B
+    lora_rank: 8
+  training:
+    batch_size: 8
+    # max_steps 是总目标：从 step 50 再更新 50 次，到 step 100。
+    max_steps: 100
+    seed: 42
+  rollout:
+    num_generations: 8
+    max_tokens: 4096
+    temperature: 1.0
+    top_p: 1.0
+  actor:
+    reward_norm: null
+    adv_norm: null
+    gae_timestep_unit: turn
+    kl_ctl: 0.0
+    reference_kl_coef: 0.01
+    loss_backend: custom
+    dynamic_sampling: false
+    ppo_n_minibatches: 1
+    update_epochs: 1
+  optimizer:
+    learning_rate: 0.000001
+  evaluation:
+    before_train: false
+    after_train: true
+    steps: 0
+    batch_size: 4
+    max_batches: null
+  checkpoint:
+    save_every: 25
+    state_dir: ../../../output/webshop-gigpo-qwen3.5-4b-resume-step50-to100-seed42/states
+  reporting:
+    log_dir: ../../../output/webshop-gigpo-qwen3.5-4b-resume-step50-to100-seed42/metrics
+    report_to: swanlab
+    workspace: pytrio
+    project: gigpo-webshop
+    tags: [gigpo, resume, step50, step100, batch8, generate8]
+    run_name: gigpo-qwen3.5-4b-resume-step50-to100-b8-g8-seed42
+
+agent:
+  parser: strict_json
+  renderer: token_append
+  advertise_tools: false
+  template_kwargs:
+    enable_thinking: false
+  export_mode: concat
+  async_rollouts: false
+  max_concurrency: 2
+  on_system_failure: raise
+  limits:
+    max_turns: 20
+    max_tokens_per_turn: 256
+    max_generated_tokens: 4096
+    max_context_tokens: 32768
+    sampling_timeout: 120
+    tool_timeout: 60
+    episode_timeout: 1800
+  retry:
+    max_attempts: 2
+    retry_tools: false
+  evaluation:
+    num_generations: 1
+    seed: 1729
+    pass_ks: [1]
+
+gigpo:
+  step_advantage_weight: 1.0
+  discount: 0.95
+  mode: mean_norm
+  enable_similarity: false
+  episode_statistic_weighting: trajectory
+
+reward:
+  mode: sparse
+  success_reward: 10.0
+
+# 旧 run 训练到了 step 62，但最近保存的 checkpoint 是 step 50。
+continuation:
+  checkpoint: trio://run_i5vpybxfnqef/weights/ppo-step-00000050
+  global_step: 50
