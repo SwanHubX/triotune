@@ -34,8 +34,8 @@ valid_dataset:
   max_examples: 100
 
 reference:
-  # Frozen base model used only when actor.kl_ctl > 0. Keeping it explicit
-  # documents the intended policy reference even though kl_ctl is zero below.
+  # Frozen base model used when either actor KL coefficient is positive. Keeping
+  # it explicit documents the intended reference even though both are zero below.
   name: ${model.name}
 
 training:
@@ -135,8 +135,12 @@ actor:
   # restricted ordinary token-level clipped objective.
   loss_backend: custom
 
-  # Zero disables fixed-reference scoring and its additional remote requests.
+  # Zero disables KL-as-reward. Reference scoring is skipped only when this
+  # and reference_kl_coef are both zero.
   kl_ctl: 0.0
+  # Independent low-variance K3 actor loss. It requires the custom loss backend
+  # and cannot be enabled together with kl_ctl.
+  reference_kl_coef: 0.0
   kl_estimator: k1
   # Standard on-policy GRPO keeps decoupling, recomputation and rejection off.
   use_decoupled_loss: false

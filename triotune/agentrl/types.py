@@ -986,6 +986,72 @@ class ObservationFormatter(Protocol):
     def format(self, results: Sequence[ToolResult]) -> list[dict[str, Any]]: ...
 
 
+class AnchorObservationProvider(Protocol):
+    """Capture trusted environment state immediately before policy sampling.
+
+    The runner installs the current interaction's :class:`ExecutionContext`
+    before invoking this hook. Stateful environments can therefore identify a
+    candidate through :func:`current_execution_context` without accepting an
+    identity chosen by the model. Implementations may return synchronously or
+    asynchronously; the runner deep-copies the returned raw observation into
+    optional episode export metadata keyed by trusted interaction ID. Ordinary
+    episodes therefore retain their historical Interaction and JSONL schema.
+    """
+
+    def observe(
+        self, episode: EpisodeResult, interaction: Interaction
+    ) -> Any | Awaitable[Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AgentBatchAdvantages:
+    """Return validated batch rows with explicit base-advantage semantics.
+
+    ``add`` preserves the normal PPO/GRPO advantage and appends the supplied
+    policy-only signal. ``replace`` uses the supplied rows as the complete
+    policy advantage before the configured final advantage normalization. The
+    latter is needed by batch algorithms whose episode statistics cannot be
+    reconstructed by a per-trajectory estimator. Neither mode changes reward
+    vectors or critic return targets.
+    """
+
+    values: Sequence[Sequence[float]]
+    mode: Literal["add", "replace"] = "add"
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"add", "replace"}:
+            raise AgentContractError(
+                "Batch advantage mode must be add or replace."
+            )
+
+
+class AgentBatchAdvantageProvider(Protocol):
+    """Compute token advantages from a complete agent rollout batch.
+
+    The provider receives every accepted trajectory in one optimizer update,
+    which permits grouping turns across candidates. It returns one finite
+    completion-aligned row per input trajectory. Returned values are added to
+    existing direct advantages. Plain row sequences use additive semantics;
+    :class:`AgentBatchAdvantages` can explicitly request replacement when a
+    batch algorithm computes its complete policy advantage. In GiGPO, a
+    provider uses ``Trajectory.anchor_observations``, ``turn_ids``, process
+    rewards, outcome reward, and group identity to calculate both advantage
+    levels without defining a new PPO loss.
+
+    Providers must treat the supplied trajectories as read-only. The return
+    contract accepts numerical rows rather than replacement trajectories, and
+    AgentRL creates new records that change only ``token_advantages``.
+    """
+
+    def advantages(
+        self, trajectories: Sequence[Trajectory]
+    ) -> (
+        Sequence[Sequence[float]]
+        | AgentBatchAdvantages
+        | Awaitable[Sequence[Sequence[float]] | AgentBatchAdvantages]
+    ): ...
+
+
 class EpisodeScorer(Protocol):
     """Score a completed or model-limited execution using task-specific context.
 

@@ -180,6 +180,7 @@ class EpisodeTrajectoryBuilder:
                     ),
                     fragment_id=f"{fragment_prefix}:turn:{index}",
                     interaction_ids=whole.interaction_ids[: index + 1],
+                    anchor_observations=whole.anchor_observations[: index + 1],
                     parent_interaction_id=(
                         whole.interaction_ids[index - 1]
                         if index
@@ -458,6 +459,21 @@ class EpisodeTrajectoryBuilder:
             for interaction in episode.interactions
             if interaction.turn is not None
         ) or tuple(f"{episode.episode_id}:turn:{i}" for i in range(len(episode.turns)))
+        anchor_by_interaction = episode.export_metadata.get(
+            "anchor_observations", {}
+        )
+        if not isinstance(anchor_by_interaction, dict):
+            raise AgentContractError(
+                "anchor_observations export metadata must be a mapping."
+            )
+        anchor_observations = (
+            tuple(
+                anchor_by_interaction.get(interaction_id)
+                for interaction_id in interaction_ids
+            )
+            if anchor_by_interaction
+            else ()
+        )
         if len(interaction_ids) != len(episode.turns):
             raise AgentContractError("Interactions must identify every generated turn.")
         initial = list(episode.turns[0].prompt_tokens)
@@ -528,5 +544,6 @@ class EpisodeTrajectoryBuilder:
             task_id=episode.task_id,
             fragment_id=f"{episode.rollout_id or episode.episode_id}:concat",
             interaction_ids=interaction_ids,
+            anchor_observations=anchor_observations,
             action_keys=action_keys,
         )

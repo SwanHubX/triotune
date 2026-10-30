@@ -348,6 +348,7 @@ class TrainingCheckpoint:
         )
         self.config, self.algorithm = config, algorithm
         self.loaded = None
+        self.bootstrap_uri = None
         self.started = False
         self.in_train_loop = False
         self.saved_step = None
@@ -366,6 +367,13 @@ class TrainingCheckpoint:
         reporting = values.pop("reporting")
         values["logging_step"] = reporting["logging_step"]
         values["training"].pop("max_steps")
+        # Zero disables the opt-in objective and is semantically identical to
+        # checkpoints written before this field existed. Omitting the default
+        # keeps those manifests resumable while enabled runs still record the
+        # coefficient as part of their exact optimization identity.
+        actor = values.get("actor")
+        if isinstance(actor, dict) and not actor.get("reference_kl_coef", 0.0):
+            actor.pop("reference_kl_coef", None)
         self.identity = {
             "config": values,
             "clients": identity,
@@ -469,6 +477,16 @@ class TrainingCheckpoint:
             else Path(config.checkpoint.resume_from).expanduser().parent
         )
 
+    def bootstrap_remote_optimizer(self, uri: str) -> None:
+        """Use one legacy remote optimizer snapshot before local manifests exist."""
+        if not self.enabled or self.loaded is not None or self.started:
+            raise ValueError(
+                "Remote optimizer bootstrap requires a new enabled checkpoint manager."
+            )
+        if not isinstance(uri, str) or not uri.startswith("trio://"):
+            raise ValueError("Remote optimizer bootstrap requires a trio:// URI.")
+        self.bootstrap_uri = uri
+
     def _scheduler_states(self, state):
         """Pair each component's schedule with its acknowledged optimizer count."""
         result = {
@@ -512,6 +530,12 @@ class TrainingCheckpoint:
                 "create_training_client_from_state_with_optimizer",
                 path=self.loaded["components"]["actor"]["uri"],
             )
+        if self.bootstrap_uri:
+            return call(
+                service,
+                "create_training_client_from_state_with_optimizer",
+                path=self.bootstrap_uri,
+            )
         return service.create_lora_training_client(**kwargs)
 
     async def create_client_async(self, service, *, component="actor", **kwargs):
@@ -520,6 +544,14 @@ class TrainingCheckpoint:
                 service,
                 "create_training_client_from_state_with_optimizer",
                 path=self.loaded["components"][component]["uri"],
+            )
+        if self.bootstrap_uri:
+            if component != "actor":
+                raise ValueError("Remote optimizer bootstrap supports actor-only runs.")
+            return await call_async(
+                service,
+                "create_training_client_from_state_with_optimizer",
+                path=self.bootstrap_uri,
             )
         return await call_async(service, "create_lora_training_client", **kwargs)
 

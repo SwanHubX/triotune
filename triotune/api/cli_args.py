@@ -1021,6 +1021,11 @@ class PPOActorConfig:
             disables that penalty.
         overlong_penalty_factor (`float`, default `1.0`):
             Maximum positive scale of the overlong completion penalty.
+        reference_kl_coef (`float`, default `0.0`):
+            Coefficient for an independent low-variance K3 reference-KL actor
+            objective. Unlike ``kl_ctl``, this term is differentiated directly
+            from current-policy logprobs in every custom-loss minibatch and
+            never enters rewards, advantages, or critic return targets.
 
     Adam parameters live in the top-level ``optimizer`` module and generation
     requests live in ``rollout`` so policy behavior is not mixed with runtime
@@ -1062,6 +1067,9 @@ class PPOActorConfig:
     max_empty_batches: int = 32
     overlong_tokens: int = 0
     overlong_penalty_factor: float = 1.0
+    # Append opt-in objective fields so every established positional
+    # constructor argument keeps its historical index.
+    reference_kl_coef: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("reward_norm", "adv_norm"):
@@ -1089,7 +1097,12 @@ class PPOActorConfig:
             "sapo_tau_neg",
         ):
             _positive(name, getattr(self, name))
-        for name in ("eps_clip", "kl_ctl", "overlong_penalty_factor"):
+        for name in (
+            "eps_clip",
+            "kl_ctl",
+            "overlong_penalty_factor",
+            "reference_kl_coef",
+        ):
             _nonnegative(name, getattr(self, name))
         for name in ("discount", "gae_lambda"):
             _probability(name, getattr(self, name), include_zero=True)
@@ -1142,6 +1155,12 @@ class PPOActorConfig:
             self.rejection_lower is not None or self.rejection_upper is not None
         ) and not self.use_decoupled_loss:
             raise ValueError("Behavior rejection requires use_decoupled_loss=True.")
+        if self.kl_ctl and self.reference_kl_coef:
+            raise ValueError(
+                "Use either KL-as-reward (kl_ctl) or independent reference KL, not both."
+            )
+        if self.reference_kl_coef and self.loss_backend != "custom":
+            raise ValueError("Independent reference KL requires loss_backend=custom.")
         if self.loss_backend == "native" and not self.native_compatible:
             raise ValueError(
                 "Native PPO only supports token_mean, token ratios and ordinary "
@@ -1160,6 +1179,7 @@ class PPOActorConfig:
             and self.rejection_lower is None
             and self.rejection_upper is None
             and not self.use_decoupled_loss
+            and not self.reference_kl_coef
         )
 
 

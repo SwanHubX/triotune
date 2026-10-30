@@ -28,6 +28,39 @@ from triotune.utils.metrics import MetricsAPI
 
 
 class ResumeTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_agent_loop_keeps_pre_gigpo_checkpoint_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            trainer = PPOTrainer(
+                args=self.config("agent", root),
+                train_dataset=self.rows("agent"),
+                eval_dataset=self.rows("agent")[:1],
+            )
+            AgentTrainingLoop(
+                trainer,
+                calculator_workflow(),
+                config=AgentConfig(max_concurrency=1),
+            )
+            identity = trainer._checkpoint.loop["identity"]
+            self.assertNotIn("batch_advantage_provider", identity)
+            self.assertNotIn("anchor_observer", identity)
+            self.assertNotIn(
+                "reference_kl_coef",
+                trainer._checkpoint.identity["config"]["actor"],
+            )
+            enabled_config = self.config("agent", Path(root) / "reference-kl")
+            enabled_config.reference_kl_coef = 0.01
+            enabled = PPOTrainer(
+                args=enabled_config,
+                train_dataset=self.rows("agent"),
+                eval_dataset=self.rows("agent")[:1],
+            )
+            self.assertEqual(
+                enabled._checkpoint.identity["config"]["actor"][
+                    "reference_kl_coef"
+                ],
+                0.01,
+            )
+
     async def test_ppo_initialization_failure_keeps_reporter_cleanup(self):
         from unittest.mock import AsyncMock
 

@@ -484,9 +484,19 @@ Long responses naturally carry more weight under token_mean, while seq_mean remo
 
 ### KL with a Fixed Reference Model
 
-actor.kl_ctl defaults to 0, which skips reference scoring. With a positive value, the trainer uses reference.name; when no reference is configured, it uses the actor's unmodified base model. kl_estimator supports k1, k2, and k3.
+actor.kl_ctl and actor.reference_kl_coef both default to 0. Reference scoring is skipped when both are zero. With either coefficient enabled, the trainer uses reference.name; when no reference is configured, it uses the actor's unmodified base model. kl_estimator supports k1, k2, and k3 for KL-as-reward.
 
 Token GAE adds the KL penalty to token rewards before the recurrence. Turn GAE uses only task rewards to compute critic targets, adding KL back to actor advantages as a token-local term to avoid accumulating fine-grained KL into turn returns.
+
+reference_kl_coef instead enables an independent low-variance K3 actor objective:
+
+$$
+d_t = \log \pi_\theta(a_t|s_t)-\log \pi_{\mathrm{ref}}(a_t|s_t),
+\qquad
+K_3(d_t)=e^{-d_t}+d_t-1.
+$$
+
+The custom loss adds reference_kl_coef * weighted_mean(K3) directly to the policy objective in every minibatch. The mean uses loss_mask and effective action weights. It does not modify rewards, frozen advantages, or critic returns. This path requires loss_backend: custom and cannot be enabled together with kl_ctl; PyTRIO's custom logprob-gradient bridge is sufficient, so no full-vocabulary logits or server-side loss change is required. Metrics are reported as policy/reference_kl and policy/reference_kl_loss.
 
 ## Training Scale and Execution Boundaries
 

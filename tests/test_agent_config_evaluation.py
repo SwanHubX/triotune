@@ -29,6 +29,20 @@ from triotune.agentrl import (
 
 
 class AgentConfigTests(unittest.TestCase):
+    def test_config_forwards_trusted_anchor_observer(self):
+        class Observer:
+            def observe(self, episode, interaction):
+                return "state"
+
+        observer = Observer()
+        workflow = AgentConfig().build_workflow(
+            tokenizer=AgentTokenizer(),
+            tools=object(),
+            scorer=object(),
+            anchor_observer=observer,
+        )
+        self.assertIs(workflow.runner.anchor_observer, observer)
+
     def test_round_trip_nested_config_and_unknown_options(self):
         config = AgentConfig(
             limits={"max_turns": 4},

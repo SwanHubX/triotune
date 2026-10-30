@@ -209,7 +209,14 @@ class AgentConfig:
         return asdict(self)
 
     def build_workflow(
-        self, *, tokenizer, tools, scorer, logger=None, context_compactor=None
+        self,
+        *,
+        tokenizer,
+        tools,
+        scorer,
+        logger=None,
+        context_compactor=None,
+        anchor_observer=None,
     ):
         """Compose the built-in JSON adapters with application tools/scoring."""
         from .diagnostics.logging import JsonlEpisodeLogger
@@ -257,6 +264,7 @@ class AgentConfig:
                 prompt_key=self.prompt_key,
                 trajectory_builder=EpisodeTrajectoryBuilder(mode=self.export_mode),
                 context_compactor=context_compactor,
+                anchor_observer=anchor_observer,
             ),
             max_concurrency=self.max_concurrency,
             logger=logger,
