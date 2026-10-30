@@ -66,6 +66,7 @@ CONFIG = (
     Path(__file__).resolve().parents[1]
     / "examples/gigpo/configs/grpo-webshop-configs.yaml"
 )
+EXAMPLE_ROOT = CONFIG.parents[1]
 
 
 class FakeShop:
@@ -178,6 +179,20 @@ def snapshot(**kwargs):
 
 
 class DataTests(unittest.TestCase):
+    def test_readme_and_launchers_expose_only_the_original_gigpo_start(self):
+        readme = (EXAMPLE_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("'", readme)
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", readme))
+        self.assertIn("## Install the environment", readme)
+        self.assertIn("## Prepare the data", readme)
+        self.assertIn("## Start training", readme)
+        self.assertNotIn("GRPO", readme)
+        self.assertNotIn("resume", readme.lower())
+        self.assertEqual(
+            sorted(path.name for path in (EXAMPLE_ROOT / "scripts").glob("*.sh")),
+            ["run-gigpo-webshop.sh"],
+        )
+
     def test_legacy_run_config_and_continuation_progress_match_step_50(self):
         experiment = load_experiment(
             CONFIG.with_name("gigpo-webshop-resume-configs.yaml")
