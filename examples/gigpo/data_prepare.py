@@ -1,7 +1,8 @@
-"""数据准备：复用 HF 缓存、构建索引、划分目标并生成任务行。
+"""Prepare WebShop assets, search indexes, goal splits, and task rows.
 
-商品 JSON 不是监督学习的 prompt/answer 数据。这里的任务行只指定目标索引；
-真实指令、页面和奖励由 WebShop 在 reset/step 时产生，不创建占位 parquet。
+Product JSON files are not supervised prompt and answer data. Task rows contain
+only goal indexes. WebShop produces instructions, pages, and rewards during
+reset and step calls, so no placeholder parquet file is created.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ WEBSHOP_REVISION = "64fa2a5c15c7daa698b9ac93f5bb5437b634c9bd"
 
 
 def asset_manifest(files: dict[str, Path]) -> dict:
-    """对 files 的文件名→本地路径映射计算 SHA-256，返回源码版本及资产清单。"""
+    """Return source metadata and SHA-256 values for named local assets."""
     return {
         "webshop_repository": WEBSHOP_REPOSITORY,
         "webshop_revision": WEBSHOP_REVISION,
@@ -38,10 +39,12 @@ def asset_manifest(files: dict[str, Path]) -> dict:
 
 @dataclass(frozen=True)
 class DataConfig:
-    """repo_id/revision 固定 HF 数据；local_files_only 控制是否只查缓存。
+    """Configure pinned data, goal splits, shuffling, and evaluation limits.
 
-    split_protocol 选择索引协议；seed 仅控制训练行打乱；train_epochs 为任务遍历
-    次数；eval_limit 是显式调试子集大小，None 表示完整评估区间。
+    ``repo_id`` and ``revision`` identify the dataset. ``local_files_only``
+    controls cache-only access. ``seed`` affects training-row shuffling,
+    ``train_epochs`` controls traversal count, and ``eval_limit`` selects an
+    explicit debug subset when it is not ``None``.
     """
 
     repo_id: str = "YWZBrandon/webshop-data"
@@ -53,7 +56,7 @@ class DataConfig:
     eval_limit: int | None = None
 
     def __post_init__(self):
-        """验证划分、随机种子、遍历次数和子集大小，拒绝 bool 伪装成整数。"""
+        """Validate split, seed, traversal count, and subset size."""
         if self.split_protocol not in {"verl", "official"}:
             raise ValueError("data.split_protocol must be verl or official.")
         for name, minimum in (("seed", 0), ("train_epochs", 1)):
@@ -68,10 +71,10 @@ class DataConfig:
 
 
 def cached_files(config: DataConfig) -> dict[str, Path]:
-    """不指定 cache_dir/local_dir，直接复用用户之前下载的默认 HF 缓存。
+    """Resolve required files through the default Hugging Face cache.
 
-    第三个文件是该版本 WebShop loader 无条件读取的依赖；human_goals=False
-    时不会用其中的人工指令生成任务。数据缺失时保留 HF 的明确异常。
+    The loader opens all three files. Human instructions are not used when
+    ``human_goals`` is disabled. Missing assets retain the original cache error.
     """
     return {
         name: Path(
@@ -92,13 +95,12 @@ def cached_files(config: DataConfig) -> dict[str, Path]:
 
 
 def goal_ranges(count: int, protocol: str) -> dict[str, range]:
-    """以目标总数 count 和划分协议 protocol 返回 train/eval/test 的 range。
+    """Return train, evaluation, and test ranges for a goal population.
 
-    索引指向固定 seed 生成并打乱后的 server.goals，不是商品编号。
-
-    verl 协议显式承认 eval 使用原来的 test 区间；official 协议保留独立 test，
-    避免在训练过程中反复用 test 选择 checkpoint。两者都是目标级划分，
-    商品仍共享，不能将结果解释为对未见商品的泛化能力。
+    Indexes identify the seeded and shuffled server goal list rather than
+    products. The ``verl`` protocol evaluates on the test interval, while the
+    ``official`` protocol keeps evaluation and test intervals separate. Both
+    protocols split goals while sharing the same product catalog.
     """
     if protocol not in {"verl", "official"}:
         raise ValueError("Unknown split protocol.")
@@ -115,12 +117,12 @@ def goal_ranges(count: int, protocol: str) -> dict[str, range]:
 
 
 def task_rows(goals: list[dict], config: DataConfig, split: str) -> list[dict]:
-    """将有序 goals 按 DataConfig 和 split 转为可重放任务行列表。
+    """Convert ordered goals into replayable task rows for one split.
 
-    仅训练行按 epoch 打乱，评估顺序固定；split 为 train/eval/test。
-
-    同一目标的不同候选由 AgentRolloutWorkflow 扩展，不能预先复制成不同组。
-    task_id 绑定目标索引和划分，环境状态及奖励答案均不写入 messages。
+    Only training rows are shuffled between epochs. AgentRolloutWorkflow expands
+    multiple candidates for one goal, so rows must not preduplicate candidate
+    groups. ``task_id`` binds the split and goal index without exposing hidden
+    environment state or reward answers in model messages.
     """
     indices = list(goal_ranges(len(goals), config.split_protocol)[split])
     if split != "train" and config.eval_limit is not None:
@@ -137,13 +139,13 @@ def task_rows(goals: list[dict], config: DataConfig, split: str) -> list[dict]:
 
 
 def goal_fingerprint(goals: list[dict]) -> str:
-    """记录完整目标顺序和价格约束，便于发现换数据/seed 后的不可比评估。"""
+    """Fingerprint the complete ordered goal and price-constraint payload."""
     payload = json.dumps(goals, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def link_assets(source: Path, files: dict[str, Path]):
-    """HF 缓存为源，外部源码的 data/ 只建立符号链接；绝不覆盖已有不同文件。"""
+    """Link cached assets into the source tree without overwriting files."""
     directory = source / "data"
     directory.mkdir(parents=True, exist_ok=True)
     for name, target in files.items():
@@ -158,10 +160,11 @@ def link_assets(source: Path, files: dict[str, Path]):
 
 
 def prepare(experiment, *, download: bool = False):
-    """按 Experiment 定位源码和数据，构建匹配索引，返回资产 SHA-256 清单。
+    """Prepare source assets and a matching index for an experiment.
 
-    download=True 允许补齐 HF 缓存；默认遵循 data.local_files_only。任何未知
-    索引或不同内容的数据链接都报错，已匹配的准备结果可以重复复用。
+    ``download=True`` permits missing cache entries to be downloaded. Unknown
+    indexes and mismatched links fail explicitly. A matching prepared checkout
+    can be reused safely.
     """
     source = experiment.source_dir
     if not (source / "web_agent_site").is_dir():
@@ -195,8 +198,9 @@ def prepare(experiment, *, download: bool = False):
     engine = importlib.import_module("web_agent_site.engine.engine")
     if not Path(engine.__file__).resolve().is_relative_to(source.resolve()):
         raise RuntimeError("Another WebShop checkout is already imported.")
-    # 文档内容完全沿用上游 convert_product_file_format.py；只构建实际使用的 1k。
-    # 原始 loader 从源码 data/ 读取属性，不接受 attrpath 参数；上面已校验链接。
+    # Build only the 1k-product document collection used by this experiment.
+    # The loader reads attributes from the source data directory, whose links
+    # were validated above.
     random_state = random.getstate()
     try:
         random.seed(experiment.environment_seed)
@@ -207,7 +211,8 @@ def prepare(experiment, *, download: bool = False):
         )
     finally:
         random.setstate(random_state)
-    # 临时目录只在构建成功后改名；中途失败不会留下被误认成完整索引的目录。
+    # Rename the temporary directory only after indexing succeeds so a failed
+    # build cannot be mistaken for a complete index.
     with tempfile.TemporaryDirectory(
         prefix="triotune-index-", dir=index.parent
     ) as temporary:
@@ -265,12 +270,12 @@ def prepare(experiment, *, download: bool = False):
 
 
 def main(argv=None):
-    """解析配置路径及 --download，执行准备并输出 JSON 清单，不连接训练服务。"""
+    """Prepare data from CLI options and print a JSON asset manifest."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).with_name("configs") / "grpo-webshop-configs.yaml",
+        default=Path(__file__).with_name("configs") / "gigpo-webshop-configs.yaml",
     )
     parser.add_argument(
         "--download",
@@ -278,7 +283,8 @@ def main(argv=None):
         help="Download missing small assets into the default HF cache",
     )
     args = parser.parse_args(argv)
-    # 延迟导入编排层，数据工具的普通导入不创建训练服务，也不产生循环依赖。
+    # Delay the orchestration import so importing data utilities does not create
+    # a training service or introduce a circular dependency.
     from .train import load_experiment
 
     experiment = load_experiment(args.config)

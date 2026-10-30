@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从任意工作目录使用 GiGPO 配置中的任务批次和 minibatch 设置启动训练。
+# Start training with the GiGPO batch and minibatch settings from any directory.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
