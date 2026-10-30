@@ -1,4 +1,4 @@
-# 原始 GiGPO WebShop 配置；不加载任何已有 checkpoint。
+# GiGPO WebShop configuration for a new training run.
 output_dir: ../../../output/webshop-gigpo-qwen3.5-4b-s150-b8-g8-seed42
 
 algorithm: gigpo
@@ -21,7 +21,7 @@ trainer:
     name: Qwen/Qwen3.5-4B
     lora_rank: 8
   training:
-    # 从头训练 150 step。
+    # Train for 150 policy update steps from initial model weights.
     batch_size: 8
     max_steps: 150
     seed: 42

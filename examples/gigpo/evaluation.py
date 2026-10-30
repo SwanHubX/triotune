@@ -1,8 +1,9 @@
-"""独立测试入口：以相同任务、评分和预算评估基础策略或云端 LoRA 策略。
+"""Evaluate base or cloud LoRA policies with the same tasks, scores, and budgets.
 
-GiGPO/GRPO/PPO 的测试差异仅在待测 actor 权重，评估不计算训练优势或更新模型。
-训练前不传 checkpoint；训练后必须传训练报告中的云端 actor checkpoint URI。
-PPO 的 critic 只服务训练，评估时不创建 critic 或要求其 checkpoint。
+GiGPO, GRPO, and PPO evaluation differs only in the actor weights under test.
+Evaluation never computes training advantages or updates model parameters. Omit
+the checkpoint before training and provide the cloud actor checkpoint URI from
+the training report afterward. The PPO critic is not created during evaluation.
 """
 
 from __future__ import annotations
@@ -18,17 +19,21 @@ from triotune.api.client_api import call_async
 
 
 def webshop_score_metrics(episodes: Sequence[EpisodeResult]) -> dict[str, float]:
-    """从本轮全部 episode 的内存记录计算 WebShop 原始平均分和百分制 Score。
+    """Compute the raw WebShop mean score and percentage score in memory.
 
-    episodes 包含每个目标的所有独立尝试，包括非法动作、预算退出和系统失败。
-    只读取 score.components.task_score，不读取稀疏训练 reward 或过程奖励。
-    没有购买的正常评分为零；系统失败没有 score 时同样计零，仍保留在分母。
-    已有 score 却缺失 task_score，或分值不在有限的 [0,1] 内，直接报错，避免
-    将评分契约错误伪装成低分。空评估也报错，不生成看似有效的零分结果。
+    Episodes include every independent attempt for each goal, including invalid
+    actions, budget exits, and system failures. Only
+    ``score.components.task_score`` is consumed; sparse training rewards and
+    process rewards are ignored. A normal attempt without a purchase scores zero.
+    A system failure without a score also contributes zero and stays in the
+    denominator. A recorded score with a missing, nonfinite, or out-of-range
+    task score violates the scoring contract and raises an error. Empty
+    evaluation input also raises instead of returning a misleading zero score.
 
-    返回 task_score_mean（0–1）、score（均值乘 100）、task_score_count（有
-    原始分值的尝试数）及 unscored_episodes（无评分、按零计入的尝试数）。
-    指标以 eval/agent 为前缀；分母始终为 len(episodes)，每条尝试等权。
+    The result includes the mean in the 0 to 1 range, the mean multiplied by
+    100, the number of scored attempts, and the number of unscored attempts.
+    Every metric uses the ``eval/agent`` prefix and every attempt has equal
+    weight in the denominator.
     """
     if not episodes:
         raise ValueError("WebShop Score requires at least one evaluation episode.")
@@ -61,12 +66,12 @@ def webshop_score_metrics(episodes: Sequence[EpisodeResult]) -> dict[str, float]
 async def load_actor_config(
     experiment, service, checkpoint: str | None, *, evaluation: bool
 ):
-    """返回有效 PPOConfig 和可选的已加载 actor 客户端。
+    """Return an effective PPO config and an optional loaded actor client.
 
-    experiment 是 train.Experiment；service 是 PyTRIO 服务客户端。checkpoint
-    是 save_state 返回的远程 actor LoRA URI，不能用基础模型名替代。evaluation
-    为真时关闭 critic，只保留 actor 的采样能力。加载失败直接报错，不退回基础
-    模型；从训练状态导出的采样快照会包含基础权重和该云端 LoRA 的合成策略。
+    ``experiment`` is a training experiment and ``service`` is a PyTRIO service
+    client. ``checkpoint`` must be the remote actor LoRA URI returned by
+    ``save_state``. Evaluation disables the critic and retains actor sampling.
+    Loading failures propagate instead of falling back to the base model.
     """
     if checkpoint is not None and not checkpoint.strip():
         raise ValueError("checkpoint must be a nonempty cloud actor LoRA URI.")
@@ -84,13 +89,14 @@ async def load_actor_config(
 
 
 async def evaluate_policy(loop, *, checkpoint: str | None) -> dict:
-    """用标准 AgentTrainingLoop.evaluate 测试，返回指标、权重来源和更新数。
+    """Evaluate through AgentTrainingLoop and report weights and update counts.
 
-    loop 已绑定数据、固定快照工厂和交互工作流。checkpoint 仅用于报告来源；
-    实际加载已由 load_actor_config 完成。前后检查 actor/critic 更新计数，确保
-    各算法测试都不执行训练。框架统计 success_rate、pass@1 和失败率；本模块
-    从 last_eval_batch 的全部内存 episode 计算平均 task_score 与百分制 Score，
-    并写入 trainer 指标和返回报告，不依赖可能不完整的磁盘 JSONL。
+    The loop already owns its dataset, fixed snapshot factory, and interaction
+    workflow. The checkpoint value is report metadata because actor loading has
+    already completed. Actor and critic update counts are checked before and
+    after evaluation to ensure that no algorithm performs training. Framework
+    metrics are combined with task scores computed from the complete in-memory
+    evaluation batch rather than a potentially incomplete JSONL log.
     """
     state = loop.trainer.state
     before = (state.optimizer_steps, state.critic_optimizer_steps)
@@ -111,7 +117,7 @@ async def evaluate_policy(loop, *, checkpoint: str | None) -> dict:
 
 
 def main(argv=None):
-    """接受与 train 共用的模型、算法、配置、划分和云端 checkpoint 参数。"""
+    """Parse model, algorithm, config, split, and cloud checkpoint options."""
     from .train import build_parser, run
 
     args = build_parser(evaluation=True).parse_args(argv)

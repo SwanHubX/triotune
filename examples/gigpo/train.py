@@ -1,8 +1,8 @@
-"""WebShop 实验编排：解析配置 → 自检/探测 → 固定策略采样 → 标准训练。
+"""Orchestrate WebShop configuration, checks, sampling, and training.
 
-配置直接构造框架已有的 PPOConfig、AgentConfig 和 GiGPOConfig，不另造训练器。
-独立评估从 evaluation.py 进入；这里保留 --mode evaluate 作为统一启动入口。
-环境、数据、优势数学各由对应模块负责，本模块只组织执行顺序和资源生命周期。
+Configuration creates PPOConfig, AgentConfig, and GiGPOConfig objects directly.
+The module coordinates execution order and resource lifecycles while environment,
+data, and advantage calculations remain in their dedicated modules.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ DEFAULT_CONFIG = Path(__file__).with_name("configs") / "gigpo-webshop-configs.ya
 
 @dataclass(frozen=True)
 class ContinuationConfig:
-    """从旧版仅保存远端优化器的 checkpoint 建立可审计的兼容续训。"""
+    """Describe a continuation from a remote optimizer-only checkpoint."""
 
     checkpoint: str
     global_step: int
@@ -59,11 +59,11 @@ class ContinuationConfig:
 
 @dataclass(frozen=True)
 class Experiment:
-    """已解析的实验参数；全部路径为绝对路径，框架参数保持原有类型。
+    """Hold validated experiment settings with resolved absolute paths.
 
-    algorithm 决定优势来源；trainer/agent/gigpo 分别配置优化器、交互和联合优势。
-    data 控制目标划分，reward 控制环境评分，source_dir 指向外部模拟器源码。
-    environment_seed 固定目标顺序及价格；output_dir 保存日志和实验报告。
+    The algorithm selects advantage behavior. Trainer, agent, and GiGPO settings
+    configure optimization, interaction, and joint advantages. Data and reward
+    settings control goal splits and environment scores.
     """
 
     algorithm: str
@@ -79,7 +79,7 @@ class Experiment:
 
 
 def resolve_path(value: str | Path, root: Path) -> Path:
-    """将配置中的 value 路径相对 YAML 目录 root 展开，返回绝对路径。"""
+    """Resolve a configured path relative to its YAML directory."""
     target = Path(value).expanduser()
     return target.resolve() if target.is_absolute() else (root / target).resolve()
 
@@ -93,12 +93,11 @@ def load_experiment(
     step_advantage_weight: float | None = None,
     output_dir: Path | None = None,
 ) -> Experiment:
-    """从 YAML 创建并校验实验，返回 Experiment；不连接云端服务。
+    """Build and validate an experiment from YAML without opening a service.
 
-    path 是配置文件；其余参数是可选 CLI 覆盖值。model 为服务模型 ID，steps
-    为更新次数，algorithm 选择实验算法，step_advantage_weight 覆盖 GiGPO 的
-    状态级优势系数；output_dir 覆盖输出目录，CLI 相对路径按当前工作目录解析。
-    显式冲突会提前报错，避免实际运行另一个算法。
+    Keyword arguments apply CLI overrides for model, update count, algorithm,
+    state-advantage weight, and output directory. Configuration conflicts fail
+    before any remote work starts.
     """
     values = load_yaml_config(path)
     unknown = set(values) - {
@@ -134,14 +133,14 @@ def load_experiment(
                 trainer_values[section][name] = str(
                     resolve_path(trainer_values[section][name], root)
                 )
-    # 命令行算法覆盖使用目标算法的归一化默认值，而不是继承 GiGPO 配置中
-    # 为 replacement advantage 显式关闭的两级归一化。
+    # Algorithm overrides use their own normalization defaults instead of the
+    # disabled normalization required by GiGPO replacement advantages.
     configured_algorithm = values.get("algorithm", "gigpo")
     if configured_algorithm == "gigpo" and selected != "gigpo":
         actor = trainer_values.setdefault("actor", {})
         actor.pop("reward_norm", None)
         actor.pop("adv_norm", None)
-    # GiGPO 借用 GRPO 的无 critic PPO actor，完整优势由插件提供。
+    # GiGPO uses a critic-free actor while its provider supplies full advantages.
     if selected == "gigpo":
         actor = trainer_values.setdefault("actor", {})
         actor.setdefault("reward_norm", None)
@@ -220,7 +219,7 @@ def load_experiment(
             "Structured WebShop anchors require gigpo.enable_similarity=false."
         )
     if selected == "gigpo":
-        # 校验仅使用配置和算法计划；无需创建真实模型或训练客户端。
+        # Validation needs only configuration and the algorithm plan.
         GiGPOAdvantageProvider(gigpo).validate_trainer(
             SimpleNamespace(args=trainer, algorithm_plan=trainer.algorithm_plan)
         )
@@ -246,7 +245,7 @@ def load_experiment(
 
 
 def advantage_provider(experiment: Experiment):
-    """返回 GiGPO 联合优势插件；GRPO/PPO 返回 None，使用训练器原生优势。"""
+    """Return a GiGPO provider or select trainer-native advantages."""
     return (
         GiGPOAdvantageProvider(experiment.gigpo)
         if experiment.algorithm == "gigpo"
@@ -255,7 +254,7 @@ def advantage_provider(experiment: Experiment):
 
 
 def save_report(output: Path, mode: str, split: str, report: dict) -> Path:
-    """将 report 写入 output 下的模式/划分报告，返回路径；拒绝非有限 JSON 数值。"""
+    """Write a finite JSON report for one execution mode and split."""
     output.mkdir(parents=True, exist_ok=True)
     path = output / f"{mode}-{split}-report.json"
     path.write_text(
@@ -266,10 +265,10 @@ def save_report(output: Path, mode: str, split: str, report: dict) -> Path:
 
 
 async def open_environment(experiment: Experiment, split: str, report: dict):
-    """加载固定数据及模拟器，向 report 写入指纹，返回 pool、训练行、评估行。
+    """Load pinned assets, environment sessions, and task rows.
 
-    split 指定 eval/test；构建后若划分或源码检查失败，本函数负责释放环境。
-    后续采样期间的 pool 生命周期由调用方 run 的 finally 负责。
+    The requested split selects evaluation or test rows. Setup failures close the
+    session pool immediately. The caller owns the pool after successful return.
     """
     files = cached_files(experiment.data)
     report["assets"] = asset_manifest(files)
@@ -306,7 +305,7 @@ async def open_environment(experiment: Experiment, split: str, report: dict):
 
 
 async def check_environment(pool: SessionPool, row: dict) -> dict:
-    """以 row.goal_index 重置真实环境并搜索目标 query，返回首页及搜索结果。"""
+    """Reset one goal, execute its search query, and return visible states."""
     session = "environment-check"
     try:
         initial = await pool.open(session, row["goal_index"])
@@ -322,7 +321,7 @@ async def check_environment(pool: SessionPool, row: dict) -> dict:
 async def probe_policy(
     experiment: Experiment, workflow, snapshot, rows: list[dict]
 ) -> dict:
-    """对首个目标采样完整候选组，验证轨迹和所选优势，不调用优化器。"""
+    """Sample one complete candidate group without optimizer updates."""
     config = experiment.trainer
     batch = await workflow.collect(
         rows[:1],
@@ -344,7 +343,7 @@ async def probe_policy(
 
 
 def apply_legacy_continuation(experiment: Experiment, trainer, train_rows) -> dict:
-    """重建旧远端 checkpoint 缺失的确定性本地计数；调用前须初始化 trainer。"""
+    """Reconstruct deterministic local counters for optimizer-only state."""
     continuation = experiment.continuation
     if continuation is None:
         return {}
@@ -383,10 +382,11 @@ def apply_legacy_continuation(experiment: Experiment, trainer, train_rows) -> di
 
 
 async def run(args) -> dict:
-    """执行 CLI 参数指定的实验并返回报告；失败也落盘，取消也释放资源。
+    """Execute one CLI experiment and persist its report on every exit path.
 
-    args 来自 build_parser；--checkpoint 仅用于独立评估。旧实验的兼容续训由
-    配置中的 continuation 描述，恢复远端优化器并重建可确定的本地进度。
+    ``--checkpoint`` applies only to independent evaluation. A continuation
+    restores remote optimizer state and reconstructs deterministic local
+    progress. Cancellation and failures still release all owned resources.
     """
     from .evaluation import evaluate_policy, load_actor_config
 
@@ -505,7 +505,8 @@ async def run(args) -> dict:
             elif args.mode == "evaluate":
                 report.update(await evaluate_policy(loop, checkpoint=args.checkpoint))
             else:
-                # 标准循环负责：完整批采样 → 优势 → step → 新快照 → 评估/保存。
+                # The loop collects complete batches, computes advantages,
+                # updates the policy, refreshes snapshots, evaluates, and saves.
                 managed_training = True
                 state = await loop.train()
                 report.update(
@@ -531,7 +532,8 @@ async def run(args) -> dict:
         if trainer is not None and not managed_training:
             await trainer.close()
     finally:
-        # 嵌套 finally 保证一层清理失败时，仍关闭模拟器并写出报告。
+        # Nested cleanup keeps closing resources and writing the report even if
+        # an earlier cleanup operation fails.
         try:
             if workflow is not None:
                 await workflow.close()
@@ -557,7 +559,7 @@ async def run(args) -> dict:
 
 
 def build_parser(*, evaluation: bool = False) -> argparse.ArgumentParser:
-    """构造共用 CLI；evaluation=True 时限定为独立评估，避免参数协议漂移。"""
+    """Build the shared training or evaluation CLI."""
     parser = argparse.ArgumentParser(
         description="WebShop algorithm evaluation" if evaluation else __doc__
     )
@@ -591,7 +593,7 @@ def build_parser(*, evaluation: bool = False) -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    """解析可选 argv 参数列表并运行实验；供 python -m 和启动脚本调用。"""
+    """Parse optional arguments and run the experiment."""
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.checkpoint and args.mode != "evaluate":
