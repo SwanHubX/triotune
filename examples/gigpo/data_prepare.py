@@ -270,7 +270,7 @@ def main(argv=None):
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).with_name("configs") / "grpo-webshop-configs.yaml",
+        default=Path(__file__).with_name("configs") / "gigpo-webshop-configs.yaml",
     )
     parser.add_argument(
         "--download",

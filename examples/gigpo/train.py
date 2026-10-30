@@ -38,7 +38,7 @@ from .data_prepare import (
 from .environment import RewardConfig, SessionPool, WebShopBackend, build_workflow
 
 ALGORITHMS = ("gigpo", "grpo", "ppo")
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "grpo-webshop-configs.yaml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "gigpo-webshop-configs.yaml"
 
 
 @dataclass(frozen=True)
@@ -134,6 +134,13 @@ def load_experiment(
                 trainer_values[section][name] = str(
                     resolve_path(trainer_values[section][name], root)
                 )
+    # 命令行算法覆盖使用目标算法的归一化默认值，而不是继承 GiGPO 配置中
+    # 为 replacement advantage 显式关闭的两级归一化。
+    configured_algorithm = values.get("algorithm", "gigpo")
+    if configured_algorithm == "gigpo" and selected != "gigpo":
+        actor = trainer_values.setdefault("actor", {})
+        actor.pop("reward_norm", None)
+        actor.pop("adv_norm", None)
     # GiGPO 借用 GRPO 的无 critic PPO actor，完整优势由插件提供。
     if selected == "gigpo":
         actor = trainer_values.setdefault("actor", {})

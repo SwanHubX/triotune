@@ -64,9 +64,28 @@ from triotune.agentrl import (
 
 CONFIG = (
     Path(__file__).resolve().parents[1]
-    / "examples/gigpo/configs/grpo-webshop-configs.yaml"
+    / "examples/gigpo/configs/gigpo-webshop-configs.yaml"
 )
 EXAMPLE_ROOT = CONFIG.parents[1]
+CONTINUATION_URI = "trio://run_i5vpybxfnqef/weights/ppo-step-00000050"
+
+
+def continuation_settings():
+    settings = yaml.safe_load(CONFIG.read_text())
+    settings["trainer"]["training"]["max_steps"] = 100
+    settings["trainer"]["checkpoint"]["state_dir"] = "states"
+    settings["continuation"] = {
+        "checkpoint": CONTINUATION_URI,
+        "global_step": 50,
+    }
+    return settings
+
+
+def load_temporary_experiment(settings):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "config.yaml"
+        path.write_text(yaml.safe_dump(settings))
+        return load_experiment(path)
 
 
 class FakeShop:
@@ -192,11 +211,13 @@ class DataTests(unittest.TestCase):
             sorted(path.name for path in (EXAMPLE_ROOT / "scripts").glob("*.sh")),
             ["run-gigpo-webshop.sh"],
         )
+        self.assertEqual(
+            sorted(path.name for path in (EXAMPLE_ROOT / "configs").glob("*.yaml")),
+            ["gigpo-webshop-configs.yaml"],
+        )
 
     def test_legacy_run_config_and_continuation_progress_match_step_50(self):
-        experiment = load_experiment(
-            CONFIG.with_name("gigpo-webshop-resume-configs.yaml")
-        )
+        experiment = load_temporary_experiment(continuation_settings())
         trainer = experiment.trainer
         self.assertEqual(trainer.model.name, "Qwen/Qwen3.5-4B")
         self.assertEqual(trainer.model.lora_rank, 8)
@@ -208,9 +229,7 @@ class DataTests(unittest.TestCase):
         self.assertFalse(experiment.agent.template_kwargs["enable_thinking"])
         self.assertEqual(
             experiment.continuation,
-            ContinuationConfig(
-                "trio://run_i5vpybxfnqef/weights/ppo-step-00000050", 50
-            ),
+            ContinuationConfig(CONTINUATION_URI, 50),
         )
         state = SimpleNamespace(
             global_step=0, optimizer_steps=0, data_cursor=0, checkpoint_path=None
@@ -228,7 +247,7 @@ class DataTests(unittest.TestCase):
         self.assertEqual(state.data_cursor, 400)
         self.assertEqual(runtime["restored_seed_offset"], 64000)
         self.assertFalse(runtime["exact_resume"])
-        fresh = load_experiment(CONFIG.with_name("gigpo-webshop-configs.yaml"))
+        fresh = load_experiment(CONFIG)
         self.assertIsNone(fresh.continuation)
         self.assertIsNone(fresh.trainer.checkpoint.state_dir)
         self.assertIsNone(fresh.trainer.checkpoint.resume_from)
@@ -241,15 +260,10 @@ class DataTests(unittest.TestCase):
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 ContinuationConfig(**values)
-        settings = yaml.safe_load(
-            CONFIG.with_name("gigpo-webshop-resume-configs.yaml").read_text()
-        )
+        settings = continuation_settings()
         settings["trainer"]["checkpoint"]["resume_from"] = "state.json"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "conflict.yaml"
-            path.write_text(yaml.safe_dump(settings))
-            with self.assertRaisesRegex(ValueError, "either legacy continuation"):
-                load_experiment(path)
+        with self.assertRaisesRegex(ValueError, "either legacy continuation"):
+            load_temporary_experiment(settings)
 
     def test_both_protocols_use_disjoint_goal_ranges(self):
         for protocol, train_start, eval_start, eval_stop in (
@@ -327,7 +341,7 @@ class DataTests(unittest.TestCase):
                 ("data", "eval_limit", 0),
             ):
                 settings = yaml.safe_load(CONFIG.read_text())
-                # 本测试验证 GiGPO 专属冲突；正式共享配置默认运行 GRPO。
+                # 本测试验证 GiGPO 专属冲突；基础配置默认运行 GiGPO。
                 settings["algorithm"] = "gigpo"
                 settings[section][key] = value
                 path = Path(directory) / "bad.yaml"
@@ -767,9 +781,7 @@ class EnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
 class EvaluationTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_continuation_uses_trainer_owned_optimizer_restore(self):
-        experiment = load_experiment(
-            CONFIG.with_name("gigpo-webshop-resume-configs.yaml")
-        )
+        experiment = load_temporary_experiment(continuation_settings())
         config = replace(
             experiment.trainer,
             reporting=replace(
@@ -796,7 +808,7 @@ class EvaluationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await trainer.close()
         service.create_training_client_from_state_with_optimizer_async.assert_awaited_once_with(
-            path="trio://run_i5vpybxfnqef/weights/ppo-step-00000050"
+            path=CONTINUATION_URI
         )
 
     def test_webshop_score_uses_partial_outcomes_and_counts_unscored_failures(self):
