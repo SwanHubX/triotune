@@ -1,0 +1,15 @@
+# Checkpoint configuration fixture for SFT, DPO, OPD, PPO/GRPO and AgentRL.
+# Copy this checkpoint mapping into the trainer configuration in your own YAML.
+checkpoint:
+  # Train checkpoints: weights + optimizer state, with the existing save policy.
+  save_every: 0
+  state_dir: null
+  resume_from: null
+  # Playground exports: actor/student weights, independently scheduled.
+  sampler:
+    enabled: false
+    # When enabled: 0 = successful completion only; N > 0 = every N updates
+    # plus completion, without exporting the same step twice.
+    save_every: 0
+    # null uses the platform retention policy; a positive integer requests seconds.
+    ttl_seconds: null

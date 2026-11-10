@@ -55,11 +55,13 @@ class RetryPolicy:
 
 @dataclass(frozen=True, slots=True)
 class AgentEvaluationConfig:
-    """Use a stable seed across policy versions for paired task comparisons."""
+    """Configure reproducible task evaluation independently from training."""
 
     num_generations: int | None = None
     seed: int = 1729
     pass_ks: tuple[int, ...] = (1,)
+    temperature: float = 1.0
+    top_p: float = 1.0
 
     def __post_init__(self) -> None:
         if self.num_generations is not None:
@@ -70,6 +72,17 @@ class AgentEvaluationConfig:
             raise ValueError("pass_ks must be nonempty and unique.")
         for k in self.pass_ks:
             positive_int(k, "pass_k")
+        for name in ("temperature", "top_p"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                or (name == "top_p" and value > 1)
+            ):
+                bound = "positive" if name == "temperature" else "in (0, 1]"
+                raise ValueError(f"evaluation.{name} must be finite and {bound}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +230,7 @@ class AgentConfig:
         logger=None,
         context_compactor=None,
         anchor_observer=None,
+        post_tool_stop=None,
     ):
         """Compose the built-in JSON adapters with application tools/scoring."""
         from .diagnostics.logging import JsonlEpisodeLogger
@@ -265,6 +279,7 @@ class AgentConfig:
                 trajectory_builder=EpisodeTrajectoryBuilder(mode=self.export_mode),
                 context_compactor=context_compactor,
                 anchor_observer=anchor_observer,
+                post_tool_stop=post_tool_stop,
             ),
             max_concurrency=self.max_concurrency,
             logger=logger,

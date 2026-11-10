@@ -1,0 +1,96 @@
+# Train a WebShop-specialized Qwen3.5-4B checkpoint for later OPD/TCOD use.
+output_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
+
+data:
+  repo_id: YWZBrandon/webshop-data
+  revision: ce990fff5aee388db2706f07820c578ab68e0453
+  directory: ../../../../../data/webshop-opd/assets
+  local_files_only: true
+  split_protocol: official
+  seed: 42
+  train_epochs: 1
+  eval_limit: 200
+
+environment:
+  source_dir: ../../../../../data/webshop-opd/WebShop
+  seed: 42
+  # Preserve dense partial credit while making an exact purchase substantially
+  # more valuable relative to an imperfect purchase.  This mixture is applied
+  # only during GRPO training; evaluation keeps the native task score and
+  # strict Pass@1 semantics.  Set to 0.0 to reproduce the previous reward.
+  exact_success_alpha: 0.4
+
+trainer:
+  model:
+    name: Qwen/Qwen3.5-4B
+    lora_rank: 32
+  training:
+    # Eight task groups times eight trajectories produce 64 rollouts/update.
+    batch_size: 8
+    max_steps: 200
+    seed: 42
+  rollout:
+    num_generations: 8
+    max_tokens: 7680
+    temperature: 1.0
+    top_p: 1.0
+    prompt_key: messages
+    chat_template_kwargs:
+      enable_thinking: false
+  actor:
+    gae_timestep_unit: turn
+    kl_ctl: 0.0
+    reference_kl_coef: 0.01
+    loss_backend: custom
+    dynamic_sampling: false
+    ppo_n_minibatches: 1
+    update_epochs: 1
+  optimizer:
+    learning_rate: 0.000001
+    grad_clip_norm: 1.0
+  checkpoint:
+    save_every: 20
+    state_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/state
+    sampler:
+      enabled: true
+  evaluation:
+    steps: 20
+    before_train: true
+    after_train: true
+    batch_size: 8
+    max_batches: null
+  reporting:
+    report_to: swanlab
+    workspace: pytrio
+    project: webshop-agentrl-TCOD
+    run_name: grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
+    log_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/metrics
+    logging_step: 1
+
+agent:
+  parser: strict_json
+  renderer: token_append
+  advertise_tools: false
+  template_kwargs:
+    enable_thinking: false
+  export_mode: concat
+  async_rollouts: false
+  max_concurrency: 4
+  on_system_failure: raise
+  limits:
+    max_turns: 15
+    max_tokens_per_turn: 512
+    max_generated_tokens: 7680
+    max_context_tokens: 10240
+    sampling_timeout: 120
+    tool_timeout: 60
+    episode_timeout: 1800
+  retry:
+    max_attempts: 2
+    retry_tools: false
+  evaluation:
+    num_generations: 1
+    seed: 42
+    pass_ks: [1]
+    temperature: 0.4
+    top_p: 1.0

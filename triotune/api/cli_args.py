@@ -438,6 +438,27 @@ class OptimizerConfig:
 
 
 @dataclass(slots=True)
+class SamplerCheckpointConfig:
+    """Opt-in Playground exports, independent of training-state saves.
+
+    Zero save_every exports only at successful training completion. A positive
+    interval also exports every N completed updates. ttl_seconds=None delegates
+    retention to PyTRIO; this is not the six-hour temporary rollout sampler.
+    """
+
+    enabled: bool = False
+    save_every: int = 0
+    ttl_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("checkpoint.sampler.enabled must be a boolean.")
+        _integer("checkpoint.sampler.save_every", self.save_every, minimum=0)
+        if self.ttl_seconds is not None:
+            _integer("checkpoint.sampler.ttl_seconds", self.ttl_seconds, minimum=1)
+
+
+@dataclass(slots=True)
 class CheckpointConfig:
     """Configure periodic checkpoint creation.
 
@@ -464,8 +485,11 @@ class CheckpointConfig:
     # cursor, evaluation, random streams, and accounting as one transaction.
     state_dir: str | None = None
     resume_from: str | None = None
+    sampler: SamplerCheckpointConfig = field(default_factory=SamplerCheckpointConfig)
 
     def __post_init__(self) -> None:
+        self.sampler = _coerce_module(self.sampler, SamplerCheckpointConfig)
+        self.sampler.__post_init__()
         _integer("save_every", self.save_every, minimum=0)
         for name in ("state_dir", "resume_from"):
             value = getattr(self, name)

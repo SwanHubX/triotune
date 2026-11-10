@@ -1,0 +1,102 @@
+# Distill the step-400 GRPO teacher into a fresh Qwen3.5-4B student.
+# Run 200 vanilla OPD updates. No temporal curriculum is applied.
+output_dir: ../../../../../output/webshop-opd/train/vanilla-opd-qwen3.5-4b-teacher-step400-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
+
+data:
+  repo_id: YWZBrandon/webshop-data
+  revision: ce990fff5aee388db2706f07820c578ab68e0453
+  directory: ../../../../../data/webshop-opd/assets
+  local_files_only: true
+  split_protocol: official
+  seed: 42
+  train_epochs: 1
+  eval_limit: 200
+
+environment:
+  source_dir: ../../../../../data/webshop-opd/WebShop
+  seed: 42
+
+trainer:
+  # Start the student from the base model, with no resumed checkpoint.
+  model:
+    name: Qwen/Qwen3.5-4B
+    lora_rank: 32
+  teacher:
+    name: Qwen/Qwen3.5-4B
+    # Sampler checkpoint ckpt_7c56f2uuof26, exported from the step-400 teacher.
+    # The teacher scoring client requires the sampler URI, not a checkpoint ID.
+    model_path: trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400
+  training:
+    batch_size: 16
+    max_steps: 200
+    seed: 42
+  optimizer:
+    learning_rate: 0.000001
+    grad_clip_norm: 1.0
+  checkpoint:
+    save_every: 20
+    state_dir: ../../../../../output/webshop-opd/train/vanilla-opd-qwen3.5-4b-teacher-step400-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/state
+  evaluation:
+    steps: 20
+    before_train: true
+    after_train: true
+  rollout:
+    # AgentRL generates one independent full trajectory for every task.
+    # The OPD behavior sampler fixes training temperature/top-p to 1.0 so its
+    # returned behavior log-probabilities remain valid for the policy update.
+    num_generations: 1
+    max_completion_length: 512
+    max_length: 10752
+    prompt_key: messages
+    add_generation_prompt: true
+    chat_template_kwargs:
+      enable_thinking: false
+    stop: null
+  execution:
+    max_concurrent_sampling: 4
+    max_concurrent_scoring: 32
+  objective:
+    kl_coef: 1.0
+    # Vanilla OPD assigns each sampled token its local teacher/student signal.
+    discount_factor: 0.0
+    importance_ratio_cap: 5.0
+  reporting:
+    report_to: swanlab
+    workspace: pytrio
+    project: webshop-agentrl-TCOD
+    tags: [opd, vanilla-opd, qwen3.5-4b, qwen3.5-4b-grpo-teacher]
+    run_name: vanilla-opd-qwen3.5-4b-teacher-step400-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
+    log_dir: ../../../../../output/webshop-opd/train/vanilla-opd-qwen3.5-4b-teacher-step400-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/metrics
+    logging_step: 1
+
+agent:
+  parser: strict_json
+  renderer: token_append
+  advertise_tools: false
+  template_kwargs:
+    enable_thinking: false
+  export_mode: concat
+  # Synchronous OPD always trains the freshly collected policy version, so its
+  # effective experience staleness is zero. The paper's allowance of two is an
+  # asynchronous scheduler setting and is intentionally not emulated here.
+  async_rollouts: false
+  max_concurrency: 4
+  on_system_failure: raise
+  limits:
+    max_turns: 15
+    max_tokens_per_turn: 512
+    max_generated_tokens: 10240
+    max_context_tokens: 10240
+    sampling_timeout: 120
+    tool_timeout: 60
+    episode_timeout: 1800
+  retry:
+    max_attempts: 2
+    retry_tools: false
+  evaluation:
+    # One independent attempt per task reports Pass@1 only.
+    num_generations: 1
+    seed: 42
+    pass_ks: [1]
+    temperature: 0.4
+    top_p: 1.0
