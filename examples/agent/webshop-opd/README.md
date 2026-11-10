@@ -5,6 +5,27 @@ data preparation in `webshop_env/data_prepare.py`, and simulator requirements
 in `requirements-webshop.txt`. Evaluation and later OPD experiments use these
 local modules.
 
+## Use the shared repository package
+
+The example imports the top-level `triotune/` package from this repository.
+An extra `examples/agent/webshop-opd/triotune/` copy is not required. Both the
+launchers and direct imports of `train` or `webshop_env` select the repository
+package ahead of older installed versions. Keep the example inside this
+repository so its shared package and configuration paths remain available.
+
+To check the import source, run from the repository root:
+
+```bash
+PYTHONPATH=examples/agent/webshop-opd .venv/bin/python -c \
+  'import webshop_env, triotune; print(triotune.__file__)'
+```
+
+The result should end in the repository's `triotune/__init__.py`. If an older
+copy or one of its submodules was already imported in a notebook or another
+long-running process, restart that Python process after removing the copy.
+The example reports the conflicting module and path instead of mixing
+implementations from multiple locations.
+
 ## Install the environment
 
 Use Python 3.12 and Java 11. From the repository root:

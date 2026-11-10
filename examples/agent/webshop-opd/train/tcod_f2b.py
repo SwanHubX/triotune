@@ -1,4 +1,4 @@
-"""Train WebShop TCOD-F2B using the unchanged, isolated Triotune OPD API."""
+"""Train WebShop TCOD-F2B using the shared repository OPD API."""
 
 from __future__ import annotations
 

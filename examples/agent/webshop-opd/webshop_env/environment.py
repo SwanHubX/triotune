@@ -422,7 +422,7 @@ def build_workflow(
     exact_success_alpha: float = 0.0,
     scorer=None,
 ):
-    """Compose the WebShop protocol with the copied Triotune AgentRL runtime."""
+    """Compose the WebShop protocol with the repository AgentRL runtime."""
 
     if scorer is not None and exact_success_alpha != 0.0:
         raise ValueError(

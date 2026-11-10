@@ -1,4 +1,4 @@
-"""Run multi-turn vanilla OPD on the isolated WebShop/Triotune prototype."""
+"""Run multi-turn WebShop OPD through the shared repository package."""
 
 from __future__ import annotations
 
