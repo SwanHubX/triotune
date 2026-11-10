@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ from train.tcod_b2f import (
     prepare_training_rows,
 )
 from train.train_tcod_b2f import prepare_and_train
-from triotune.agentrl import Generation, SamplingSnapshot, current_execution_context
+from triotune.agentrl import AgentContractError, Generation, SamplingSnapshot, current_execution_context
 from triotune.trainer import OPDConfig, OPDTrainer
 
 
@@ -96,10 +97,18 @@ class AdaptiveSampler:
 
 
 class B2FConfigurationTests(unittest.TestCase):
-    def test_qwen38_b2f_config_and_expert_collection_settings(self):
+    def test_grpo_b2f_config_matches_f2b_and_uses_a_fresh_student(self):
         experiment = load_experiment(DEFAULT_CONFIG)
         self.assertEqual(experiment.trainer.model.name, "Qwen/Qwen3.5-4B")
-        self.assertEqual(experiment.trainer.teacher.name, "Qwen/Qwen3.8-27B")
+        self.assertEqual(experiment.trainer.teacher.name, "Qwen/Qwen3.5-4B")
+        self.assertEqual(experiment.trainer.teacher.model_path, "trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400")
+        self.assertIsNone(experiment.trainer.checkpoint.resume_from)
+        from train.tcod_f2b import load_experiment as load_f2b
+        baseline = load_f2b(DEFAULT_CONFIG.with_name("tcod-f2b-grpo-teacher.yaml"))
+        for name in ("model", "teacher", "training", "optimizer", "rollout", "objective", "evaluation", "execution"):
+            self.assertEqual(getattr(experiment.trainer, name), getattr(baseline.trainer, name))
+        self.assertEqual(replace(experiment.agent, log_path=None), replace(baseline.agent, log_path=None))
+        self.assertNotEqual(experiment.output_dir, baseline.output_dir)
         self.assertEqual(experiment.curriculum.k_start, 1)
         self.assertEqual(experiment.curriculum.growth_interval, 4)
         self.assertEqual(experiment.experts.pass_k, 10)
@@ -184,6 +193,38 @@ class B2FExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(limited["status"], "expert_collection_limited")
             collect_mock.assert_awaited_once_with(experiment, max_tasks=4)
             run_mock.assert_not_awaited()
+
+    async def test_failed_or_cancelled_teacher_replay_releases_sessions_before_updates(self):
+        for failure in ("premature_purchase", "cancelled"):
+            with self.subTest(failure=failure):
+                trainer = OPDTrainer("student", "teacher", args=OPDConfig(max_steps=1))
+                pool = ShopPool()
+                experiment = load_experiment(DEFAULT_CONFIG)
+                workflow = build_b2f_workflow(experiment.agent, AgentTokenizer(), pool,
+                                              experiment.curriculum)
+                loop = TCODB2FTrainingLoop(trainer, workflow, config=experiment.agent)
+                original = pool.step
+
+                async def fail(rollout_id, action):
+                    if failure == "cancelled":
+                        raise asyncio.CancelledError()
+                    state = await original(rollout_id, action)
+                    return {**state, "done": True}
+
+                pool.step = fail
+                try:
+                    with self.assertRaises((AgentContractError, asyncio.CancelledError)):
+                        await loop.collect_and_update([{
+                            "task_id": "replay-failure", "goal_index": 0,
+                            "expert_actions": list(ShopPool.actions),
+                        }])
+                    self.assertEqual(trainer.state.global_step, 0)
+                    self.assertFalse(pool.sessions)
+                    self.assertEqual(self.service.training.optim_calls, 0)
+                    self.assertEqual(self.service.teacher.requests, [])
+                finally:
+                    await workflow.close()
+                    await pool.close()
 
     async def test_teacher_prefix_is_replayed_without_opd_gradients(self):
         row = {

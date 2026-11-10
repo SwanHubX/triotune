@@ -72,4 +72,5 @@ smoke-test command. A separate [TCOD-F2B training entry point](train/README.md#t
 adds an expanding rollout-prefix curriculum using the same OPD interfaces,
 using the shared Triotune package and the example-owned WebShop environment.
 The training documentation also includes a TCOD-B2F workflow with resumable
-Pass@10 teacher-expert collection and gradient-free environment-prefix replay.
+Pass@10 expert collection from the GRPO-trained Qwen3.5-4B teacher and
+gradient-free environment-prefix replay into a fresh Qwen3.5-4B student.

@@ -238,75 +238,107 @@ pause/resume lifecycle that preserves the next horizon and sampling seeds.
 These are deterministic fake-service tests; they do not validate remote model
 quality or start a real training job.
 
-## TCOD-B2F with Qwen3.8-27B
+## TCOD-B2F with the GRPO teacher
 
-This checkout contains the B2F replay adapter, launchers, and tests, but is
-missing `collect_tcod_b2f_experts.py`, `train_tcod_b2f.py`, and
-`configs/tcod-b2f-qwen3.8-27b-teacher.yaml`. The B2F commands below describe
-the intended workflow and cannot run until those files are restored. The B2F
-test module also fails to import while the collection module is missing.
+B2F uses the same fixed step-400 GRPO-trained `Qwen/Qwen3.5-4B` teacher
+as the F2B baseline. Its sampler URI is
+`trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400`.
+The student starts from the original `Qwen/Qwen3.5-4B` base model, with no
+student checkpoint loaded. The teacher is used both for expert generation
+and for scoring the student's original action tokens.
 
-B2F requires successful teacher trajectories before student training. The
-author's public WebShop workflow consumes an `actions` field, while its public
-data-generation script only emits task IDs. The intended collection stage,
-`collect_tcod_b2f_experts.py`, samples the fixed Qwen3.8-27B teacher at Pass@10
-and appends one shortest strict success per goal to a resumable JSONL cache.
+[`configs/tcod-b2f-grpo-teacher.yaml`](configs/tcod-b2f-grpo-teacher.yaml)
+keeps the F2B model, LoRA rank, optimizer, loss, evaluation, and rollout settings:
+200 updates, 16 tasks per update, one student trajectory per task, learning
+rate `1e-6`, 15 turns, 512 tokens per response, full 200-task Pass@1 evaluation
+before training and every 20 updates, checkpoints every 20 updates, and seed 42.
+Training uses temperature 1 and evaluation uses temperature 0.4. The
+curriculum is `k=min(1 + completed_steps // 4, 15)`; evaluation always starts
+from reset with the full horizon.
 
-The main training launcher performs expert collection automatically. Validate
-the shared configuration, then start the complete prepare-and-train workflow:
+B2F additionally needs successful teacher trajectories.
+[`collect_tcod_b2f_experts.py`](collect_tcod_b2f_experts.py) samples up to ten
+independent attempts per planned training goal, using the fixed teacher sampler
+without creating a training client. It retains the shortest strict environment
+success with a replayable sequence of successful `webshop` tool calls ending
+in exactly one purchase. Partial purchases, model claims, failed tool actions,
+and infrastructure failures are not expert successes.
+
+The main launcher collects missing experts and then starts student training:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-qwen3.8-27b-teacher.sh --check-config
-bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-qwen3.8-27b-teacher.sh
+bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh --check-config
+bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh
 ```
 
-It resumes the Pass@10 cache, processes every missing task in the planned
-200-update training set, then immediately starts B2F using the retained strict
-successes. For a bounded connectivity and data-format check, collect only a
-small number of previously uncached tasks and stop before student training:
+For a bounded collection check, process at most 16 previously uncached goals
+and exit before student training:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-qwen3.8-27b-teacher.sh --expert-max-tasks 16
+bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh --expert-max-tasks 16
+```
+
+Independent collection is also available:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/collect-tcod-b2f-grpo-teacher.sh --max-tasks 16
 ```
 
 The default cache is
-`data/webshop-opd/tcod-b2f/qwen3.8-27b-experts.jsonl`. Re-running collection
-skips cached goal indexes and continues appending. Failed Pass@10 tasks remain
-absent. Training filters the shuffled WebShop train split to cached successes
-and deterministically cycles that set to fill `max_steps * batch_size`. At
-least 16 successful expert tasks are required by the default batch size.
-The separate `collect-tcod-b2f-qwen3.8-27b-teacher.sh` launcher remains
-available when expert collection should be operated independently.
+`data/webshop-opd/tcod-b2f/grpo-teacher-step400-experts.jsonl`.
+Its `.meta.json` sidecar binds the teacher URI, actual asset hashes, ordered
+goals, environment seed, prompt, generation settings, and full agent limits.
+Changing these settings requires a new cache path. A cache without matching
+metadata is rejected before opening a model client. Concurrent collectors
+using the same path are rejected by a file lock.
 
-[`tcod_b2f.py`](tcod_b2f.py) applies the linear curriculum independently to
-each expert trajectory. For expert length `L` and
-`k = min(1 + completed_steps // 4, 15)`, it executes the first `max(L-k, 0)`
-teacher actions without gradients, then starts the student from the resulting
-WebShop state. The purchase action is never replayed as part of a teacher
-prefix. Only student-generated turns receive teacher log-probabilities and OPD
-gradients. Evaluation bypasses expert replay and starts every task from reset
-with the full 15-turn budget.
+Each completed successful goal atomically replaces the complete cache, so an
+interruption preserves previously acknowledged successes. Re-running collection
+skips cached successes; unsuccessful goals can be retried. Per-goal attempt
+seeds do not shift when collection is resumed or the pending batch changes.
+Keep the cache frozen during student training. Both cache and metadata live
+under ignored `data/`; trajectories and model weights are not packaged or
+committed.
 
-When resuming a student checkpoint, the launcher skips expert collection and
-uses the frozen cache bound into that checkpoint:
+Training filters the shuffled train split to distinct cached successes and
+cycles that set deterministically to fill `max_steps * batch_size`. At least
+one full batch of distinct successful goals is required. Repeated epochs of
+one goal cannot satisfy the default minimum of 16 goals.
+
+[`tcod_b2f.py`](tcod_b2f.py) replays the first `max(L-k, 0)` actions of a
+successful expert path of length `L`, then hands the resulting WebShop state
+to the student. The purchase action is never replayed. The student sees the
+current observation and the two most recent teacher transitions. Teacher
+prefixes and tool observations are context only: only student-generated
+responses receive OPD targets and gradients. Replay and student turns share
+the original 15-turn budget. As in F2B, training includes the final model reply;
+a purchase on the final allowed turn can carry task credit without a
+protocol-complete training success. Evaluation stops at purchase immediately.
+
+Resume uses the frozen cache and skips expert collection:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-qwen3.8-27b-teacher.sh \
+bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh \
   --resume-from output/webshop-opd/train/<run-name>/state/opd-step-00000020.json
 ```
 
-The default uses a fresh Qwen3.5-4B student, fixed Qwen3.8-27B teacher, 200
-updates, batch size 16, learning rate 1e-6, checkpoint/evaluation interval 20,
-and Pass@1 evaluation over 200 tasks. Metrics include `curriculum/k`, expert
-length, teacher-prefix mean/min/max, and collection attempts. Complete
-checkpoints bind the filtered expert-enriched training rows, so changing the
-expert cache after a run has started intentionally makes resume validation
-fail. Keep a frozen cache for the duration of one experiment.
+Complete manifests retain the curriculum, data cursor, seed cursor, optimizer,
+and update history. Changing expert actions or the curriculum invalidates a
+resume. Unique run directories allow pause and resume within the same second.
+Student sampling timeouts and teacher HTTP 503 responses use the same
+pre-update, same-seed retry as F2B; other teacher, tool, and replay errors stop
+the update. Cancellation closes sessions and preserves completed cache writes.
+Metrics include `curriculum/k`, expert length, teacher-prefix mean/min/max,
+and collection attempts.
 
-Student sampling timeouts and teacher HTTP 503 errors use the same pre-update,
-same-seed transaction retry as F2B. Tool, expert replay, alignment, and other
-teacher errors remain fail-fast. The implementation lives in `train/`; it does
-not modify the shared Triotune package or `webshop_env/`.
+Offline verification covers actual collection through the AgentRL tool loop,
+strict success filtering, model identity and cache checks, failure and
+cancellation cleanup, atomic cache replacement, duplicate goals, OPD updates,
+evaluation, checkpoints, pause and resume:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/test-agent-opd.sh
+```
 
 ## Train a GRPO teacher
 

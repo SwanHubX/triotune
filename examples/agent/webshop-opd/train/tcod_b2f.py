@@ -14,6 +14,7 @@ from itertools import cycle, islice
 from pathlib import Path
 from statistics import mean
 from typing import Any
+from uuid import uuid4
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = EXAMPLE_ROOT.parents[2]
@@ -50,9 +51,23 @@ from train.vanilla_opd import (
 )
 
 DEFAULT_CONFIG = (
-    Path(__file__).with_name("configs") / "tcod-b2f-qwen3.8-27b-teacher.yaml"
+    Path(__file__).with_name("configs") / "tcod-b2f-grpo-teacher.yaml"
 )
 ACTION_PATTERN = re.compile(r"^(search|click)\[[^\[\]\n]+\]$")
+
+
+def validate_expert_actions(actions, *, max_turns=None):
+    """Accept only replayable paths ending in exactly one purchase."""
+    if (
+        not isinstance(actions, list)
+        or not actions
+        or any(not isinstance(action, str) or not ACTION_PATTERN.fullmatch(action) for action in actions)
+        or actions[-1].lower() != "click[buy now]"
+        or any(action.lower() == "click[buy now]" for action in actions[:-1])
+        or (max_turns is not None and len(actions) > max_turns)
+    ):
+        raise ValueError("Expert actions must end in one purchase within the turn budget.")
+    return tuple(actions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +148,7 @@ def load_experiment(
     )
 
 
-def load_expert_actions(path: Path) -> dict[int, tuple[str, ...]]:
+def load_expert_actions(path: Path, *, allow_empty=False) -> dict[int, tuple[str, ...]]:
     """Load one successful, nonterminal-prefix-safe action list per goal."""
 
     if not path.is_file():
@@ -148,21 +163,19 @@ def load_expert_actions(path: Path) -> dict[int, tuple[str, ...]]:
             record = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError(f"Invalid expert JSONL line {line_number}: {error}") from error
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid expert record at line {line_number}.")
         goal_index = record.get("goal_index")
-        actions = record.get("actions")
         if (
             type(goal_index) is not int
             or goal_index < 0
-            or not isinstance(actions, list)
-            or not actions
-            or any(not isinstance(action, str) or not ACTION_PATTERN.fullmatch(action) for action in actions)
             or record.get("success") is not True
         ):
             raise ValueError(f"Invalid successful expert record at line {line_number}.")
         if goal_index in experts:
             raise ValueError(f"Duplicate expert goal_index {goal_index}.")
-        experts[goal_index] = tuple(actions)
-    if not experts:
+        experts[goal_index] = validate_expert_actions(record.get("actions"))
+    if not experts and not allow_empty:
         raise ValueError("TCOD-B2F expert cache contains no successful trajectories.")
     return experts
 
@@ -175,11 +188,17 @@ def prepare_training_rows(
     """Retain teacher-success tasks and deterministically fill the update plan."""
 
     experts = load_expert_actions(experiment.experts.path)
-    eligible = [
-        {**row, "expert_actions": list(experts[row["goal_index"]])}
-        for row in train_rows
-        if row["goal_index"] in experts
-    ]
+    for actions in experts.values():
+        validate_expert_actions(list(actions), max_turns=experiment.agent.limits.max_turns)
+    # Epoch traversal must not turn repeated copies of one goal into a full
+    # batch of supposedly distinct expert tasks.
+    seen = set()
+    eligible = []
+    for row in train_rows:
+        goal = row["goal_index"]
+        if goal in experts and goal not in seen:
+            seen.add(goal)
+            eligible.append({**row, "expert_actions": list(experts[goal])})
     if len(eligible) < experiment.trainer.batch_size:
         raise ValueError(
             "TCOD-B2F needs at least one full batch of successful expert tasks; "
@@ -233,8 +252,7 @@ class B2FShoppingEpisodeExecutor:
             return await self.executor.run(row, snapshot, **kwargs)
         context = kwargs["context"]
         actions = row.get("expert_actions")
-        if not isinstance(actions, list) or not actions:
-            raise AgentContractError("B2F training row is missing expert_actions.")
+        validate_expert_actions(actions, max_turns=self.limits.max_turns)
         k = self.curriculum.horizon(self.completed_steps, self.limits.max_turns)
         prefix_length = max(0, len(actions) - k)
         # Never replay the purchase itself. With k>=1 this also follows directly
@@ -334,7 +352,9 @@ class TCODB2FTrainingLoop(AgentOPDTrainingLoop):
                 await asyncio.sleep(self.config.retry.delay(attempt))
         if update is None:
             raise RuntimeError("TCOD-B2F collection retry produced no update.")
-        metadata = [episode.export_metadata for episode in update.batch.episodes]
+        metadata = [
+            episode.export_metadata for episode in self._accepted_episodes(update.batch)
+        ]
         prefix_lengths = [int(item["teacher_prefix_length"]) for item in metadata]
         expert_lengths = [int(item["expert_length"]) for item in metadata]
         metrics = {
@@ -374,7 +394,7 @@ async def run(
         stop_after_step=stop_after_step,
         loop_class=TCODB2FTrainingLoop,
         algorithm="agent_tcod_b2f",
-        run_label="tcod-b2f",
+        run_label=f"tcod-b2f-{uuid4().hex[:8]}",
         workflow_factory=lambda config, tokenizer, pool: build_b2f_workflow(
             config,
             tokenizer,
