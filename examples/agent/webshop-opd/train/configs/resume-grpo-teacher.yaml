@@ -1,0 +1,116 @@
+# Precision phase: continue the completed dense-reward GRPO teacher from step
+# 200 for 200 additional optimizer updates, reaching total step 400.
+output_dir: ../../../../../output/webshop-opd/train/grpo-teacher-precision-s200-to400-b8-g8-seed42
+
+data:
+  repo_id: YWZBrandon/webshop-data
+  revision: ce990fff5aee388db2706f07820c578ab68e0453
+  directory: ../../../../../data/webshop-opd/assets
+  local_files_only: true
+  split_protocol: official
+  seed: 42
+  train_epochs: 1
+  eval_limit: 200
+
+environment:
+  source_dir: ../../../../../data/webshop-opd/WebShop
+  seed: 42
+
+# PyTRIO Train checkpoint saved by the completed dense-reward GRPO run.
+# global_step reconstructs local data and sampling progress because a remote
+# checkpoint URI does not contain the local AgentRL manifest.
+continuation:
+  checkpoint: trio://run_n9e12csgxlof/weights/ppo-step-00000200
+  global_step: 200
+  additional_steps: 200
+
+# Evaluation always keeps the native WebShop task score. These values apply
+# only to precision-phase training trajectories.
+reward:
+  mode: precision
+  exact_purchase_reward: 1.0
+  # Any incorrect purchase is worse than no purchase. The additional mismatch
+  # penalty uses 1 - task_score because WebShop exposes one aggregate score.
+  incorrect_purchase_base: -0.3
+  mismatch_penalty: 0.4
+  no_purchase_reward: -0.2
+  invalid_action_reward: -0.4
+
+trainer:
+  # These model, rollout, optimizer, evaluation, and Agent settings deliberately
+  # match the source run whose remote optimizer is loaded above.
+  model:
+    name: Qwen/Qwen3.5-4B
+    lora_rank: 32
+  training:
+    batch_size: 8
+    seed: 42
+  rollout:
+    num_generations: 8
+    max_tokens: 7680
+    temperature: 1.0
+    top_p: 1.0
+    prompt_key: messages
+    chat_template_kwargs:
+      enable_thinking: false
+  actor:
+    gae_timestep_unit: turn
+    kl_ctl: 0.0
+    reference_kl_coef: 0.01
+    loss_backend: custom
+    dynamic_sampling: false
+    ppo_n_minibatches: 1
+    update_epochs: 1
+  optimizer:
+    learning_rate: 0.000001
+    grad_clip_norm: 1.0
+  checkpoint:
+    # New local manifests are written here after the remote checkpoint has been
+    # loaded. They can provide exact local recovery for this precision phase.
+    state_dir: ../../../../../output/webshop-opd/train/grpo-teacher-precision-s200-to400-b8-g8-seed42/state
+    save_every: 20
+    sampler:
+      enabled: true
+  evaluation:
+    # Keep the source identity. The entry point explicitly evaluates restored
+    # step 200, then the loop evaluates every 20 steps through final step 400.
+    steps: 20
+    before_train: true
+    after_train: true
+    batch_size: 8
+  reporting:
+    report_to: swanlab
+    workspace: pytrio
+    project: webshop-agentrl-TCOD
+    tags: [grpo, resume, precision-reward, step200, step400]
+    run_name: grpo-teacher-precision-s200-to400-b8-g8-seed42
+    log_dir: ../../../../../output/webshop-opd/train/grpo-teacher-precision-s200-to400-b8-g8-seed42/metrics
+    logging_step: 1
+
+agent:
+  parser: strict_json
+  renderer: token_append
+  advertise_tools: false
+  template_kwargs:
+    enable_thinking: false
+  export_mode: concat
+  async_rollouts: false
+  max_concurrency: 4
+  on_system_failure: raise
+  limits:
+    max_turns: 15
+    max_tokens_per_turn: 512
+    max_generated_tokens: 7680
+    max_context_tokens: 10240
+    sampling_timeout: 120
+    tool_timeout: 60
+    episode_timeout: 1800
+  retry:
+    max_attempts: 2
+    retry_tools: false
+  evaluation:
+    num_generations: 1
+    seed: 42
+    pass_ks: [1]
+    temperature: 0.4
+    top_p: 1.0

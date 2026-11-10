@@ -1,0 +1,33 @@
+# Match student.yaml except for policy identity and output directory.
+role: teacher
+model:
+  name: Qwen/Qwen3.8-27B
+data:
+  repo_id: YWZBrandon/webshop-data
+  revision: ce990fff5aee388db2706f07820c578ab68e0453
+  directory: ../../../../../data/webshop-opd/assets
+  local_files_only: true
+  split_protocol: official
+  seed: 42
+  train_epochs: 1
+  eval_limit: 200
+environment:
+  source_dir: ../../../../../data/webshop-opd/WebShop
+  seed: 42
+evaluation:
+  # 1: one attempt and Pass@1; 4: four attempts and Pass@4.
+  pass_k: 4
+  max_turns: 15
+  max_tokens_per_turn: 512
+  max_context_tokens: 10240
+  temperature: 0.4
+  top_p: 1.0
+  enable_thinking: false
+  seed: 42
+  max_concurrency: 4
+  # Print every N completed tasks; include all attempts of the selected task.
+  rollout_log_interval: 20
+  sampling_timeout: 120
+  tool_timeout: 60
+  episode_timeout: 1800
+output_dir: ../../../../../output/webshop-opd/eval/teacher

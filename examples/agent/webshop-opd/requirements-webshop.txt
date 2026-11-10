@@ -1,0 +1,18 @@
+# Install only dependencies needed by the WebShop text simulator.
+# Keep the TrioTune project dependencies and lock file unchanged.
+# The environment calls the Gym API directly without step or reset wrappers.
+# Pyserini 0.22.1 requires Java 11; the spaCy English model is included below.
+# The text environment imports torch even when images are disabled.
+torch>=2.3
+beautifulsoup4>=4.12,<5
+cleantext==1.1.4
+Flask>=2.2,<4
+faiss-cpu>=1.8,<2
+gym==0.26.2
+pyserini==0.22.1
+rank-bm25==0.2.2
+rich>=12,<15
+selenium>=4.2,<5
+spacy>=3.8,<4
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+thefuzz>=0.19,<1

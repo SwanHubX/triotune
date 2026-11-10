@@ -358,6 +358,12 @@ class RealReportingTests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(result.returncode, 0, str(script) + result.stderr)
+            # Simulate an already imported experimental copy explicitly. The
+            # example no longer ships one, and editable installs may otherwise
+            # resolve this import to the valid repository package.
+            foreign_package = Path(directory) / "triotune"
+            foreign_package.mkdir()
+            (foreign_package / "__init__.py").write_text("")
             code = (
                 "import triotune, runpy\n"
                 f"runpy.run_path({str(example / 'train/vanilla_opd.py')!r})\n"
@@ -365,7 +371,7 @@ class RealReportingTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, "-P", "-c", code],
                 cwd=directory,
-                env={**os.environ, "PYTHONPATH": str(example)},
+                env={**os.environ, "PYTHONPATH": f"{directory}:{example}"},
                 capture_output=True,
                 text=True,
                 timeout=30,
