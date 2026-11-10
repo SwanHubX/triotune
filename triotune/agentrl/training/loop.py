@@ -25,7 +25,11 @@ from ...utils.checkpoint import training_limit
 from ...utils.dataloader import iter_batches, num_batches
 from ..config import AgentConfig
 from ..rollout.workflow import AgentRolloutBatch, AgentRolloutWorkflow
-from ..runtime.sampling import SamplingSnapshot
+from ..runtime.sampling import (
+    SamplingSnapshot,
+    create_sampling_snapshot,
+    validate_training_snapshot,
+)
 from ..types import (
     AgentBatchAdvantageProvider,
     AgentBatchAdvantages,
@@ -88,14 +92,13 @@ class AgentTrainingLoop:
         """
         self.trainer, self.workflow = trainer, workflow
         self.config = config or AgentConfig()
+        self._custom_snapshot_factory = snapshot_factory is not None
         self.snapshot_factory = snapshot_factory or self._snapshot
         if batch_advantage_provider is not None and not callable(
             getattr(batch_advantage_provider, "advantages", None)
         ):
             raise TypeError("batch_advantage_provider must implement advantages().")
-        validate_trainer = getattr(
-            batch_advantage_provider, "validate_trainer", None
-        )
+        validate_trainer = getattr(batch_advantage_provider, "validate_trainer", None)
         if callable(validate_trainer):
             # Algorithm-specific providers can reject trainer settings that
             # would otherwise be silently ignored by a replacement advantage.
@@ -111,10 +114,14 @@ class AgentTrainingLoop:
         self.last_train_snapshot: SamplingSnapshot | None = None
         if trainer._checkpoint.enabled:
             if self.config.async_rollouts or snapshot_factory is not None:
-                raise ValueError("Complete agent checkpoints require synchronous rollouts and the trainer snapshot factory.")
+                raise ValueError(
+                    "Complete agent checkpoints require synchronous rollouts and the trainer snapshot factory."
+                )
             identity = self.config.to_dict()
             identity.pop("log_path", None)
-            identity["executor"] = f"{type(workflow.runner).__module__}.{type(workflow.runner).__qualname__}"
+            identity["executor"] = (
+                f"{type(workflow.runner).__module__}.{type(workflow.runner).__qualname__}"
+            )
             provider_identity = getattr(
                 batch_advantage_provider, "checkpoint_identity", None
             )
@@ -137,8 +144,12 @@ class AgentTrainingLoop:
 
     def checkpoint_state(self):
         """Keep sampler/evaluation progress without persisting completed turns."""
-        return {"seed_offset": self._seed_offset, "last_eval_step": self._last_eval_step,
-                "baseline": self._baseline_episodes, "updates": self.update_history}
+        return {
+            "seed_offset": self._seed_offset,
+            "last_eval_step": self._last_eval_step,
+            "baseline": self._baseline_episodes,
+            "updates": self.update_history,
+        }
 
     def restore_checkpoint_state(self, state):
         """Rejoin candidate seed ranges and paired evaluation after optimizer load."""
@@ -147,8 +158,13 @@ class AgentTrainingLoop:
         self._baseline_episodes = state["baseline"]
         self.update_history = state["updates"]
 
-    async def _snapshot(self):
-        return await self.trainer.create_sampling_snapshot(stop=self.config.stop)
+    async def _snapshot(self, *, temperature=1.0, top_p=1.0):
+        return await create_sampling_snapshot(
+            self.trainer,
+            stop=self.config.stop,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
     async def evaluate(
         self, dataset: Iterable[Mapping[str, Any]] | None = None
@@ -168,7 +184,14 @@ class AgentTrainingLoop:
         n_samples = self.config.evaluation.num_generations or config.num_generations
         if max(self.config.evaluation.pass_ks) > n_samples:
             raise ValueError("Evaluation pass_k must not exceed num_generations.")
-        snapshot = await self.snapshot_factory()
+        snapshot = (
+            await self.snapshot_factory()
+            if self._custom_snapshot_factory
+            else await self._snapshot(
+                temperature=self.config.evaluation.temperature,
+                top_p=self.config.evaluation.top_p,
+            )
+        )
         # Hold one policy fixed across all evaluation batches so the aggregate
         # describes a single model state, even when the dataset is streamed.
         episodes, trajectories, exports, groups, branch_groups = [], [], [], {}, {}
@@ -227,10 +250,18 @@ class AgentTrainingLoop:
             self._baseline_episodes = paired_task_summary(episodes)
         else:
             metrics.update(paired_task_metrics(self._baseline_episodes, episodes))
-        trainer._eval_sample_input_tokens += int(metrics["eval/agent/sample_input_tokens"])
-        trainer._eval_sample_output_tokens += int(metrics["eval/agent/sample_output_tokens"])
-        metrics["usage/eval_sample_input_tokens_total"] = float(trainer._eval_sample_input_tokens)
-        metrics["usage/eval_sample_output_tokens_total"] = float(trainer._eval_sample_output_tokens)
+        trainer._eval_sample_input_tokens += int(
+            metrics["eval/agent/sample_input_tokens"]
+        )
+        trainer._eval_sample_output_tokens += int(
+            metrics["eval/agent/sample_output_tokens"]
+        )
+        metrics["usage/eval_sample_input_tokens_total"] = float(
+            trainer._eval_sample_input_tokens
+        )
+        metrics["usage/eval_sample_output_tokens_total"] = float(
+            trainer._eval_sample_output_tokens
+        )
         await trainer.publish_metrics(metrics)
         self._last_eval_step = trainer.state.global_step
         return metrics
@@ -262,6 +293,7 @@ class AgentTrainingLoop:
         """
         config = self.trainer.args
         snapshot = snapshot or await self.snapshot_factory()
+        validate_training_snapshot(snapshot)
         episodes, accepted, exports, groups, branch_groups = [], [], [], {}, {}
         self.last_train_snapshot = snapshot
         group_count, empty_batches, dropped, refills = 0, 0, 0, 0
@@ -315,6 +347,7 @@ class AgentTrainingLoop:
     async def _update(self, batch, snapshot, progress, *, max_staleness=0):
         """Consume one completed batch and record its exact sampling provenance."""
         trainer = self.trainer
+        validate_training_snapshot(snapshot)
         self.last_train_snapshot = snapshot
         if self.batch_advantage_provider is not None:
             await self._add_batch_advantages(batch)
@@ -341,10 +374,24 @@ class AgentTrainingLoop:
         )
         batch_metrics = batch.metrics()
         trainer._sample_input_tokens += int(batch_metrics["agent/sample_input_tokens"])
-        trainer._sample_output_tokens += int(batch_metrics["agent/sample_output_tokens"])
-        batch_metrics["usage/sample_input_tokens_total"] = float(trainer._sample_input_tokens)
-        batch_metrics["usage/sample_output_tokens_total"] = float(trainer._sample_output_tokens)
+        trainer._sample_output_tokens += int(
+            batch_metrics["agent/sample_output_tokens"]
+        )
+        batch_metrics["usage/sample_input_tokens_total"] = float(
+            trainer._sample_input_tokens
+        )
+        batch_metrics["usage/sample_output_tokens_total"] = float(
+            trainer._sample_output_tokens
+        )
         await trainer.publish_metrics(batch_metrics)
+        progress.set_postfix(
+            {name: f"{value:.4f}" for name, value in {
+                "loss": metrics.get("train/loss", 0.0),
+                "reward": batch_metrics["agent/reward_mean"],
+                "success": batch_metrics["agent/success_rate"],
+            }.items()},
+            refresh=False,
+        )
         progress.update(1)
         if (
             trainer.eval_dataset is not None
@@ -353,6 +400,9 @@ class AgentTrainingLoop:
         ):
             await self.evaluate()
         trainer._checkpoint.publish(trainer)
+
+        if trainer._sampler_checkpoint.due(trainer.state.global_step):
+            await trainer.save_sampler_checkpoint_async()
 
     async def _add_batch_advantages(self, batch: AgentRolloutBatch) -> None:
         """Validate and attach one provider's batch-level advantages.
@@ -539,10 +589,7 @@ class AgentTrainingLoop:
                 desc="Agent PPO train",
                 unit="step",
             ) as progress:
-                while (
-                    limit is None
-                    or trainer.state.global_step < limit
-                ):
+                while limit is None or trainer.state.global_step < limit:
                     if self.config.async_rollouts:
                         await self._train_overlapped(rows, progress)
                         break
@@ -570,6 +617,11 @@ class AgentTrainingLoop:
             ):
                 # A periodic evaluation may already cover the final weights.
                 await self.evaluate()
+            if not paused and trainer._sampler_checkpoint.due(
+                trainer.state.global_step, final=True
+            ):
+                trainer._checkpoint.publish(trainer)
+                await trainer.save_sampler_checkpoint_async()
             trainer._checkpoint.publish(trainer)
         except BaseException as exc:
             # Preserve cancellation and the original training exception even

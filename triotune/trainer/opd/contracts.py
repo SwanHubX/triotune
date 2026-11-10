@@ -266,6 +266,7 @@ class OPDState:
     data_cursor: int = 0
     optimizer_steps: int = 0
     checkpoint_manifest_path: str | None = None
+    sampler_checkpoint_path: str | None = None
 
 
 @dataclass(slots=True)

@@ -3,6 +3,7 @@
 from .cli_args import (
     BaseTrainerConfig,
     CheckpointConfig,
+    SamplerCheckpointConfig,
     DatasetConfig,
     DPOConfig,
     DPODataConfig,
@@ -57,6 +58,7 @@ __all__ = [
     "POLICY_LOSS_FNS",
     "BaseTrainerConfig",
     "CheckpointConfig",
+    "SamplerCheckpointConfig",
     "DatasetConfig",
     "BuiltinObjective",
     "BuiltinPyTrioObjective",

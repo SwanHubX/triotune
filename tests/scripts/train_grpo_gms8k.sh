@@ -4,5 +4,5 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-exec uv run python triotune/recipes/train_grpo.py --rebuild-data \
-  --config triotune/configs/grpo_gms8k.yaml "$@"
+exec uv run python tests/recipes/train_grpo.py --rebuild-data \
+  --config tests/configs/grpo_gms8k.yaml "$@"

@@ -3,7 +3,7 @@
 [中文说明](README_CN.md) | [完整训练文档](../../docs/agenrl/README.md)
 
 The triotune.agentrl package connects a tool-using agent to the existing
-PPO-family trainer. PyTRIO owns model sampling, optimization, metrics, and
+PPO-family trainer and synchronous multi-turn OPD. PyTRIO owns model sampling, optimization, metrics, and
 checkpoint storage; this package owns the episode protocol, tools, scoring, and
 exact-token trajectory export.
 
@@ -58,7 +58,12 @@ compaction, policy age, and group filtering in
 ownership, replay, recovery, and third-party forwarding are documented in
 [agentrl_openai.md](../../docs/agenrl/agentrl_openai.md).
 
-Sampling uses temperature 1 and top-p 1 to preserve the PPO log-probability
-contract. Begin with synchronous collection and a fixed snapshot; enable
+Training sampling uses temperature 1 and top-p 1 to preserve the PPO log-probability
+contract. Evaluation can set `AgentConfig(evaluation={"temperature": 0.4})`;
+these snapshots are rejected at training collection and update boundaries.
+`AgentOPDTrainingLoop` provides synchronous turn-level teacher distillation;
+environment rewards remain diagnostic metrics. Sampler retention and legacy
+checkpoint compatibility are described in the [package guide](../README.md).
+Begin with synchronous collection and a fixed snapshot; enable
 bounded asynchronous collection only after the synchronous workflow passes its
 tokenizer and probe checks.
