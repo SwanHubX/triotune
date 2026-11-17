@@ -69,7 +69,7 @@ def load_experiment(path: Path, *, steps: int | None = None) -> Experiment:
         trainer_values.setdefault("training", {})["max_steps"] = steps
     for section, names in (
         ("reporting", ("log_dir",)),
-        ("checkpoint", ("state_dir", "resume_from")),
+        ("checkpoint", ("state_dir",)),
     ):
         settings = trainer_values.get(section, {})
         for name in names:
@@ -137,7 +137,7 @@ def write_report(output: Path, report: dict[str, Any]) -> Path:
     return path
 
 
-async def run(experiment: Experiment, *, stop_after_step: int | None = None) -> dict:
+async def run(experiment: Experiment) -> dict:
     """Own the WebShop catalog around one complete GRPO training lifecycle."""
 
     started = time.perf_counter()
@@ -197,7 +197,7 @@ async def run(experiment: Experiment, *, stop_after_step: int | None = None) -> 
         )
         loop = WebShopMetricsAgentTrainingLoop(trainer, workflow, config=agent)
         loop_owns_cleanup = True
-        state = await loop.train(stop_after_step=stop_after_step)
+        state = await loop.train()
         report.update(
             status="completed",
             checkpoint=state.checkpoint_path,
@@ -235,7 +235,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=int, help="Override total training steps.")
-    parser.add_argument("--stop-after-step", type=int)
     parser.add_argument(
         "--check-config",
         action="store_true",
@@ -246,7 +245,7 @@ def main() -> None:
     if args.check_config:
         print(json.dumps(asdict(experiment), indent=2, default=str))
         return
-    asyncio.run(run(experiment, stop_after_step=args.stop_after_step))
+    asyncio.run(run(experiment))
 
 
 if __name__ == "__main__":

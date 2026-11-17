@@ -19,10 +19,12 @@ curriculum:
   growth_interval: 4
 
 experts:
-  path: ../../../../../data/webshop-opd/tcod-b2f/grpo-teacher-step400-experts.jsonl
-  pass_k: 10
+  path: ../../../../../data/webshop-opd/tcod-b2f/grpo-teacher-ckpt_7c56f2uuof26-p2-b1-experts.jsonl
+  sampler_checkpoint_id: ckpt_7c56f2uuof26
+  train_checkpoint_id: ckpt_wth5sxffdght
+  pass_k: 2
   temperature: 1.0
-  batch_size: 4
+  batch_size: 1
   seed: 42
 
 environment:
@@ -30,14 +32,14 @@ environment:
   seed: 42
 
 trainer:
-  # Start the student from the base model, with no resumed checkpoint.
+  # Start the student from the base model.
   model:
     name: Qwen/Qwen3.5-4B
     lora_rank: 32
   teacher:
     name: Qwen/Qwen3.5-4B
-    # Sampler checkpoint ckpt_7c56f2uuof26, exported from the step-400 teacher.
-    # The teacher scoring client requires the sampler URI, not a checkpoint ID.
+    # Sampler checkpoint ID: ckpt_7c56f2uuof26. The scoring client requires
+    # its full sampler URI; a bare ID or Train checkpoint is not a model_path.
     model_path: trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400
   training:
     batch_size: 16

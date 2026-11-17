@@ -23,7 +23,7 @@ environment:
   seed: 42
 
 trainer:
-  # Start the student from the base model, with no resumed checkpoint.
+  # Start the student from the base model.
   model:
     name: Qwen/Qwen3.5-4B
     lora_rank: 32

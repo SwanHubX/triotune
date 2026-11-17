@@ -41,7 +41,7 @@ class CurriculumConfig:
 
     The first update has completed_steps=0, matching the reference WebShop
     implementation's batch-index convention. The schedule is independent of
-    max_steps, so extending or resuming a run never restarts its curriculum.
+    max_steps.
     """
 
     k_start: int = 1
@@ -64,10 +64,9 @@ class CurriculumConfig:
 class TCODAgentConfig(AgentConfig):
     """Include application-owned curriculum settings in checkpoint identity.
 
-    AgentConfig.to_dict() serializes dataclass fields, so the existing Agent
-    OPD checkpoint binding also validates this schedule on resume. The fixed
-    limits describe evaluation and the maximum training horizon, never the
-    temporary prefix of an individual update.
+    AgentConfig.to_dict() serializes dataclass fields for checkpoint auditing.
+    The fixed limits describe evaluation and the maximum training horizon,
+    never the temporary prefix of an individual update.
     """
 
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
@@ -88,7 +87,6 @@ def load_experiment(
     path: Path,
     *,
     steps: int | None = None,
-    resume_from: Path | None = None,
 ) -> Experiment:
     """Validate the schedule and existing OPD settings without remote calls."""
 
@@ -101,20 +99,6 @@ def load_experiment(
         values, root=path.resolve().parent, steps=steps
     )
     agent = TCODAgentConfig(**asdict(experiment.agent), curriculum=curriculum)
-    if resume_from is not None:
-        manifest = resume_from.expanduser()
-        if not manifest.is_absolute():
-            manifest = (Path.cwd() / manifest).resolve()
-        if not manifest.is_file():
-            raise ValueError(f"Resume checkpoint manifest does not exist: {manifest}")
-        trainer = replace(
-            experiment.trainer,
-            checkpoint=replace(
-                experiment.trainer.checkpoint,
-                resume_from=str(manifest),
-            ),
-        )
-        experiment = replace(experiment, trainer=trainer)
     return replace(experiment, agent=agent)
 
 
@@ -246,14 +230,13 @@ class TCODF2BTrainingLoop(AgentOPDTrainingLoop):
         return update
 
 
-async def run(experiment: Experiment, *, stop_after_step: int | None = None) -> dict:
+async def run(experiment: Experiment) -> dict:
     """Use the shared WebShop resource/report lifecycle with the F2B loop."""
 
     if not isinstance(experiment.agent, TCODAgentConfig):
         raise TypeError("TCOD-F2B requires a curriculum experiment.")
     return await run_opd(
         experiment,
-        stop_after_step=stop_after_step,
         loop_class=TCODF2BTrainingLoop,
         algorithm="agent_tcod_f2b",
         run_label="tcod-f2b",
@@ -264,12 +247,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=int, help="Override total training updates.")
-    parser.add_argument("--stop-after-step", type=int)
-    parser.add_argument(
-        "--resume-from",
-        type=Path,
-        help="Resume from a complete local checkpoint manifest.",
-    )
     parser.add_argument(
         "--check-config",
         action="store_true",
@@ -279,12 +256,11 @@ def main() -> None:
     experiment = load_experiment(
         args.config,
         steps=args.steps,
-        resume_from=args.resume_from,
     )
     if args.check_config:
         print(json.dumps(asdict(experiment), indent=2, default=str))
         return
-    asyncio.run(run(experiment, stop_after_step=args.stop_after_step))
+    asyncio.run(run(experiment))
 
 
 if __name__ == "__main__":

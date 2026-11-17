@@ -5,8 +5,6 @@ The transport is local; optimizer updates use the existing Torch CPU fixture.
 """
 
 import asyncio
-import json
-import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -21,7 +19,6 @@ from triotune.agentrl import AgentOPDTrainingLoop, AgentTrainingLoop
 from triotune.api import CheckpointConfig, SamplerCheckpointConfig
 from triotune.trainer import DPOConfig, DPOTrainer, OPDConfig, OPDTrainer
 from triotune.trainer import PPOConfig, PPOTrainer, SFTConfig, SFTTrainer
-from triotune.utils.checkpoint import load_training_checkpoint
 from triotune.utils.config import load_yaml_config
 from triotune.utils.sampler_checkpoint import SamplerCheckpoint
 from test_ppo_family import Future
@@ -194,28 +191,6 @@ class TrainingSmokeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("/sampler/", state.sampler_checkpoint_path)
                 if kind == "dpo":
                     self.assertEqual(trainer.save_sampler_checkpoint(), state.sampler_checkpoint_path)
-
-    async def test_pause_resume_and_old_manifests_keep_train_separate(self):
-        for kind in ("sft", "dpo", "opd", "grpo"):
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
-                service = ExportService()
-                with patch("pytrio.ServiceClient", return_value=service):
-                    args = config(kind, state_dir=directory)
-                    head = trainer_for(kind, args, rows(kind))
-                    method = head.train_async if kind in ("dpo", "opd") else head.train
-                    await method(stop_after_step=1)
-                    self.assertEqual(service.exports, [])
-                    # Simulate an existing manifest written before Sampler metadata.
-                    path = Path(head.state.checkpoint_manifest_path)
-                    payload = json.loads(path.read_text())
-                    payload["state"].pop("sampler_checkpoint_path", None)
-                    path.write_text(json.dumps(payload))
-                    self.assertEqual(load_training_checkpoint(path)["state"]["global_step"], 1)
-                    resumed = trainer_for(kind, config(kind, state_dir=directory, resume_from=str(path)), rows(kind))
-                    state = await train(resumed)
-                self.assertEqual([e["step"] for e in service.exports], [3])
-                self.assertEqual(load_training_checkpoint(state.checkpoint_manifest_path)["state"]["sampler_checkpoint_path"],
-                                 state.sampler_checkpoint_path)
 
     async def test_export_failure_preserves_train_checkpoint(self):
         for kind in ("sft", "dpo", "opd", "grpo"):

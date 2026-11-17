@@ -83,7 +83,7 @@ def experiment_from_settings(
         trainer_values.setdefault("training", {})["max_steps"] = steps
     for section, names in (
         ("reporting", ("log_dir",)),
-        ("checkpoint", ("state_dir", "resume_from")),
+        ("checkpoint", ("state_dir",)),
     ):
         settings = trainer_values.get(section, {})
         for name in names:
@@ -138,7 +138,6 @@ def write_report(output: Path, report: dict[str, Any]) -> Path:
 async def run(
     experiment: Experiment,
     *,
-    stop_after_step: int | None = None,
     loop_class: type[AgentOPDTrainingLoop] = AgentOPDTrainingLoop,
     algorithm: str = "agent_vanilla_opd",
     run_label: str = "vanilla-opd",
@@ -211,7 +210,7 @@ async def run(
             config=agent,
         )
         loop_owns_cleanup = True
-        state = await loop.train(stop_after_step=stop_after_step)
+        state = await loop.train()
         report.update(
             status="completed",
             checkpoint=state.checkpoint_path,
@@ -251,11 +250,6 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=int, help="Override total training steps.")
     parser.add_argument(
-        "--stop-after-step",
-        type=int,
-        help="Pause cleanly after this global step for checkpoint testing.",
-    )
-    parser.add_argument(
         "--check-config",
         action="store_true",
         help="Validate configuration without opening WebShop or PyTRIO.",
@@ -265,7 +259,7 @@ def main() -> None:
     if args.check_config:
         print(json.dumps(asdict(experiment), indent=2, default=str))
         return
-    asyncio.run(run(experiment, stop_after_step=args.stop_after_step))
+    asyncio.run(run(experiment))
 
 
 if __name__ == "__main__":

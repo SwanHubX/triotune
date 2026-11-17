@@ -15,7 +15,6 @@ from test_opd_trainer import _Service
 from train.collect_tcod_b2f_experts import episode_actions
 from train.tcod_b2f import (
     DEFAULT_CONFIG,
-    ExpertConfig,
     TCODB2FTrainingLoop,
     build_b2f_workflow,
     load_experiment,
@@ -102,7 +101,12 @@ class B2FConfigurationTests(unittest.TestCase):
         self.assertEqual(experiment.trainer.model.name, "Qwen/Qwen3.5-4B")
         self.assertEqual(experiment.trainer.teacher.name, "Qwen/Qwen3.5-4B")
         self.assertEqual(experiment.trainer.teacher.model_path, "trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400")
-        self.assertIsNone(experiment.trainer.checkpoint.resume_from)
+        self.assertEqual(
+            experiment.experts.sampler_checkpoint_id, "ckpt_7c56f2uuof26"
+        )
+        self.assertEqual(
+            experiment.experts.train_checkpoint_id, "ckpt_wth5sxffdght"
+        )
         from train.tcod_f2b import load_experiment as load_f2b
         baseline = load_f2b(DEFAULT_CONFIG.with_name("tcod-f2b-grpo-teacher.yaml"))
         for name in ("model", "teacher", "training", "optimizer", "rollout", "objective", "evaluation", "execution"):
@@ -111,11 +115,34 @@ class B2FConfigurationTests(unittest.TestCase):
         self.assertNotEqual(experiment.output_dir, baseline.output_dir)
         self.assertEqual(experiment.curriculum.k_start, 1)
         self.assertEqual(experiment.curriculum.growth_interval, 4)
-        self.assertEqual(experiment.experts.pass_k, 10)
-        self.assertEqual(experiment.experts.batch_size, 4)
+        self.assertEqual(experiment.experts.pass_k, 2)
+        self.assertEqual(experiment.experts.batch_size, 1)
         self.assertEqual(experiment.agent.limits.max_turns, 15)
         self.assertEqual(experiment.trainer.batch_size, 16)
         self.assertEqual(experiment.trainer.max_steps, 200)
+
+    def test_checkpoint_ids_and_sampler_uri_are_required(self):
+        import yaml
+
+        values = yaml.safe_load(DEFAULT_CONFIG.read_text())
+        for field, value, message in (
+            ("sampler_checkpoint_id", "7c56f2uuof26", "sampler_checkpoint_id"),
+            ("train_checkpoint_id", "", "train_checkpoint_id"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                damaged = json.loads(json.dumps(values))
+                damaged["experts"][field] = value
+                path = Path(directory) / "config.yaml"
+                path.write_text(yaml.safe_dump(damaged))
+                with self.assertRaisesRegex(ValueError, message):
+                    load_experiment(path)
+        with tempfile.TemporaryDirectory() as directory:
+            damaged = json.loads(json.dumps(values))
+            damaged["trainer"]["teacher"]["model_path"] = None
+            path = Path(directory) / "config.yaml"
+            path.write_text(yaml.safe_dump(damaged))
+            with self.assertRaisesRegex(ValueError, "teacher sampler URI"):
+                load_experiment(path)
 
     def test_successful_experts_are_filtered_and_cycled_to_the_training_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,7 +191,7 @@ class B2FExecutionTests(unittest.IsolatedAsyncioTestCase):
         thread_patch.start()
         self.addCleanup(thread_patch.stop)
 
-    async def test_direct_entry_collects_experts_then_trains_and_resume_skips_collection(self):
+    async def test_direct_entry_collects_experts_then_trains(self):
         experiment = object()
         with (
             patch(
@@ -179,13 +206,7 @@ class B2FExecutionTests(unittest.IsolatedAsyncioTestCase):
             report = await prepare_and_train(experiment)
             self.assertEqual(report["status"], "completed")
             collect_mock.assert_awaited_once_with(experiment, max_tasks=None)
-            run_mock.assert_awaited_once_with(experiment, stop_after_step=None)
-
-            collect_mock.reset_mock()
-            run_mock.reset_mock()
-            await prepare_and_train(experiment, resume=True)
-            collect_mock.assert_not_awaited()
-            run_mock.assert_awaited_once()
+            run_mock.assert_awaited_once_with(experiment)
 
             collect_mock.reset_mock()
             run_mock.reset_mock()

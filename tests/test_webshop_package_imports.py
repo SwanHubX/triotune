@@ -32,8 +32,6 @@ class WebShopPackageImportTests(unittest.TestCase):
             "train",
             "train.vanilla_opd",
             "train.grpo_teacher",
-            "train.resume_grpo_teacher",
-            "train.resume_grpo_teacher_native",
             "train.tcod_f2b",
             "train.tcod_b2f",
             "train.collect_tcod_b2f_experts",

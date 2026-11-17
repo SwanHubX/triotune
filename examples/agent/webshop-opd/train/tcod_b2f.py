@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass, replace
 from itertools import cycle, islice
 from pathlib import Path
 from statistics import mean
-from typing import Any
 from uuid import uuid4
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +32,6 @@ from triotune.agentrl import (
 from triotune.utils.config import load_yaml_config
 from webshop_env.environment import (
     INSTRUCTIONS,
-    SessionPool,
     ShoppingEpisodeExecutor,
     build_workflow,
 )
@@ -75,6 +73,8 @@ class ExpertConfig:
     """Locate successful trajectories and configure their teacher collection."""
 
     path: Path
+    sampler_checkpoint_id: str
+    train_checkpoint_id: str
     pass_k: int = 10
     temperature: float = 1.0
     batch_size: int = 4
@@ -82,6 +82,13 @@ class ExpertConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
+        for name in ("sampler_checkpoint_id", "train_checkpoint_id"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not re.fullmatch(r"ckpt_[a-z0-9]+", value)
+            ):
+                raise ValueError(f"experts.{name} must be a PyTRIO checkpoint ID.")
         for name in ("pass_k", "batch_size"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -107,7 +114,6 @@ def load_experiment(
     path: Path,
     *,
     steps: int | None = None,
-    resume_from: Path | None = None,
 ) -> B2FExperiment:
     """Validate B2F, OPD, and expert-cache settings without remote calls."""
 
@@ -124,20 +130,13 @@ def load_experiment(
     curriculum = CurriculumConfig(**curriculum_values)
     experts = ExpertConfig(**expert_values)
     base = experiment_from_settings(values, root=root, steps=steps)
-    agent = TCODAgentConfig(**asdict(base.agent), curriculum=curriculum)
-    trainer = base.trainer
-    if resume_from is not None:
-        manifest = resume_from.expanduser()
-        if not manifest.is_absolute():
-            manifest = (Path.cwd() / manifest).resolve()
-        if not manifest.is_file():
-            raise ValueError(f"Resume checkpoint manifest does not exist: {manifest}")
-        trainer = replace(
-            trainer,
-            checkpoint=replace(trainer.checkpoint, resume_from=str(manifest)),
+    if base.trainer.teacher is None or base.trainer.teacher.model_path is None:
+        raise ValueError(
+            "TCOD-B2F requires the teacher sampler URI in trainer.teacher.model_path."
         )
+    agent = TCODAgentConfig(**asdict(base.agent), curriculum=curriculum)
     return B2FExperiment(
-        trainer=trainer,
+        trainer=base.trainer,
         agent=agent,
         data=base.data,
         source_dir=base.source_dir,
@@ -381,8 +380,6 @@ class TCODB2FTrainingLoop(AgentOPDTrainingLoop):
 
 async def run(
     experiment: B2FExperiment,
-    *,
-    stop_after_step: int | None = None,
 ) -> dict:
     """Run B2F with cached experts and the shared WebShop resource lifecycle."""
 
@@ -391,7 +388,6 @@ async def run(
     load_expert_actions(experiment.experts.path)
     return await run_opd(
         experiment,
-        stop_after_step=stop_after_step,
         loop_class=TCODB2FTrainingLoop,
         algorithm="agent_tcod_b2f",
         run_label=f"tcod-b2f-{uuid4().hex[:8]}",
@@ -414,19 +410,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--steps", type=int, help="Override total training updates.")
-    parser.add_argument("--stop-after-step", type=int)
-    parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--check-config", action="store_true")
     args = parser.parse_args()
     experiment = load_experiment(
         args.config,
         steps=args.steps,
-        resume_from=args.resume_from,
     )
     if args.check_config:
         print(json.dumps(asdict(experiment), indent=2, default=str))
         return
-    asyncio.run(run(experiment, stop_after_step=args.stop_after_step))
+    asyncio.run(run(experiment))
 
 
 if __name__ == "__main__":

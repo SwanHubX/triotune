@@ -22,6 +22,10 @@ from triotune.agentrl import SamplingSnapshot
 from triotune.trainer import OPDTrainer
 
 
+async def inline(function, /, *args, **kwargs):
+    return function(*args, **kwargs)
+
+
 class TeacherClient:
     def __init__(self):
         self.requests = []
@@ -54,6 +58,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.goals = [{"id": i} for i in range(1504)]
         self.files = {"products": self.root / "products.json"}
         self.files["products"].write_text("[]")
+        thread_patch = patch("asyncio.to_thread", side_effect=inline)
+        thread_patch.start()
+        self.addCleanup(thread_patch.stop)
         original = load_experiment(DEFAULT_CONFIG, steps=1)
         original.trainer.training.batch_size = 2
         self.experiment = replace(
@@ -78,9 +85,18 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             guard.start()
             self.addCleanup(guard.stop)
 
-    async def test_collects_actual_teacher_paths_resumes_and_preserves_goal_seeds(self):
+    async def test_collects_actual_teacher_paths_reuses_cache_and_preserves_goal_seeds(self):
         first = await collect(self.experiment, max_tasks=1)
         self.assertEqual(first["cached_total"], 1)
+        metadata = json.loads(
+            self.experiment.experts.path.with_suffix(".jsonl.meta.json").read_text()
+        )
+        self.assertEqual(
+            metadata["experts"]["sampler_checkpoint_id"], "ckpt_7c56f2uuof26"
+        )
+        self.assertEqual(
+            metadata["experts"]["train_checkpoint_id"], "ckpt_wth5sxffdght"
+        )
         stored = load_expert_actions(self.experiment.experts.path)
         self.assertEqual(list(stored.values()), [ShopPool.actions])
         self.assertEqual(len(self.client.requests), 6)
@@ -111,6 +127,19 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "settings changed"):
             await collect(self.experiment)
         self.experiment.trainer.teacher.model_path = original
+        original_id = self.experiment.experts.sampler_checkpoint_id
+        object.__setattr__(
+            self.experiment.experts,
+            "sampler_checkpoint_id",
+            "ckpt_another",
+        )
+        with self.assertRaisesRegex(ValueError, "settings changed"):
+            await collect(self.experiment)
+        object.__setattr__(
+            self.experiment.experts,
+            "sampler_checkpoint_id",
+            original_id,
+        )
         self.files["products"].write_text("[1]")
         with self.assertRaisesRegex(ValueError, "settings changed"):
             await collect(self.experiment)
@@ -156,13 +185,12 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                 await collect(self.experiment)
         self.service.create_sampling_client_async.assert_not_awaited()
 
-    async def test_real_collection_training_checkpoint_and_resume_lifecycle(self):
+    async def test_real_collection_and_complete_training_lifecycle(self):
         service = _Service()
         tokenizer = AgentTokenizer()
         tokenizer.get_vocab = lambda: {chr(i): i for i in range(256)}
         service.training.get_tokenizer = lambda: tokenizer
         service.create_sampling_client_async = self.service.create_sampling_client_async
-        service.create_training_client_from_state_with_optimizer = lambda **kwargs: service.training
         args = self.experiment.trainer
         args.training.max_steps = 2
         args.training.batch_size = 1
@@ -198,27 +226,19 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             patch("pytrio.ServiceClient", return_value=service),
             patch.object(OPDTrainer, "create_sampling_snapshot", snapshot),
         ):
-            first = await prepare_and_train(experiment, stop_after_step=1)
-            self.assertEqual(first["global_step"], 1)
-            manifest = self.root / "state/opd-step-00000001.json"
-            self.assertTrue(manifest.exists())
-            original_cache = experiment.experts.path.read_bytes()
-            resumed_args = replace(args, checkpoint=replace(args.checkpoint, resume_from=str(manifest)))
-            resumed = replace(experiment, trainer=resumed_args)
-            second = await prepare_and_train(resumed, resume=True)
-            self.assertEqual(second["global_step"], 2)
-            self.assertNotEqual(first["output_dir"], second["output_dir"])
-            self.assertEqual([u["curriculum"]["k"] for u in second["updates"]], [1, 2])
+            result = await prepare_and_train(experiment)
+            self.assertEqual(result["global_step"], 2)
+            self.assertTrue((self.root / "state/opd-step-00000001.json").exists())
+            self.assertTrue((self.root / "state/opd-step-00000002.json").exists())
+            self.assertEqual(
+                [u["curriculum"]["k"] for u in result["updates"]],
+                [1, 2],
+            )
             self.assertEqual(service.training.optim_calls, 2)
             self.assertEqual(len(service.teachers[args.teacher.name].requests), 5)
             saved = json.loads((self.root / "state/opd-step-00000002.json").read_text())
             self.assertEqual(saved["loop"]["state"]["seed_offset"], 30)
-            self.assertEqual(experiment.experts.path.read_bytes(), original_cache)
-            self.assertEqual(second["metrics"]["eval/agent/pass@1"], 1.0)
-            altered = original_cache.decode().replace("search[shoes]", "search[other]")
-            experiment.experts.path.write_text(altered)
-            with self.assertRaisesRegex(ValueError, "dataset"):
-                await prepare_and_train(resumed, resume=True)
+            self.assertEqual(result["metrics"]["eval/agent/pass@1"], 1.0)
         self.assertTrue(all(p.closed and not p.sessions for p in self.pools))
 
     def test_atomic_replace_failure_keeps_the_previous_cache(self):

@@ -629,37 +629,6 @@ class FullAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(manifest["state"]["global_step"], 1)
 
-            self.service.create_training_client_from_state_with_optimizer = (
-                lambda **kwargs: self.service.training
-            )
-            resumed_trainer = OPDTrainer(
-                "student",
-                "teacher",
-                args=OPDConfig(
-                    batch_size=1,
-                    num_generations=1,
-                    max_steps=1,
-                    checkpoint={
-                        "save_every": 1,
-                        "state_dir": directory,
-                        "resume_from": state.checkpoint_manifest_path,
-                    },
-                ),
-                train_dataset=calculator_rows()[:1],
-                defer_checkpoint_loop_binding=True,
-            )
-            resumed_loop = AgentOPDTrainingLoop(
-                resumed_trainer,
-                calculator_workflow(),
-            )
-            self.assertEqual(resumed_trainer.state.global_step, 1)
-            self.assertEqual(
-                resumed_loop._seed_offset,
-                workflow.runner.limits.max_turns,
-            )
-            self.assertEqual(len(resumed_loop.update_history), 1)
-            await resumed_loop.workflow.close()
-
 
 if __name__ == "__main__":
     unittest.main()

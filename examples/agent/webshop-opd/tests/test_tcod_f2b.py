@@ -141,24 +141,6 @@ class CurriculumConfigurationTests(unittest.TestCase):
             vanilla.trainer.checkpoint.state_dir,
         )
 
-    def test_resume_override_uses_an_existing_shell_relative_manifest(self):
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            manifest = Path(directory) / "checkpoint.json"
-            manifest.write_text("{}\n")
-            relative = manifest.relative_to(Path.cwd())
-
-            experiment = load_experiment(DEFAULT_CONFIG, resume_from=relative)
-
-            self.assertEqual(
-                experiment.trainer.checkpoint.resume_from,
-                str(manifest.resolve()),
-            )
-            with self.assertRaisesRegex(ValueError, "does not exist"):
-                load_experiment(
-                    DEFAULT_CONFIG,
-                    resume_from=Path(directory) / "missing.json",
-                )
-
     def test_schedule_boundaries_and_cap_follow_completed_update_indices(self):
         schedule = CurriculumConfig()
         self.assertEqual(
@@ -380,33 +362,6 @@ class F2BLoopTests(unittest.IsolatedAsyncioTestCase):
             loop.update_history[-1]["curriculum"]["collection_attempts"],
             2,
         )
-
-    async def test_pause_resume_keeps_schedule_seed_cursor_and_rejects_schedule_changes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            loop, pool, _ = self.make_loop(checkpoint={"state_dir": directory, "save_every": 1})
-            state = await loop.train(stop_after_step=2)
-            path = state.checkpoint_manifest_path
-            manifest = json.loads(Path(path).read_text())
-            self.assertEqual(manifest["loop"]["identity"]["curriculum"], {"k_start": 1, "growth_interval": 1})
-            self.assertEqual(manifest["loop"]["identity"]["limits"]["max_turns"], 15)
-            self.assertEqual(manifest["loop"]["state"]["seed_offset"], 3)
-            self.assertEqual([r["curriculum"]["horizon"] for r in manifest["loop"]["state"]["updates"]], [1, 2])
-            self.assertFalse(pool.sessions)
-            self.service.create_training_client_from_state_with_optimizer = lambda **kwargs: self.service.training
-            checkpoint = {"state_dir": directory, "save_every": 1, "resume_from": path}
-            resumed, _, _ = self.make_loop(checkpoint=checkpoint)
-            self.assertEqual(resumed.trainer.state.global_step, 2)
-            self.assertEqual(resumed._seed_offset, 3)
-            state = await resumed.train()
-            self.assertEqual(state.global_step, 4)
-            self.assertEqual([r["curriculum"]["horizon"] for r in resumed.update_history], [1, 2, 3, 4])
-            self.assertEqual(resumed._seed_offset, 10)
-            # Purchase at k=3 needs no positive reward to receive OPD targets;
-            # k=4 also includes the protocol's final model reply.
-            self.assertEqual(resumed.update_history[-1]["turns"], 4)
-            self.assert_full_limits(resumed)
-            with self.assertRaisesRegex(ValueError, "configuration does not match"):
-                self.make_loop(checkpoint=checkpoint, curriculum=CurriculumConfig(1, 2))
 
     async def test_entry_point_writes_tcod_report_using_the_shared_resource_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

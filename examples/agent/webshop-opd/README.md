@@ -1,67 +1,24 @@
-# WebShop OPD
+# WebShop AgentRL Training
 
-This example owns its environment adapter in `webshop_env/environment.py`,
-data preparation in `webshop_env/data_prepare.py`, and simulator requirements
-in `requirements-webshop.txt`. Evaluation and later OPD experiments use these
-local modules.
+[![Zhihu Tutorial](https://img.shields.io/badge/Zhihu-WebShop_Tutorial-0084FF?style=flat-square&logo=zhihu&logoColor=white)](https://zhuanlan.zhihu.com/p/2105967931184116262)
 
-## Use the shared repository package
+This example trains Qwen3.5-4B in the WebShop environment. It includes **GRPO teacher training, vanilla OPD, TCOD-F2B, and TCOD-B2F**. PyTRIO provides model training and inference, while this directory contains the environment adapter, data preparation code, and training entry points.
 
-The example imports the top-level `triotune/` package from this repository.
-An extra `examples/agent/webshop-opd/triotune/` copy is not required. Both the
-launchers and direct imports of `train` or `webshop_env` select the repository
-package ahead of older installed versions. Keep the example inside this
-repository so its shared package and configuration paths remain available.
+## Environment Setup
 
-To check the import source, run from the repository root:
-
-```bash
-PYTHONPATH=examples/agent/webshop-opd .venv/bin/python -c \
-  'import webshop_env, triotune; print(triotune.__file__)'
-```
-
-The result should end in the repository's `triotune/__init__.py`. If an older
-copy or one of its submodules was already imported in a notebook or another
-long-running process, restart that Python process after removing the copy.
-The example reports the conflicting module and path instead of mixing
-implementations from multiple locations.
-
-## Install the environment
-
-Use Python 3.12 and Java 11. From the repository root:
+The example requires **Python 3.12, Java 11, and valid PyTRIO credentials**. Run the following commands from the repository root:
 
 ```bash
 uv sync
-uv pip install 'torch>=2.3' --index-url https://download.pytorch.org/whl/cpu
+uv pip install "torch>=2.3" --index-url https://download.pytorch.org/whl/cpu
 uv pip install -r examples/agent/webshop-opd/requirements-webshop.txt
 ```
 
-Use the actual path of your Java 11 installation for `JAVA_HOME`; a distribution's
-example path may not exist on your machine. Alternatively, place the JDK or a
-symlink to it at `data/webshop-opd/java`. The launchers honor a valid `JAVA_HOME`
-and fall back to that local installation if the inherited path is missing or
-invalid. They set `JVM_PATH` to the selected JDK's `lib/server/libjvm.so`, avoiding
-stale pyjnius library overrides. If no valid JDK is found, they stop with a setup
-message before opening the simulator. `--check-config` requires no Java runtime.
+Set JAVA_HOME to a Java 11 installation, or place the JDK under data/webshop-opd/java. CPU-only PyTorch is sufficient because model computation runs through PyTRIO.
 
-The simulator imports PyTorch even in text-only mode; CPU PyTorch is sufficient
-because model inference runs through PyTRIO. The requirements also install the
-pinned spaCy English model. If a later `uv sync` removes these additional
-packages, repeat the two `uv pip install` commands before preparing or evaluating.
+## Build the Dataset
 
-## Prepare the data
-
-All downloaded WebShop assets, the upstream simulator checkout, and the search
-index live under the repository's ignored `data/webshop-opd/` directory:
-
-| Path | Contents |
-| --- | --- |
-| `data/webshop-opd/assets/` | Pinned product and instruction JSON files |
-| `data/webshop-opd/WebShop/` | Pinned upstream simulator checkout |
-| `data/webshop-opd/WebShop/data/` | Links to this example's local JSON files |
-| `data/webshop-opd/WebShop/search_engine/indexes_1k/` | Generated search index |
-
-Clone the simulator and prepare the assets and index:
+**Use the following commands to prepare the dataset.** They download the pinned data files, link them into WebShop, and build a Lucene index for 1,000 products. No model service is used during this process.
 
 ```bash
 mkdir -p data/webshop-opd
@@ -70,28 +27,132 @@ git -C data/webshop-opd/WebShop checkout 64fa2a5c15c7daa698b9ac93f5bb5437b634c9b
 bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh --prepare-data --download
 ```
 
-The preparation command uses the student's data/environment settings, which
-match the teacher's. It makes no model calls. Downloaded files go directly to
-`data.directory`; evaluation only reads these local files. An existing index
-is reused only when the recorded source and asset hashes match. Conflicting
-files or indexes are rejected without overwriting them. Do not add generated
-data or the simulator checkout to Git.
+The generated files are stored in the following locations:
 
-## Evaluate before training
+| Path | Contents |
+| --- | --- |
+| data/webshop-opd/assets/ | Product, generated-instruction, and human-instruction JSON files |
+| data/webshop-opd/WebShop/data/ | Links to the local JSON files |
+| data/webshop-opd/WebShop/search_engine/indexes_1k/ | Search index for 1,000 products |
+| data/webshop-opd/WebShop/.triotune-webshop.json | Dataset version and SHA-256 metadata |
 
-See [the evaluation instructions](eval/README.md) for student/teacher launchers,
-budgets, output files, and Pass@1/Pass@4 definitions. Both YAML files resolve
-data paths relative to their own locations, so launchers work from any directory.
+The source is the Hugging Face dataset YWZBrandon/webshop-data at revision ce990fff5aee388db2706f07820c578ab68e0453. The default official split uses **goals 0–499 for testing, goals 500–1499 for validation, and goals starting at 1500 for training**. The current configurations evaluate the first 200 validation goals.
 
-## Train multi-turn vanilla OPD
+### Dataset Format
 
-The repository Triotune package includes a synchronous AgentRL OPD adapter.
-The launchers use that shared implementation. See
-[the training documentation](train/README.md) for its exact turn-level loss
-boundary, offline verification command, configuration check, and later remote
-smoke-test command. A separate [TCOD-F2B training entry point](train/README.md#tcod-f2b-with-the-grpo-teacher)
-adds an expanding rollout-prefix curriculum using the same OPD interfaces,
-using the shared Triotune package and the example-owned WebShop environment.
-The training documentation also includes a TCOD-B2F workflow with resumable
-Pass@10 expert collection from the GRPO-trained Qwen3.5-4B teacher and
-gradient-free environment-prefix replay into a fresh Qwen3.5-4B student.
+GRPO, vanilla OPD, and TCOD-F2B do not use static prompt-answer pairs. Each training row contains only a task identifier and a goal index:
+
+```json
+{
+  "task_id": "webshop-train-1500",
+  "goal_index": 1500
+}
+```
+
+For each episode, the environment dynamically produces the **shopping instruction, product pages, available actions, and task reward** from goal_index. Model responses use the JSON tool-call format:
+
+```json
+{
+  "tool_calls": [
+    {
+      "name": "webshop",
+      "arguments": {
+        "action": "search[waterproof hiking shoes]"
+      }
+    }
+  ]
+}
+```
+
+TCOD-B2F additionally requires a cache of successful teacher trajectories. Each JSONL record has the following format:
+
+```json
+{
+  "goal_index": 1500,
+  "success": true,
+  "actions": [
+    "search[waterproof hiking shoes]",
+    "click[B000EXAMPLE]",
+    "click[buy now]"
+  ]
+}
+```
+
+## Start Training
+
+Run all commands from the repository root. Add --check-config to any training command to validate its configuration without starting WebShop or a model service.
+
+### 1. GRPO Teacher
+
+Train the Qwen3.5-4B teacher used by later OPD and TCOD experiments:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-grpo-teacher.sh
+```
+
+### 2. Vanilla OPD
+
+Use the original Qwen3.8-27B teacher:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-vanilla-opd.sh
+```
+
+Use the GRPO-trained Qwen3.5-4B teacher:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-vanilla-opd-grpo-teacher.sh
+```
+
+### 3. TCOD-F2B
+
+Use the original Qwen3.8-27B teacher:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-tcod-f2b-qwen3.8-27b-teacher.sh
+```
+
+Use the GRPO-trained Qwen3.5-4B teacher:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-tcod-f2b-grpo-teacher.sh
+```
+
+F2B starts with one turn and **adds one turn every four training steps**, up to 15 turns:
+
+```text
+k = min(1 + completed_steps // 4, 15)
+```
+
+### 4. TCOD-B2F
+
+B2F uses the GRPO-trained Qwen3.5-4B teacher to generate successful trajectories, then trains a fresh Qwen3.5-4B student. The main launcher collects missing trajectories before starting training:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh
+```
+
+To collect teacher trajectories without starting student training:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/collect-tcod-b2f-grpo-teacher.sh
+```
+
+The expert cache is stored under data/webshop-opd/tcod-b2f/ and is excluded from Git.
+
+## Evaluation and Verification
+
+Run the before-training evaluations with:
+
+```bash
+bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh
+bash examples/agent/webshop-opd/eval/scripts/run-teacher-eval.sh
+```
+
+The offline test suite does not access model services, Java, or WebShop data:
+
+```bash
+bash examples/agent/webshop-opd/train/scripts/test-agent-opd.sh
+```
+
+Training outputs are written under output/webshop-opd/, including episode records, metrics, reports, and checkpoint manifests. See the [evaluation guide](eval/README.md) for detailed evaluation definitions.
