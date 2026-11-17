@@ -100,12 +100,12 @@ class B2FConfigurationTests(unittest.TestCase):
         experiment = load_experiment(DEFAULT_CONFIG)
         self.assertEqual(experiment.trainer.model.name, "Qwen/Qwen3.5-4B")
         self.assertEqual(experiment.trainer.teacher.name, "Qwen/Qwen3.5-4B")
-        self.assertEqual(experiment.trainer.teacher.model_path, "trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400")
+        self.assertEqual(experiment.trainer.teacher.model_path, "trio://run_grpoexample/sampler_weights/ppo-sampler-step-00000400")
         self.assertEqual(
-            experiment.experts.sampler_checkpoint_id, "ckpt_7c56f2uuof26"
+            experiment.experts.sampler_checkpoint_id, "ckpt_samplerexample"
         )
         self.assertEqual(
-            experiment.experts.train_checkpoint_id, "ckpt_wth5sxffdght"
+            experiment.experts.train_checkpoint_id, "ckpt_trainexample"
         )
         from train.tcod_f2b import load_experiment as load_f2b
         baseline = load_f2b(DEFAULT_CONFIG.with_name("tcod-f2b-grpo-teacher.yaml"))
@@ -126,7 +126,7 @@ class B2FConfigurationTests(unittest.TestCase):
 
         values = yaml.safe_load(DEFAULT_CONFIG.read_text())
         for field, value, message in (
-            ("sampler_checkpoint_id", "7c56f2uuof26", "sampler_checkpoint_id"),
+            ("sampler_checkpoint_id", "samplerexample", "sampler_checkpoint_id"),
             ("train_checkpoint_id", "", "train_checkpoint_id"),
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:

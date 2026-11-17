@@ -58,7 +58,7 @@ trainer:
     importance_ratio_cap: 5.0
   reporting:
     report_to: swanlab
-    workspace: pytrio
+    workspace: your-workspace
     project: webshop-agentrl-TCOD
     run_name: vanilla-opd-qwen3.5-4b-qwen3.8-27b-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
     log_dir: ../../../../../output/webshop-opd/train/vanilla-opd-qwen3.5-4b-qwen3.8-27b-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/metrics

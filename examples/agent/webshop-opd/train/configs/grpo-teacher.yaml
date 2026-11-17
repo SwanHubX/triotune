@@ -61,7 +61,7 @@ trainer:
     max_batches: null
   reporting:
     report_to: swanlab
-    workspace: pytrio
+    workspace: your-workspace
     project: webshop-agentrl-TCOD
     run_name: grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
     log_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/metrics

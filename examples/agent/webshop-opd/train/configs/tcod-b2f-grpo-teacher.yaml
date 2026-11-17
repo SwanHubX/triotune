@@ -19,9 +19,9 @@ curriculum:
   growth_interval: 4
 
 experts:
-  path: ../../../../../data/webshop-opd/tcod-b2f/grpo-teacher-ckpt_7c56f2uuof26-p2-b1-experts.jsonl
-  sampler_checkpoint_id: ckpt_7c56f2uuof26
-  train_checkpoint_id: ckpt_wth5sxffdght
+  path: ../../../../../data/webshop-opd/tcod-b2f/grpo-teacher-ckpt_samplerexample-p2-b1-experts.jsonl
+  sampler_checkpoint_id: ckpt_samplerexample
+  train_checkpoint_id: ckpt_trainexample
   pass_k: 2
   temperature: 1.0
   batch_size: 1
@@ -38,9 +38,9 @@ trainer:
     lora_rank: 32
   teacher:
     name: Qwen/Qwen3.5-4B
-    # Sampler checkpoint ID: ckpt_7c56f2uuof26. The scoring client requires
-    # its full sampler URI; a bare ID or Train checkpoint is not a model_path.
-    model_path: trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400
+    # Replace these example IDs with IDs from your GRPO teacher run.
+    # The scoring client requires the full sampler URI, not a bare ID.
+    model_path: trio://run_grpoexample/sampler_weights/ppo-sampler-step-00000400
   training:
     batch_size: 16
     max_steps: 200
@@ -79,7 +79,7 @@ trainer:
     importance_ratio_cap: 5.0
   reporting:
     report_to: swanlab
-    workspace: pytrio
+    workspace: your-workspace
     project: webshop-agentrl-TCOD
     tags: [opd, tcod-b2f, qwen3.5-4b, qwen3.5-4b-grpo-teacher]
     run_name: tcod-b2f-qwen3.5-4b-teacher-step400-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42

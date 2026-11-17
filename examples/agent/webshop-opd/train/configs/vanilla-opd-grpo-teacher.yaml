@@ -23,9 +23,9 @@ trainer:
     lora_rank: 32
   teacher:
     name: Qwen/Qwen3.5-4B
-    # Sampler checkpoint ckpt_7c56f2uuof26, exported from the step-400 teacher.
+    # Replace this example URI with the sampler URI from your GRPO teacher run.
     # The teacher scoring client requires the sampler URI, not a checkpoint ID.
-    model_path: trio://run_x4uc1nm5nyc8/sampler_weights/ppo-sampler-step-00000400
+    model_path: trio://run_grpoexample/sampler_weights/ppo-sampler-step-00000400
   training:
     batch_size: 16
     max_steps: 200
@@ -62,7 +62,7 @@ trainer:
     importance_ratio_cap: 5.0
   reporting:
     report_to: swanlab
-    workspace: pytrio
+    workspace: your-workspace
     project: webshop-agentrl-TCOD
     tags: [opd, vanilla-opd, qwen3.5-4b, qwen3.5-4b-grpo-teacher]
     run_name: vanilla-opd-qwen3.5-4b-teacher-step400-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42

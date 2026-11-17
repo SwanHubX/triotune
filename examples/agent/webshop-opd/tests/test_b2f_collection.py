@@ -92,10 +92,10 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.experiment.experts.path.with_suffix(".jsonl.meta.json").read_text()
         )
         self.assertEqual(
-            metadata["experts"]["sampler_checkpoint_id"], "ckpt_7c56f2uuof26"
+            metadata["experts"]["sampler_checkpoint_id"], "ckpt_samplerexample"
         )
         self.assertEqual(
-            metadata["experts"]["train_checkpoint_id"], "ckpt_wth5sxffdght"
+            metadata["experts"]["train_checkpoint_id"], "ckpt_trainexample"
         )
         stored = load_expert_actions(self.experiment.experts.path)
         self.assertEqual(list(stored.values()), [ShopPool.actions])

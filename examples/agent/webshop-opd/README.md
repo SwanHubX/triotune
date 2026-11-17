@@ -82,6 +82,8 @@ TCOD-B2F additionally requires a cache of successful teacher trajectories. Each 
 
 Run all commands from the repository root. Add --check-config to any training command to validate its configuration without starting WebShop or a model service.
 
+**Before running an experiment with a GRPO-trained teacher, replace run_grpoexample, ckpt_samplerexample, and ckpt_trainexample in the relevant configuration with identifiers produced by your own GRPO run. Replace your-workspace with your SwanLab workspace name.**
+
 ### 1. GRPO Teacher
 
 Train the Qwen3.5-4B teacher used by later OPD and TCOD experiments:

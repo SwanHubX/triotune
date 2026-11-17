@@ -67,7 +67,7 @@ trainer:
     importance_ratio_cap: 5.0
   reporting:
     report_to: swanlab
-    workspace: pytrio
+    workspace: your-workspace
     project: webshop-agentrl-TCOD
     tags: [opd, tcod-f2b, qwen3.5-4b, qwen3.8-27b-teacher]
     run_name: tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
