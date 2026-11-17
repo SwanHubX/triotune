@@ -17,6 +17,7 @@ Triotune 基于 PyTRIO 公共客户端 API，负责数据准备、奖励与优�
   - [快速开始](#-快速开始)
 - [支持能力](#-支持能力)
   - [算法](#-算法)
+  - [案例](#-案例)
   - [模型](#-模型)
 - [Python API](#-python-api)
 - [Agent RL](#agent-rl)
@@ -94,6 +95,16 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 | **DPO** | [📖 文档](./docs/algorithms/dpo_CN.md) | [🔧 案例](./examples/dpo) | [📄 论文](https://arxiv.org/abs/2305.18290) |
 | **OPD** | [📖 文档](./docs/algorithms/opd_CN.md) | [🔧 案例](./examples/opd) | [📄 论文](https://arxiv.org/abs/2601.18734) |
 | **SFT** | [📖 文档](./docs/algorithms/sft_CN.md) | [🔧 案例](./examples/sft) |  |
+
+### 📕 案例
+
+除上表中的 GSM8K 算法案例外，仓库还提供以下完整的智能体与环境训练流程：
+
+| 案例 | 主要内容 | 入口 |
+| --- | --- | --- |
+| **Calculator Agent** | 多轮工具调用 AgentRL 训练、奖励设计与评估 | [📁 目录](./examples/agent/calculator) · [🚀 训练入口](./examples/agent/calculator/train.py) |
+| **WebShop TCOD** | WebShop 环境与评估、GRPO 教师训练、标准 OPD、TCOD-F2B 和 TCOD-B2F | [📖 指南](./examples/agent/webshop-tcod/README.md) |
+| **WebShop GiGPO** | 使用组内隔离优势和 reference KL 的 WebShop GiGPO 训练 | [📖 指南](./examples/gigpo/README.md) |
 
 ### 📖 模型
 

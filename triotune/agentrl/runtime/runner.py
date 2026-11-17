@@ -269,6 +269,7 @@ class EpisodeRunner:
         resource_owner: str = "runner",
         context_compactor: ConversationCompactor | None = None,
         anchor_observer: AnchorObservationProvider | None = None,
+        post_tool_stop=None,
     ):
         """Compose execution adapters and optional model-specific serialization.
 
@@ -284,7 +285,9 @@ class EpisodeRunner:
         if type(self)._execute is EpisodeRunner._execute and any(
             adapter is None for adapter in (parser, tools, observations)
         ):
-            raise ValueError("The default episode loop requires parser, tools, and observations.")
+            raise ValueError(
+                "The default episode loop requires parser, tools, and observations."
+            )
         self.parser, self.tools, self.scorer = parser, tools, scorer
         self.interaction_scorer = interaction_scorer
         self.failure_classifier = failure_classifier
@@ -295,6 +298,12 @@ class EpisodeRunner:
         ):
             raise TypeError("anchor_observer must implement observe().")
         self.anchor_observer = anchor_observer
+        if post_tool_stop is not None and not callable(post_tool_stop):
+            raise TypeError("post_tool_stop must be callable or None.")
+        # Environment-specific terminal conditions are checked only after all
+        # tool results from one model action have been recorded. The default is
+        # absent, preserving the established model-final-answer protocol.
+        self.post_tool_stop = post_tool_stop
         self.limits, self.prompt_key = limits or EpisodeLimits(), prompt_key
         self.trajectory_builder = trajectory_builder or EpisodeTrajectoryBuilder()
         self.retry = retry or RetryPolicy()
@@ -596,8 +605,11 @@ class EpisodeRunner:
                 renderer = self.renderer or ChatTemplateRenderer(snapshot.tokenizer)
                 await self._execute(episode, messages, snapshot, renderer, seed)
                 _execution_context.set(context)
-                if episode.status not in SYSTEM_STATUSES and episode.status != "rejected" and not episode.export_metadata.get("system_failure", False) and (
-                    self.score_partial or episode.status == "completed"
+                if (
+                    episode.status not in SYSTEM_STATUSES
+                    and episode.status != "rejected"
+                    and not episode.export_metadata.get("system_failure", False)
+                    and (self.score_partial or episode.status == "completed")
                 ):
                     # Invalid actions and budget exits can still carry useful
                     # negative task signals. Infrastructure failures cannot.
@@ -782,9 +794,9 @@ class EpisodeRunner:
                     # JSONL schema. The trusted interaction ID provides stable
                     # alignment during concat, individual, compacted, or branch
                     # trajectory export.
-                    episode.export_metadata.setdefault(
-                        "anchor_observations", {}
-                    )[interaction.interaction_id] = copy.deepcopy(anchor)
+                    episode.export_metadata.setdefault("anchor_observations", {})[
+                        interaction.interaction_id
+                    ] = copy.deepcopy(anchor)
                 await self._execute_turn(
                     episode,
                     interaction,
@@ -935,4 +947,13 @@ class EpisodeRunner:
                 )
             )
         messages.extend(self.observations.format(turn.tool_results))
+        if self.post_tool_stop is not None:
+            should_stop = self.post_tool_stop(episode, turn)
+            if inspect.isawaitable(should_stop):
+                should_stop = await should_stop
+            if type(should_stop) is not bool:
+                raise AgentContractError("post_tool_stop must return a boolean.")
+            if should_stop:
+                episode.status = interaction.status = "completed"
+                return
         interaction.status = "tool_results"

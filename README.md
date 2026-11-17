@@ -17,6 +17,7 @@ Triotune handles data preparation, rewards, advantages, token alignment, and tra
   - [Quick Start](#-quick-start)
 - [Supported Features](#-supported-features)
   - [Algorithms](#-algorithms)
+  - [Examples](#-examples)
   - [Models](#-models)
 - [Python API](#-python-api)
 - [Agent RL](#agent-rl)
@@ -94,6 +95,16 @@ uv run python examples/ppo/gsm8k_ppo.py --config examples/ppo/gsm8k_ppo_args.yam
 | **DPO** | [📖 Docs](./docs/algorithms/dpo.md) | [🔧 Example](./examples/dpo) | [📄 Paper](https://arxiv.org/abs/2305.18290) |
 | **OPD** | [📖 Docs](./docs/algorithms/opd.md) | [🔧 Example](./examples/opd) | [📄 Paper](https://arxiv.org/abs/2601.18734) |
 | **SFT** | [📖 Docs](./docs/algorithms/sft.md) | [🔧 Example](./examples/sft) |  |
+
+### 📕 Examples
+
+In addition to the algorithm-specific GSM8K examples above, the repository includes complete agent and environment workflows:
+
+| Example | Highlights | Start Here |
+| --- | --- | --- |
+| **Calculator Agent** | Multi-turn tool-using AgentRL training, reward shaping, and evaluation | [📁 Directory](./examples/agent/calculator) · [🚀 Training entry](./examples/agent/calculator/train.py) |
+| **WebShop TCOD** | WebShop setup and evaluation, GRPO teacher training, vanilla OPD, TCOD-F2B, and TCOD-B2F | [📖 Guide](./examples/agent/webshop-tcod/README.md) |
+| **WebShop GiGPO** | WebShop GiGPO training with group-isolated advantages and reference KL | [📖 Guide](./examples/gigpo/README.md) |
 
 ### 📖 Models
 

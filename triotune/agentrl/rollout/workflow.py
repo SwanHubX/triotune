@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from ...trainer.ppo.rollout import gather_cancel_on_error
 from ...trainer.ppo.trajectory import Trajectory
-from ..runtime.sampling import SamplingSnapshot
+from ..runtime.sampling import SamplingSnapshot, validate_training_snapshot
 from ..training.evaluation import evaluation_metrics
 from ..training.rewards import aggregate_assignments
 from ..types import (
@@ -273,6 +273,7 @@ class AgentRolloutWorkflow:
         seed: int | None = None,
         is_eval: bool = False,
         strict: bool = True,
+        log_episodes: bool = True,
     ) -> AgentRolloutBatch:
         """Run n_samples attempts per input row under the supplied policy.
 
@@ -284,6 +285,12 @@ class AgentRolloutWorkflow:
         """
         if type(n_samples) is not int or n_samples < 1:
             raise ValueError("n_samples must be a positive integer.")
+        if type(log_episodes) is not bool:
+            raise TypeError("log_episodes must be boolean.")
+        if type(is_eval) is not bool:
+            raise TypeError("is_eval must be boolean.")
+        if not is_eval:
+            validate_training_snapshot(snapshot)
         if self._capacity_limit != self.max_concurrency:
             # Preserve the historically mutable max_concurrency attribute for
             # callers that tune capacity between collection calls. Changing it
@@ -399,7 +406,7 @@ class AgentRolloutWorkflow:
                             None,
                         )
                         exported = None
-                if self.logger is not None:
+                if self.logger is not None and log_episodes:
                     # Persist the post-validation status, including any export
                     # failure, before strict batch rejection can raise.
                     token = _execution_context.set(context)
@@ -473,6 +480,7 @@ class AgentRolloutWorkflow:
         is_eval: bool = False,
         strict: bool = True,
         max_pending_groups: int | None = None,
+        log_episodes: bool = True,
     ):
         """Yield completed prompt groups without waiting for the slowest row.
 
@@ -514,6 +522,7 @@ class AgentRolloutWorkflow:
                         seed=group_seed,
                         is_eval=is_eval,
                         strict=strict,
+                        log_episodes=log_episodes,
                     )
                 )
                 pending[task] = index

@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pytrio as trio
@@ -23,11 +24,13 @@ from ..dataset import prepare_prompt
 from ..utils.checkpoint import TrainingCheckpoint, save_checkpoint_async, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.sampler_checkpoint import SamplerCheckpoint
 from ..utils.token_usage import compute_train_tokens
 from ..utils.updates import run_update_async
 from .opd.contracts import (
     OPDPrompt,
     OPDResult,
+    OPDRollout,
     OPDState,
     OPDTeacherGroup,
     OPDTeacherSpec,
@@ -154,9 +157,7 @@ class _OPDMetricTotals:
             for sample in samples
         )
         self.weighted_reverse_kl_square_sum += sum(
-            (
-                sample.teacher_weight_sum * (student - teacher)
-            ) ** 2
+            (sample.teacher_weight_sum * (student - teacher)) ** 2
             for sample in samples
             for student, teacher in zip(
                 sample.rollout.behavior_logprobs,
@@ -178,10 +179,8 @@ class _OPDMetricTotals:
                     - reverse_kl**2,
                 )
             ),
-            f"{prefix}/student_logprob": self.student_logprob_sum
-            / self.token_count,
-            f"{prefix}/teacher_logprob": self.teacher_logprob_sum
-            / self.token_count,
+            f"{prefix}/student_logprob": self.student_logprob_sum / self.token_count,
+            f"{prefix}/teacher_logprob": self.teacher_logprob_sum / self.token_count,
             f"{prefix}/advantage_mean": self.advantage_sum / self.token_count,
             f"{prefix}/advantage_std": math.sqrt(
                 max(
@@ -219,12 +218,8 @@ class _OPDMetricReducer:
                 / totals.token_count,
                 "rollout/completion_length_mean": totals.token_count
                 / totals.completion_count,
-                "rollout/completion_length_min": float(
-                    totals.completion_length_min
-                ),
-                "rollout/completion_length_max": float(
-                    totals.completion_length_max
-                ),
+                "rollout/completion_length_min": float(totals.completion_length_min),
+                "rollout/completion_length_max": float(totals.completion_length_max),
                 "rollout/truncated_fraction": totals.truncated_count
                 / totals.completion_count,
             }
@@ -291,6 +286,7 @@ class OPDTrainer:
         teacher_groups: Sequence[OPDTeacherGroup] | None = None,
         teacher_group_key: str = "teacher_group",
         execution_plan: OPDExecutionPlan | None = None,
+        defer_checkpoint_loop_binding: bool = False,
     ) -> None:
         """Create clients and bind an immutable OPD algorithm execution plan."""
 
@@ -299,7 +295,9 @@ class OPDTrainer:
         if model is None and configured_model is not None:
             model = configured_model.name
         if lora_rank is None:
-            lora_rank = configured_model.lora_rank if configured_model is not None else 32
+            lora_rank = (
+                configured_model.lora_rank if configured_model is not None else 32
+            )
         if teachers is None and self.args.teacher is not None:
             if teacher_model is None:
                 teacher_model = self.args.teacher.name
@@ -307,6 +305,8 @@ class OPDTrainer:
                 teacher_model_path = self.args.teacher.model_path
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a PyTRIO base-model ID.")
+        if type(defer_checkpoint_loop_binding) is not bool:
+            raise TypeError("defer_checkpoint_loop_binding must be boolean.")
         if (
             isinstance(lora_rank, bool)
             or not isinstance(lora_rank, int)
@@ -363,13 +363,11 @@ class OPDTrainer:
                 or not isinstance(teacher_groups, Sequence)
                 or not teacher_groups
                 or any(
-                    not isinstance(group, OPDTeacherGroup)
-                    for group in teacher_groups
+                    not isinstance(group, OPDTeacherGroup) for group in teacher_groups
                 )
             ):
                 raise ValueError(
-                    "teacher_groups must be a non-empty sequence of "
-                    "OPDTeacherGroup."
+                    "teacher_groups must be a non-empty sequence of OPDTeacherGroup."
                 )
             group_specs = tuple(teacher_groups)
         group_names = [group.name for group in group_specs]
@@ -396,9 +394,7 @@ class OPDTrainer:
         else:
             self.default_teacher_group = None
         # Retain the old public attributes for single-teacher integrations.
-        self.teacher_model = (
-            teacher_specs[0].model if len(teacher_specs) == 1 else None
-        )
+        self.teacher_model = teacher_specs[0].model if len(teacher_specs) == 1 else None
         self.teacher_model_path = (
             teacher_specs[0].model_path if len(teacher_specs) == 1 else None
         )
@@ -406,27 +402,47 @@ class OPDTrainer:
             execution_plan, OPDExecutionPlan
         ):
             raise TypeError("execution_plan must be an OPDExecutionPlan.")
-        self.execution_plan = execution_plan or OPDExecutionPlan.from_config(
-            self.args
-        )
+        self.execution_plan = execution_plan or OPDExecutionPlan.from_config(self.args)
         self._objective = self.execution_plan.objective
         self._metric_reducer = _OPDMetricReducer()
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.state = OPDState()
+        self._sampler_checkpoint = SamplerCheckpoint(self.args.checkpoint.sampler, "opd")
         self._last_eval_step: int | None = None
         self._checkpoint = TrainingCheckpoint(
-            self.args, "opd", train_dataset, eval_dataset,
-            identity={"model": self.model, "lora_rank": lora_rank,
-                      "teachers": [asdict(spec) for spec in teacher_specs],
-                      "teacher_groups": self.teacher_groups, "teacher_group_key": teacher_group_key},
+            self.args,
+            "opd",
+            train_dataset,
+            eval_dataset,
+            identity={
+                "model": self.model,
+                "lora_rank": lora_rank,
+                "teachers": [asdict(spec) for spec in teacher_specs],
+                "teacher_groups": self.teacher_groups,
+                "teacher_group_key": teacher_group_key,
+            },
         )
         if self._checkpoint.enabled and execution_plan is not None:
-            raise ValueError("Complete checkpoints require the built-in OPD execution plan.")
-        self._checkpoint.bind_loop()
+            raise ValueError(
+                "Complete checkpoints require the built-in OPD execution plan."
+            )
+        # An external AgentRL loop has additional deterministic state (notably
+        # its seed cursor).  It must bind its identity before checkpoint-loop
+        # restoration; the built-in prompt loop retains the historical eager
+        # binding behavior.
+        agent_resume = (
+            self._checkpoint.loaded is not None
+            and self._checkpoint.loaded["loop"]["kind"] == "agent_opd"
+        )
+        if not defer_checkpoint_loop_binding and not agent_resume:
+            self._checkpoint.bind_loop()
         self._service_client = trio.ServiceClient()
-        self._training_client = self._checkpoint.create_client(self._service_client,
-            base_model=self.model, rank=lora_rank, seed=self.args.seed,
+        self._training_client = self._checkpoint.create_client(
+            self._service_client,
+            base_model=self.model,
+            rank=lora_rank,
+            seed=self.args.seed,
         )
         self._tokenizer = self._training_client.get_tokenizer()
         student_vocab = self._tokenizer.get_vocab()
@@ -478,6 +494,12 @@ class OPDTrainer:
         )
 
         self._checkpoint.restore(self)
+
+    @property
+    def tokenizer(self):
+        """Expose the student tokenizer used by exact-token AgentRL rendering."""
+
+        return self._tokenizer
 
     # ------------------------------------------------------------------
     # Re-entrancy and failure-state guard
@@ -557,6 +579,143 @@ class OPDTrainer:
             model_input_factory=trio.ModelInput.from_ints,
         )
 
+    async def _optimize_scored_async(
+        self,
+        scored: Sequence[OPDTrainingSample],
+        *,
+        prompt_count: int,
+        behavior_policy_version: int,
+        sample_input_tokens: int,
+        sample_output_tokens: int,
+        started: float,
+        prepared: float,
+        snapshotted: float,
+        referenced: float,
+    ) -> OPDResult:
+        """Apply one OPD update to immutable, teacher-scored student actions.
+
+        Both the ordinary prompt path and the multi-turn agent path terminate
+        here.  Keeping optimizer ownership in one method guarantees identical
+        importance weighting, metrics, checkpoint cadence, failure poisoning,
+        and policy-version advancement for both collection front ends.
+
+        ``prompt_count`` is the number of logical tasks represented by the
+        update.  ``scored`` may be larger because one agent task contributes a
+        separate datum for every generated turn.  Token counters describe the
+        original student requests rather than teacher-scoring requests.
+        """
+
+        if not scored:
+            raise ValueError("An OPD update requires at least one scored rollout.")
+        if type(prompt_count) is not int or prompt_count < 1:
+            raise ValueError("prompt_count must be a positive integer.")
+        if behavior_policy_version != self.state.behavior_policy_version:
+            raise ValueError(
+                "Scored rollouts must match the current behavior-policy version."
+            )
+        for name, value in (
+            ("sample_input_tokens", sample_input_tokens),
+            ("sample_output_tokens", sample_output_tokens),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer.")
+
+        datums = [sample.datum for sample in scored]
+        # A failed/cancelled backward can leave partial remote gradients. Keep
+        # the trainer unusable until both backward and optimizer have succeeded.
+        self._requires_restart = True
+        adam = optimizer_params(
+            self.args,
+            trio.AdamParams,
+            step=self.state.optimizer_steps + 1,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
+        update = await run_update_async(
+            self._training_client,
+            self._objective,
+            datums,
+            adam,
+        )
+        self.state.global_step += 1
+        self.state.optimizer_steps += 1
+        self.state.behavior_policy_version += 1
+        self._sampling_seed_offset += prompt_count
+        # A snapshot is immutable.  Clearing the handle forces the next batch
+        # to export the newly updated student instead of reusing stale weights.
+        self._student_sampler = None
+        self._requires_restart = False
+
+        input_tokens = compute_train_tokens(datums)
+        metrics = _remote_metrics(update.forward, update.optimizer)
+        metrics.update(
+            _importance_metrics(
+                update.forward,
+                datums,
+                self.args.importance_ratio_cap,
+            )
+        )
+        metrics.update(
+            self._metric_reducer.training(
+                scored,
+                prompt_count=prompt_count,
+                behavior_policy_version=behavior_policy_version,
+            )
+        )
+        metrics.update(
+            {
+                "optim/lr": adam.learning_rate,
+                "data/input_tokens": float(input_tokens),
+                "time/prepare": prepared - started,
+                "time/snapshot": snapshotted - prepared,
+                "time/rollout_teacher": referenced - snapshotted,
+                "time/forward_backward": update.forward_seconds,
+                "time/optim": update.optimizer_seconds,
+            }
+        )
+        if self.args.importance_ratio_cap is not None:
+            metrics["policy/importance_ratio_cap"] = float(
+                self.args.importance_ratio_cap
+            )
+
+        checkpoint_path = None
+        self._total_tokens += input_tokens
+        self._sample_input_tokens += sample_input_tokens
+        self._sample_output_tokens += sample_output_tokens
+        metrics.update(
+            {
+                "usage/train_tokens": float(input_tokens),
+                "usage/train_tokens_total": float(self._total_tokens),
+                "usage/sample_input_tokens": float(sample_input_tokens),
+                "usage/sample_output_tokens": float(sample_output_tokens),
+                "usage/sample_input_tokens_total": float(self._sample_input_tokens),
+                "usage/sample_output_tokens_total": float(self._sample_output_tokens),
+            }
+        )
+        self.state.metrics = metrics
+        save_started = time.perf_counter()
+        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
+            checkpoint_path = await self._save_state_async()
+        metrics["time/checkpoint"] = time.perf_counter() - save_started
+        metrics["time/step"] = time.perf_counter() - started
+        metrics["time/tokens_per_second"] = input_tokens / metrics["time/step"]
+        self._log(metrics)
+        # An application loop owns additional progress such as agent seeds and
+        # episode history.  It publishes only after recording that state.
+        if self._checkpoint.loop_owner is None:
+            self._checkpoint.publish(self)
+            if self._sampler_checkpoint.due(self.state.global_step):
+                await self._sampler_checkpoint.save_async(
+                    self._training_client, self.state, self._metrics_api
+                )
+                self._checkpoint.publish(self)
+        return OPDResult(
+            self.state.global_step,
+            metrics,
+            len(datums),
+            behavior_policy_version,
+            checkpoint_path,
+        )
+
     # ------------------------------------------------------------------
     # Backend metrics, checkpointing, and reporting
     # ------------------------------------------------------------------
@@ -596,7 +755,9 @@ class OPDTrainer:
 
         self._metrics_api.flush(step=self.state.global_step)
 
-    def _finish_run(self, state: str, error: str | None = None, *, flush: bool = True) -> None:
+    def _finish_run(
+        self, state: str, error: str | None = None, *, flush: bool = True
+    ) -> None:
         """Close SwanLab once and clear the owned run handle."""
 
         self._metrics_api.finish(state=state, error=error, flush=flush)
@@ -617,87 +778,19 @@ class OPDTrainer:
         version = self.state.behavior_policy_version
         scored = await self._rollout_and_score(prompts, self._student_sampler)
         referenced = time.perf_counter()
-        datums = [sample.datum for sample in scored]
-        # A failed/cancelled backward can leave partial remote gradients. Keep
-        # the trainer unusable until both backward and optimizer have succeeded.
-        self._requires_restart = True
-        adam = optimizer_params(
-            self.args, trio.AdamParams, step=self.state.optimizer_steps + 1,
-            total_steps=self._checkpoint.optimizer_horizons["actor"],
-        )
-        update = await run_update_async(
-            self._training_client,
-            self._objective,
-            datums,
-            adam,
-        )
-        self.state.global_step += 1
-        self.state.optimizer_steps += 1
-        self.state.behavior_policy_version += 1
-        self._sampling_seed_offset += len(prompts)
-        self._student_sampler = None
-        self._requires_restart = False
-        input_tokens = compute_train_tokens(datums)
         sample_input_tokens = sum(len(prompt.tokens) for prompt in prompts)
         sample_output_tokens = sum(sample.tokens for sample in scored)
-        metrics = _remote_metrics(update.forward, update.optimizer)
-        metrics.update(
-            _importance_metrics(
-                update.forward,
-                datums,
-                self.args.importance_ratio_cap,
-            )
+        return await self._optimize_scored_async(
+            scored,
+            prompt_count=len(prompts),
+            behavior_policy_version=version,
+            sample_input_tokens=sample_input_tokens,
+            sample_output_tokens=sample_output_tokens,
+            started=started,
+            prepared=prepared,
+            snapshotted=snapshotted,
+            referenced=referenced,
         )
-        metrics.update(
-            self._metric_reducer.training(
-                scored,
-                prompt_count=len(prompts),
-                behavior_policy_version=version,
-            )
-        )
-        metrics.update(
-            {
-                "optim/lr": adam.learning_rate,
-                "data/input_tokens": float(input_tokens),
-                "time/prepare": prepared - started,
-                "time/snapshot": snapshotted - prepared,
-                "time/rollout_teacher": referenced - snapshotted,
-                "time/forward_backward": update.forward_seconds,
-                "time/optim": update.optimizer_seconds,
-            }
-        )
-        if self.args.importance_ratio_cap is not None:
-            metrics["policy/importance_ratio_cap"] = float(
-                self.args.importance_ratio_cap
-            )
-        checkpoint_path = None
-        self._total_tokens += input_tokens
-        self._sample_input_tokens += sample_input_tokens
-        self._sample_output_tokens += sample_output_tokens
-        metrics.update(
-            {
-                "usage/train_tokens": float(input_tokens),
-                "usage/train_tokens_total": float(self._total_tokens),
-                "usage/sample_input_tokens": float(sample_input_tokens),
-                "usage/sample_output_tokens": float(sample_output_tokens),
-                "usage/sample_input_tokens_total": float(
-                    self._sample_input_tokens
-                ),
-                "usage/sample_output_tokens_total": float(
-                    self._sample_output_tokens
-                ),
-            }
-        )
-        self.state.metrics = metrics
-        save_started = time.perf_counter()
-        if self.args.save_every and self.state.global_step % self.args.save_every == 0:
-            checkpoint_path = await self._save_state_async()
-        metrics["time/checkpoint"] = time.perf_counter() - save_started
-        metrics["time/step"] = time.perf_counter() - started
-        metrics["time/tokens_per_second"] = input_tokens / metrics["time/step"]
-        self._log(metrics)
-        self._checkpoint.publish(self)
-        return OPDResult(self.state.global_step, metrics, len(datums), version, checkpoint_path)
 
     # ------------------------------------------------------------------
     # Public one-step update
@@ -711,6 +804,148 @@ class OPDTrainer:
         finally:
             self._busy = False
 
+    async def create_sampling_snapshot(
+        self,
+        *,
+        stop=None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+    ):
+        """Export one immutable student policy for a complete agent batch.
+
+        Every turn in a multi-turn episode must use the same behavior policy.
+        The returned ``SamplingSnapshot`` binds the PyTRIO sampling client,
+        tokenizer, opaque snapshot identity, and numeric policy version that
+        later OPD validation checks before any teacher or optimizer request.
+        """
+
+        from ..agentrl.runtime.sampling import PyTRIOAgentSampler, SamplingSnapshot
+
+        self._enter()
+        try:
+            self._student_sampler = await call_async(
+                self._training_client,
+                "save_weights_and_get_sampling_client",
+            )
+            return SamplingSnapshot(
+                f"opd-step-{self.state.global_step}-{uuid4().hex}",
+                PyTRIOAgentSampler(
+                    self._student_sampler,
+                    self._tokenizer,
+                    stop=stop,
+                    temperature=temperature,
+                    top_p=top_p,
+                ),
+                self._tokenizer,
+                policy_version=self.state.behavior_policy_version,
+            )
+        finally:
+            self._busy = False
+
+    async def _step_rollouts_async(
+        self,
+        rollouts: Sequence[OPDRollout],
+        *,
+        prompt_count: int,
+    ) -> OPDResult:
+        """Teacher-score exact agent turns and perform one optimizer update."""
+
+        self._checkpoint.require_training_loop()
+        if not rollouts:
+            raise ValueError("Agent OPD requires at least one generated turn.")
+        version = self.state.behavior_policy_version
+        for rollout in rollouts:
+            if not isinstance(rollout, OPDRollout):
+                raise TypeError("Agent OPD input must contain OPDRollout records.")
+            if rollout.behavior_policy_version != version:
+                raise ValueError(
+                    "Agent OPD rejects stale or mixed behavior-policy versions."
+                )
+
+        started = time.perf_counter()
+        # Agent collection has already produced exact prompt and completion
+        # token IDs.  No second student generation is allowed at this boundary.
+        prepared = snapshotted = time.perf_counter()
+        scored = await self.execution_plan.materialize_rollouts(
+            rollouts,
+            teacher_clients=self._teacher_clients,
+            teacher_groups=self.teacher_groups,
+            config=self.args,
+            model_input_factory=trio.ModelInput.from_ints,
+        )
+        referenced = time.perf_counter()
+        return await self._optimize_scored_async(
+            scored,
+            prompt_count=prompt_count,
+            behavior_policy_version=version,
+            sample_input_tokens=sum(len(item.prompt_tokens) for item in rollouts),
+            sample_output_tokens=sum(len(item.completion_tokens) for item in rollouts),
+            started=started,
+            prepared=prepared,
+            snapshotted=snapshotted,
+            referenced=referenced,
+        )
+
+    async def step_rollouts_async(
+        self,
+        rollouts: Sequence[OPDRollout],
+        *,
+        prompt_count: int,
+    ) -> OPDResult:
+        """Public update entry point for turns collected by AgentRL."""
+
+        self._enter()
+        try:
+            return await self._step_rollouts_async(
+                rollouts,
+                prompt_count=prompt_count,
+            )
+        finally:
+            self._busy = False
+
+    async def publish_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """Publish agent execution metrics beside trainer-owned OPD metrics."""
+
+        payload = {str(name): float(value) for name, value in metrics.items()}
+        self.state.metrics.update(payload)
+        self._metrics_api.publish(payload, step=self.state.global_step)
+        return payload
+
+    async def save_sampler_checkpoint_async(self) -> str | None:
+        """Export student weights for Playground if explicitly enabled."""
+        self._enter()
+        try:
+            self._checkpoint.publish(self)
+            path = await self._sampler_checkpoint.save_async(
+                self._training_client, self.state, self._metrics_api
+            )
+            self._checkpoint.publish(self)
+            return path
+        finally:
+            self._busy = False
+
+    async def save_checkpoint_async(self) -> str:
+        """Save the current student and optimizer outside the built-in loop."""
+
+        self._enter()
+        try:
+            return await self._save_state_async()
+        finally:
+            self._busy = False
+
+    async def close(
+        self,
+        *,
+        state: str = "success",
+        error: str | None = None,
+        flush: bool = True,
+    ) -> None:
+        """Finalize the reporter owned by an external AgentRL training loop."""
+
+        if flush:
+            self._flush_log()
+        self._finish_run(state, error, flush=False)
+
     # ------------------------------------------------------------------
     # Validation: sampled student versus fixed teacher
     # ------------------------------------------------------------------
@@ -722,7 +957,9 @@ class OPDTrainer:
 
         config = self.args
         batch_size = config.eval_batch_size or config.batch_size
-        yield from iter_batches(dataset, batch_size, max_batches=config.eval_max_batches)
+        yield from iter_batches(
+            dataset, batch_size, max_batches=config.eval_max_batches
+        )
 
     def _publish_evaluation(self, metrics: Mapping[str, float]) -> dict[str, float]:
         """Store sampled distillation metrics without changing policy version."""
@@ -791,7 +1028,9 @@ class OPDTrainer:
 
     async def train_async(self, *, stop_after_step: int | None = None) -> OPDState:
         """Consume one pass of the dataset, with strictly fresh rollouts per update."""
-        limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+        limit, paused = training_limit(
+            self.args, self.state.global_step, stop_after_step
+        )
         self._checkpoint.begin()
         self._enter()
         started = time.perf_counter()
@@ -805,9 +1044,7 @@ class OPDTrainer:
         try:
             if self.train_dataset is None:
                 raise ValueError("train_dataset is required for train_async().")
-            if (
-                self._checkpoint.evaluation_due(self, self._last_eval_step)
-            ):
+            if self._checkpoint.evaluation_due(self, self._last_eval_step):
                 await self._evaluate_async(self.eval_dataset)
             batches = iter_batches(self._checkpoint.rows(self), self.args.batch_size)
             while limit is None or self.state.global_step < limit:
@@ -838,7 +1075,10 @@ class OPDTrainer:
                     await self._evaluate_async(self.eval_dataset)
                     self._checkpoint.publish(self)
             if self.state.global_step > initial_step:
-                if not self.args.save_every or self.state.global_step % self.args.save_every:
+                if (
+                    not self.args.save_every
+                    or self.state.global_step % self.args.save_every
+                ):
                     await self._save_state_async()
                 elapsed = time.perf_counter() - started
                 summary = {
@@ -852,9 +1092,7 @@ class OPDTrainer:
                     )
                     / elapsed,
                     "usage/train_tokens_total": float(self._total_tokens),
-                    "usage/sample_input_tokens_total": float(
-                        self._sample_input_tokens
-                    ),
+                    "usage/sample_input_tokens_total": float(self._sample_input_tokens),
                     "usage/sample_output_tokens_total": float(
                         self._sample_output_tokens
                     ),
@@ -875,6 +1113,11 @@ class OPDTrainer:
                 and self._last_eval_step != self.state.global_step
             ):
                 await self._evaluate_async(self.eval_dataset)
+            if not paused and self._sampler_checkpoint.due(self.state.global_step, final=True):
+                self._checkpoint.publish(self)
+                await self._sampler_checkpoint.save_async(
+                    self._training_client, self.state, self._metrics_api
+                )
             if self.state.checkpoint_path is not None:
                 self._checkpoint.publish(self)
         except BaseException as error:

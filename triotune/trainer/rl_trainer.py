@@ -26,6 +26,7 @@ from ..api.client_api import call_async
 from ..utils.checkpoint import TrainingCheckpoint, save_checkpoint_async, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.sampler_checkpoint import SamplerCheckpoint
 from ..utils.token_usage import SampleTokens
 from .ppo.actor import PPOActor
 from .ppo.advantages import PPOAlgorithmPlan
@@ -151,19 +152,46 @@ class PPOTrainer:
         self._last_eval_step: int | None = None
         self._rollout_metrics: dict[str, float] = {}
         self.state = PPOState()
+        self._sampler_checkpoint = SamplerCheckpoint(self.args.checkpoint.sampler, "ppo")
         self._checkpoint = TrainingCheckpoint(
-            self.args, "ppo", train_dataset, eval_dataset,
-            identity={"model": self.model, "lora_rank": lora_rank, "reference": self.reference_model},
+            self.args,
+            "ppo",
+            train_dataset,
+            eval_dataset,
+            identity={
+                "model": self.model,
+                "lora_rank": lora_rank,
+                "reference": self.reference_model,
+            },
         )
-        if self._checkpoint.enabled and any(value is not None for value in (
-            critic, self.algorithm_plan, training_client, critic_training_client,
-            reference_client, tokenizer,
-        )):
-            raise ValueError("Complete PPO checkpoints require owned PyTRIO clients and built-in algorithm plans.")
+        if self._checkpoint.enabled and any(
+            value is not None
+            for value in (
+                critic,
+                self.algorithm_plan,
+                training_client,
+                critic_training_client,
+                reference_client,
+                tokenizer,
+            )
+        ):
+            raise ValueError(
+                "Complete PPO checkpoints require owned PyTRIO clients and built-in algorithm plans."
+            )
 
     # ------------------------------------------------------------------
     # Client initialization and reference-model setup
     # ------------------------------------------------------------------
+
+    @property
+    def tokenizer(self):
+        """Expose the initialized actor tokenizer for exact AgentRL rendering."""
+
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "PPOTrainer must be initialized before reading tokenizer."
+            )
+        return self._tokenizer
 
     async def initialize(self) -> None:
         """Create clients, tokenizers, reporters, and the actor exactly once."""
@@ -205,7 +233,8 @@ class PPOTrainer:
                 if self._service is None:
                     self._service = trio.ServiceClient()
                 self._critic_client = await self._checkpoint.create_client_async(
-                    self._service, component="critic",
+                    self._service,
+                    component="critic",
                     base_model=self.model,
                     rank=self.args.critic_lora_rank or self.lora_rank,
                     seed=None if self.args.seed is None else self.args.seed + 1,
@@ -214,7 +243,12 @@ class PPOTrainer:
                 raise ValueError(
                     "Actor and critic must use independent training clients."
                 )
-            self.critic = PyTRIOCritic(self._critic_client, self.args, token_ids, total_steps=self._checkpoint.optimizer_horizons["critic"])
+            self.critic = PyTRIOCritic(
+                self._critic_client,
+                self.args,
+                token_ids,
+                total_steps=self._checkpoint.optimizer_horizons["critic"],
+            )
 
         # Actor and critic remain independent training clients, but one PPO
         # experiment owns one metric run with component-specific namespaces.
@@ -229,7 +263,12 @@ class PPOTrainer:
             },
             logging_step=self.args.logging_step,
         )
-        self._actor = PPOActor(self._client, self.args, self.algorithm_plan, total_steps=self._checkpoint.optimizer_horizons["actor"])
+        self._actor = PPOActor(
+            self._client,
+            self.args,
+            self.algorithm_plan,
+            total_steps=self._checkpoint.optimizer_horizons["actor"],
+        )
         self._checkpoint.restore(self)
 
     async def _references(self, trajectories):
@@ -251,7 +290,13 @@ class PPOTrainer:
             )
         await score_reference(self._reference, trajectories)
 
-    async def create_sampling_snapshot(self, *, stop=None) -> SamplingSnapshot:
+    async def create_sampling_snapshot(
+        self,
+        *,
+        stop=None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+    ) -> SamplingSnapshot:
         """Export current actor weights for an entire custom agent batch.
 
         The returned sampling client is a fixed exported policy. Collection may
@@ -268,7 +313,13 @@ class PPOTrainer:
         )
         return SamplingSnapshot(
             f"step-{self.state.global_step}-{uuid4().hex}",
-            PyTRIOAgentSampler(self._sampling, self._tokenizer, stop=stop),
+            PyTRIOAgentSampler(
+                self._sampling,
+                self._tokenizer,
+                stop=stop,
+                temperature=temperature,
+                top_p=top_p,
+            ),
             self._tokenizer,
             policy_version=self.state.global_step,
         )
@@ -548,11 +599,26 @@ class PPOTrainer:
         )
         if self.args.save_every and self.state.global_step % self.args.save_every == 0:
             await self.save_checkpoint()
+        if self._checkpoint.loop_owner is None and self._sampler_checkpoint.due(
+            self.state.global_step
+        ):
+            await self.save_sampler_checkpoint_async()
         return self.state.metrics
 
     # ------------------------------------------------------------------
     # Checkpointing and run finalization
     # ------------------------------------------------------------------
+
+    async def save_sampler_checkpoint_async(self) -> str | None:
+        """Export actor weights for Playground; never export the critic."""
+        if not self._sampler_checkpoint.due(self.state.global_step, final=True):
+            return self.state.sampler_checkpoint_path
+        await self.initialize()
+        path = await self._sampler_checkpoint.save_async(
+            self._client, self.state, self._metrics
+        )
+        self._checkpoint.publish(self)
+        return path
 
     async def save_checkpoint(self) -> str:
         """Save owned actor and critic states and return the actor checkpoint."""
@@ -629,7 +695,9 @@ class PPOTrainer:
             for trajectory in generated:
                 trajectory.policy_version = self.state.global_step
                 trajectory.snapshot_id = getattr(
-                    self._sampling, "sampling_run_cuid", f"step-{self.state.global_step}"
+                    self._sampling,
+                    "sampling_run_cuid",
+                    f"step-{self.state.global_step}",
                 )
             self._next_group += len(source)
             sampled_groups += len(source)
@@ -812,7 +880,9 @@ class PPOTrainer:
         progress = None
         try:
             await self.initialize()
-            limit, paused = training_limit(self.args, self.state.global_step, stop_after_step)
+            limit, paused = training_limit(
+                self.args, self.state.global_step, stop_after_step
+            )
             self._checkpoint.begin()
             initial_step = self.state.global_step
             progress = tqdm(
@@ -821,15 +891,10 @@ class PPOTrainer:
                 desc="PPO train",
                 unit="step",
             )
-            if (
-                self._checkpoint.evaluation_due(self, self._last_eval_step)
-            ):
+            if self._checkpoint.evaluation_due(self, self._last_eval_step):
                 await self.evaluate()
             rows = self._checkpoint.rows(self)
-            while (
-                limit is None
-                or self.state.global_step < limit
-            ):
+            while limit is None or self.state.global_step < limit:
                 start = time.perf_counter()
                 initial_sample_input = self._sample_input_tokens
                 initial_sample_output = self._sample_output_tokens
@@ -924,6 +989,8 @@ class PPOTrainer:
                 summary,
                 step=self.state.global_step,
             )
+            if not paused and self._sampler_checkpoint.due(self.state.global_step, final=True):
+                await self.save_sampler_checkpoint_async()
             self._checkpoint.publish(self)
             await self.close(flush=not paused)
         except BaseException as error:

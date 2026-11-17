@@ -6,6 +6,7 @@ from importlib import import_module
 from ..api.cli_args import (
     BaseTrainerConfig,
     CheckpointConfig,
+    SamplerCheckpointConfig,
     DatasetConfig,
     DPOConfig,
     DPODataConfig,
@@ -146,6 +147,7 @@ def __getattr__(name):
 __all__ = [
     "BaseTrainerConfig",
     "CheckpointConfig",
+    "SamplerCheckpointConfig",
     "DatasetConfig",
     "DPOConfig",
     "DPODataConfig",

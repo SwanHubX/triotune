@@ -42,4 +42,14 @@ uv run python examples/agent/calculator/train.py --mode train
 
 奖励提交、分支、上下文压缩、策略年龄和分组过滤见 [agentrl_training_CN.md](../../docs/agenrl/agentrl_training_CN.md)。OpenAI session 所有权、回放、恢复和第三方转发见 [agentrl_openai_CN.md](../../docs/agenrl/agentrl_openai_CN.md)。
 
-采样 temperature 和 top-p 固定为 1，以满足 PPO 的 log probability 契约。先使用同步采集和固定快照；完成 tokenizer 与 probe 检查后，再开启有界异步采集。
+训练采样 temperature 和 top-p 固定为 1，以满足 PPO 的 log probability 契约。
+评估可通过 `AgentConfig(evaluation={"temperature": 0.4, "top_p": 1.0})`
+单独配置；这些快照会在进入训练采集或更新前被拒绝。先使用同步采集和固定
+快照；完成 tokenizer 与 probe 检查后，再开启有界异步采集。
+
+`AgentOPDTrainingLoop(OPDTrainer(...), workflow)` 提供同步、多轮、逐动作
+teacher 蒸馏。续训同样恢复 seed 游标、更新历史及评估进度。
+`post_tool_stop` 可在所有工具结果记录完成后结束 episode，默认不开启。
+训练 JSONL 保留完整 token 证据；OPD 评估使用精简的 `eval-episodes.jsonl`。
+指标统一由 trainer 发布到 SwanLab，终端显示训练进度和损失。
+Sampler 保存与保留配置见 [包说明](../README.md)。

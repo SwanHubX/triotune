@@ -1,5 +1,7 @@
 # WebShop GiGPO
 
+[![Zhihu Tutorial](https://img.shields.io/badge/Zhihu-GiGPO_Tutorial-0084FF?style=flat-square&logo=zhihu&logoColor=white)](https://zhuanlan.zhihu.com/p/2099569957122196987)
+
 ## Install the environment
 
 TrioTune requires Python 3.12. The WebShop simulator also requires Git and

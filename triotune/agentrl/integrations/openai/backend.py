@@ -29,6 +29,7 @@ from ...runtime.sampling import (
     PPO_TEMPERATURE,
     PPO_TOP_P,
     SamplingSnapshot,
+    validate_training_snapshot,
 )
 from ...types import (
     ActionParseError,
@@ -250,6 +251,7 @@ class PyTRIOBackend:
         """
         if not isinstance(snapshot, SamplingSnapshot):
             raise AgentContractError("PyTRIO backend requires a SamplingSnapshot.")
+        validate_training_snapshot(snapshot)
         if not isinstance(model, str) or not model:
             raise ValueError("PyTRIO backend model must be a nonempty string.")
         self.snapshot = snapshot

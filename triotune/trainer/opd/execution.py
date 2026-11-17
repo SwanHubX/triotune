@@ -204,6 +204,66 @@ class OPDExecutionPlan:
             for sample in prompt_samples
         ]
 
+    async def materialize_rollouts(
+        self,
+        rollouts: Sequence[OPDRollout],
+        *,
+        teacher_clients: Mapping[str, Any],
+        teacher_groups: Mapping[str, Mapping[str, float]],
+        config: Any,
+        model_input_factory: Any = None,
+    ) -> list[OPDTrainingSample]:
+        """Score existing on-policy rollouts without generating replacements.
+
+        Agent environments already own student generation because every turn
+        depends on an external observation.  Re-sampling inside the ordinary
+        prompt rollout phase would lose that observation and would attach the
+        behavior probability to a different action.  This entry point accepts
+        the original token IDs and behavior log-probabilities captured by the
+        agent runner, asks the fixed teacher to score those exact actions, and
+        returns training samples in input order.
+
+        A failure cancels sibling requests before any optimizer call.  The
+        method intentionally performs no policy update; ``OPDTrainer`` remains
+        the sole owner of optimizer state and failure recovery.
+        """
+
+        if not rollouts:
+            raise ValueError("Agent OPD execution requires at least one rollout.")
+        for rollout in rollouts:
+            if not isinstance(rollout, OPDRollout):
+                raise TypeError("Agent OPD rollouts must be OPDRollout records.")
+
+        scoring_slots = asyncio.Semaphore(config.max_concurrent_scoring)
+        pending = iter(enumerate(rollouts))
+        results: list[OPDTrainingSample | None] = [None] * len(rollouts)
+
+        async def score(index: int, rollout: OPDRollout) -> None:
+            teacher_weights = teacher_groups.get(rollout.teacher_group)
+            if teacher_weights is None:
+                raise ValueError(f"Unknown teacher group {rollout.teacher_group!r}.")
+            async with scoring_slots:
+                target = await self.teacher_phase.score(
+                    teacher_clients=teacher_clients,
+                    teacher_weights=teacher_weights,
+                    rollout=rollout,
+                    model_input_factory=model_input_factory,
+                )
+            results[index] = self.target_builder.build(target)
+
+        async def worker() -> None:
+            # ``next`` executes without an await, so cooperative workers cannot
+            # claim the same item even when scoring completion order differs.
+            for index, rollout in pending:
+                await score(index, rollout)
+
+        async with asyncio.TaskGroup() as group:
+            for _ in range(min(len(rollouts), config.max_concurrent_scoring)):
+                group.create_task(worker())
+        if any(result is None for result in results):
+            raise RuntimeError("Agent OPD scoring did not finish every rollout.")
+        return [result for result in results if result is not None]
+
 
 __all__ = [
     "OPDExecutionPlan",

@@ -81,6 +81,17 @@ def _tuple_tree(value):
     return tuple(_tuple_tree(v) for v in value) if isinstance(value, list) else value
 
 
+def _loop_identity(identity):
+    """Omit only new default evaluation options for legacy agent manifests."""
+    identity = copy.deepcopy(identity)
+    evaluation = identity.get("evaluation")
+    if isinstance(evaluation, dict):
+        for name in ("temperature", "top_p"):
+            if evaluation.get(name) == 1.0:
+                evaluation.pop(name)
+    return identity
+
+
 def capture_rng():
     """Serialize local RNGs as plain JSON, never executable pickle payloads.
 
@@ -178,6 +189,12 @@ def load_training_checkpoint(path):
         state_fields |= {"critic_optimizer_steps", "critic_checkpoint_path"}
     elif payload["algorithm"] == "opd":
         state_fields.add("behavior_policy_version")
+    # Playground export metadata is optional so older manifests remain loadable.
+    if "sampler_checkpoint_path" in state:
+        state_fields.add("sampler_checkpoint_path")
+        sampler_path = state["sampler_checkpoint_path"]
+        if sampler_path is not None and (not isinstance(sampler_path, str) or not sampler_path):
+            raise ValueError("Checkpoint sampler URI must be non-empty text or null.")
     if set(state) != state_fields or not isinstance(state["metrics"], dict):
         raise ValueError("Checkpoint trainer state is incomplete.")
     for name in ("global_step", "optimizer_steps", "data_cursor"):
@@ -200,6 +217,25 @@ def load_training_checkpoint(path):
             or component["train_tokens"] < 0
         ):
             raise ValueError("Checkpoint component token accounting is invalid.")
+        sampler = component.get("sampler_checkpoint")
+        if sampler is not None:
+            if (
+                name != "actor"
+                or not isinstance(sampler, dict)
+                or set(sampler) != {"uri", "step", "ttl_seconds"}
+                or not isinstance(sampler["uri"], str)
+                or not sampler["uri"]
+                or (sampler["step"] is not None and (
+                    type(sampler["step"]) is not int
+                    or not 0 < sampler["step"] <= state["global_step"]
+                ))
+                or (sampler["ttl_seconds"] is not None and (
+                    type(sampler["ttl_seconds"]) is not int or sampler["ttl_seconds"] < 1
+                ))
+            ):
+                raise ValueError("Checkpoint sampler export metadata is invalid.")
+            if state.get("sampler_checkpoint_path", sampler["uri"]) != sampler["uri"]:
+                raise ValueError("Checkpoint sampler URI does not match trainer state.")
     if payload["format_version"] == FORMAT_VERSION:
         if set(payload["schedulers"]) != set(payload["components"]):
             raise ValueError("Checkpoint scheduler components are incomplete.")
@@ -305,6 +341,9 @@ def load_training_checkpoint(path):
         torch.Generator().set_state(
             torch.tensor(payload["rng"]["torch_cpu"], dtype=torch.uint8)
         )
+    sampler = payload["components"]["actor"].get("sampler_checkpoint")
+    if sampler is not None:
+        state["sampler_checkpoint_path"] = sampler["uri"]
     return payload
 
 
@@ -510,11 +549,12 @@ class TrainingCheckpoint:
             return
         current = {
             "kind": kind,
-            "identity": json.loads(_json_bytes(identity or {})),
+            "identity": json.loads(_json_bytes(_loop_identity(identity or {}))),
             "state": {},
         }
-        if self.loaded and any(
-            self.loaded["loop"][key] != current[key] for key in ("kind", "identity")
+        if self.loaded and (
+            self.loaded["loop"]["kind"] != current["kind"]
+            or _loop_identity(self.loaded["loop"]["identity"]) != current["identity"]
         ):
             raise ValueError(
                 "Checkpoint execution loop or agent configuration does not match."
@@ -562,6 +602,9 @@ class TrainingCheckpoint:
         self.saved_step = self.loaded["state"]["global_step"]
         for key, value in self.loaded["state"].items():
             setattr(trainer.state, key, copy.deepcopy(value))
+        sampler = self.loaded["components"]["actor"].get("sampler_checkpoint")
+        if sampler is not None:
+            trainer._sampler_checkpoint.restore(sampler)
         for key, value in self.loaded["runtime"].items():
             if key in _RUNTIME_FIELDS:
                 setattr(trainer, key, copy.deepcopy(value))
@@ -657,6 +700,9 @@ class TrainingCheckpoint:
         if not trainer.state.checkpoint_path:
             raise ValueError("Cannot publish runtime state without saved actor state.")
         state = asdict(trainer.state)
+        # Optional exports belong to component metadata. Keep the historical
+        # state schema so older Triotune loaders can still resume our manifests.
+        sampler_path = state.pop("sampler_checkpoint_path", None)
         self.directory.mkdir(parents=True, exist_ok=True)
         target = (
             self.directory
@@ -674,6 +720,10 @@ class TrainingCheckpoint:
                 ),
             }
         }
+        if sampler_path is not None:
+            components["actor"]["sampler_checkpoint"] = (
+                trainer._sampler_checkpoint.metadata(sampler_path)
+            )
         if getattr(trainer.args, "use_critic", False):
             if not trainer.state.critic_checkpoint_path:
                 raise ValueError(

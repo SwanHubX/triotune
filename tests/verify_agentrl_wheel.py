@@ -45,10 +45,16 @@ def verify(output: Path) -> Path:
         path.relative_to(ROOT).as_posix()
         for path in (ROOT / "triotune" / "agentrl").rglob("*.py")
     }
+    expected |= {
+        "triotune/utils/sampler_checkpoint.py",
+    }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
     missing = expected - names
-    old = {name for name in names if name.startswith("triotune/agent/")}
+    old = {
+        name for name in names
+        if name.startswith(("triotune/agent/", "triotune/configs/"))
+    }
     if missing or old:
         raise RuntimeError(
             f"Invalid wheel contents: missing={sorted(missing)}, obsolete={sorted(old)}"
@@ -65,14 +71,14 @@ print('All agentrl modules imported from the wheel.')
     modules = sorted(
         path[:-3].replace("/", ".")
         for path in expected
-        if not path.endswith("/__init__.py")
+        if path.endswith(".py") and not path.endswith("/__init__.py")
     )
     subprocess.run(
         [sys.executable, "-I", "-c", code, str(wheel), "triotune.agentrl", *modules],
         check=True,
         timeout=30,
     )
-    print(f"Verified {len(expected)} agentrl files in {wheel}")
+    print(f"Verified {len(expected)} AgentRL and sampler files in {wheel}")
     return wheel
 
 

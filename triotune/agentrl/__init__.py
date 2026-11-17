@@ -13,7 +13,7 @@ and optimization remain behind the existing PyTRIO/trainer boundaries.
 """
 
 from .config import AgentConfig, AgentEvaluationConfig, RetryPolicy
-from .diagnostics.logging import JsonlEpisodeLogger
+from .diagnostics.logging import JsonlEpisodeLogger, JsonlEvaluationSummaryLogger
 from .diagnostics.validation import probe_tokenizer
 from .rollout.trajectory import EpisodeTrajectoryBuilder
 from .rollout.workflow import (
@@ -57,6 +57,11 @@ _sys.modules.setdefault(__name__ + ".sdk.openai", _openai_integration)
 from .training.evaluation import evaluation_metrics, paired_task_metrics
 from .training.gigpo import GiGPOAdvantageProvider, GiGPOConfig
 from .training.loop import AgentTrainingLoop
+from .training.opd import (
+    AgentOPDTrainingLoop,
+    AgentOPDUpdate,
+    episode_turn_rollouts,
+)
 from .training.rewards import (
     CompositeScorer,
     CostConfig,
@@ -130,6 +135,8 @@ __all__ = [
     "AgentEvent",
     "AgentRolloutBatch",
     "AgentRolloutWorkflow",
+    "AgentOPDTrainingLoop",
+    "AgentOPDUpdate",
     "AgentSampler",
     "AgentTrainingLoop",
     "AgentTurn",
@@ -168,6 +175,7 @@ __all__ = [
     "JsonActionParser",
     "JsonObservationFormatter",
     "JsonlEpisodeLogger",
+    "JsonlEvaluationSummaryLogger",
     "NativeToolContinuationRenderer",
     "ObservationFormatter",
     "OpenAIClient",
@@ -202,6 +210,7 @@ __all__ = [
     "TurnRewardScorer",
     "current_execution_context",
     "evaluation_metrics",
+    "episode_turn_rollouts",
     "function_tool",
     "paired_task_metrics",
     "probe_tokenizer",

@@ -9,6 +9,8 @@ to serve every turn and task group collected before the next optimizer update.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -19,17 +21,49 @@ from ...api.client_api import call_async
 from ...utils.token_usage import compute_sample_tokens
 from ..types import AgentContractError, AgentSampler, Generation, validate_tokens
 
-# PPO behavior-policy log probabilities are only valid for the deterministic
-# sampling configuration used by the existing trainer contract.
+# Training behavior-policy log probabilities are valid only for the unwarped
+# defaults below. Evaluation may explicitly request another distribution
+# because its generations never enter an optimizer update.
 PPO_TEMPERATURE = 1.0
 PPO_TOP_P = 1.0
+
+
+def validate_training_snapshot(snapshot) -> None:
+    """Reject evaluation distributions before collection or optimization.
+
+    Custom samplers without these attributes retain the existing AgentSampler
+    contract: their implementer supplies unwarped behavior probabilities.
+    """
+    for name in ("temperature", "top_p"):
+        value = getattr(snapshot.sampler, name, 1.0)
+        if isinstance(value, bool) or value != 1.0:
+            raise AgentContractError(
+                f"Training snapshots require {name}=1; use is_eval=True for evaluation."
+            )
+
+
+async def create_sampling_snapshot(trainer, *, stop=None, temperature=1.0, top_p=1.0):
+    """Support legacy stop-only trainers without swallowing their exceptions."""
+    factory = trainer.create_sampling_snapshot
+    options = dict(stop=stop, temperature=temperature, top_p=top_p)
+    signature = inspect.signature(factory)
+    try:
+        signature.bind(**options)
+    except TypeError:
+        if temperature != 1.0 or top_p != 1.0:
+            raise AgentContractError(
+                "Custom trainer must accept temperature and top_p for non-default evaluation."
+            ) from None
+        signature.bind(stop=stop)
+        options = dict(stop=stop)
+    return await factory(**options)
 
 
 class PyTRIOAgentSampler:
     """Adapt an existing immutable sampling client; never refresh it mid-episode.
 
-    Sampling stays at temperature=top_p=1 so returned behavior logprobs match
-    the target-logprob contract used by Triotune's PPO implementation.
+    Training callers retain temperature=top_p=1 so returned behavior logprobs
+    match the target-logprob contract. Evaluation callers may override them.
     """
 
     def __init__(
@@ -38,6 +72,8 @@ class PyTRIOAgentSampler:
         tokenizer: Any,
         *,
         stop: str | Sequence[str] | Sequence[int] | None = None,
+        temperature: float = PPO_TEMPERATURE,
+        top_p: float = PPO_TOP_P,
     ):
         """Wrap a sampling client and its tokenizer without changing its weights.
 
@@ -45,7 +81,18 @@ class PyTRIOAgentSampler:
         sequence. The caller must use stop conventions compatible with its
         parser and chat template, especially when stop markers are not returned.
         """
+        for name, value in (("temperature", temperature), ("top_p", top_p)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                or (name == "top_p" and value > 1)
+            ):
+                bound = "positive" if name == "temperature" else "in (0, 1]"
+                raise ValueError(f"{name} must be finite and {bound}.")
         self.client, self.tokenizer, self.stop = client, tokenizer, stop
+        self.temperature, self.top_p = float(temperature), float(top_p)
         self.sampling_source = "pytrio"
 
     async def generate(
@@ -78,8 +125,8 @@ class PyTRIOAgentSampler:
             num_samples=1,
             sampling_params=trio.SamplingParams(
                 max_tokens=max_tokens,
-                temperature=PPO_TEMPERATURE,
-                top_p=PPO_TOP_P,
+                temperature=self.temperature,
+                top_p=self.top_p,
                 seed=seed,
                 stop=self.stop,
             ),

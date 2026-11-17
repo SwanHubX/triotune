@@ -33,6 +33,7 @@ from ..utils.checkpoint import (
 )
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.sampler_checkpoint import SamplerCheckpoint
 from ..utils.scoring import (
     score_completion,
     score_completion_async,
@@ -113,6 +114,7 @@ class DPOTrainer:
                 "DPO policy and reference models must use identical token-to-ID vocabularies."
             )
         self.state = DPOState()
+        self._sampler_checkpoint = SamplerCheckpoint(self.args.checkpoint.sampler, "dpo")
         self._last_eval_step: int | None = None
         self._total_tokens = 0
         self._total_pairs = 0
@@ -422,7 +424,27 @@ class DPOTrainer:
         metrics["time/pairs_per_second"] = count / metrics["time/step"]
         self._log_swanlab(metrics, count)
         self._checkpoint.publish(self)
+        if self._sampler_checkpoint.due(self.state.global_step):
+            self.save_sampler_checkpoint()
         return result
+
+    def save_sampler_checkpoint(self) -> str | None:
+        """Export the current policy for Playground if explicitly enabled."""
+        self._checkpoint.publish(self)
+        path = self._sampler_checkpoint.save(
+            self._training_client, self.state, self._metrics_api
+        )
+        self._checkpoint.publish(self)
+        return path
+
+    async def save_sampler_checkpoint_async(self) -> str | None:
+        """Asynchronous Playground export, independent of Train checkpoints."""
+        self._checkpoint.publish(self)
+        path = await self._sampler_checkpoint.save_async(
+            self._training_client, self.state, self._metrics_api
+        )
+        self._checkpoint.publish(self)
+        return path
 
     def _save_state(self) -> str:
         """Save policy weights and optimizer state for the current step."""
@@ -526,6 +548,8 @@ class DPOTrainer:
         metrics["time/pairs_per_second"] = len(pairs) / metrics["time/step"]
         self._log_swanlab(metrics, len(pairs))
         self._checkpoint.publish(self)
+        if self._sampler_checkpoint.due(self.state.global_step):
+            await self.save_sampler_checkpoint_async()
         return result
 
     @staticmethod
@@ -740,6 +764,8 @@ class DPOTrainer:
             if not paused:
                 self._log_final_samples(last_rows)
             self._log_training_summary(started)
+            if not paused and self._sampler_checkpoint.due(self.state.global_step, final=True):
+                self.save_sampler_checkpoint()
             if self.state.checkpoint_path is not None:
                 self._checkpoint.publish(self)
         except BaseException as error:
@@ -806,6 +832,8 @@ class DPOTrainer:
             if not paused:
                 await self._log_final_samples_async(last_rows)
             self._log_training_summary(started)
+            if not paused and self._sampler_checkpoint.due(self.state.global_step, final=True):
+                await self.save_sampler_checkpoint_async()
             if self.state.checkpoint_path is not None:
                 self._checkpoint.publish(self)
         except BaseException as error:

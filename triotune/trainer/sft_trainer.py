@@ -18,6 +18,7 @@ from ..dataset import SupervisedExample, prepare_sft
 from ..utils.checkpoint import TrainingCheckpoint, checkpoint_path, training_limit
 from ..utils.dataloader import iter_batches, num_batches
 from ..utils.metrics import MetricsAPI
+from ..utils.sampler_checkpoint import SamplerCheckpoint
 from ..utils.token_usage import compute_train_tokens
 from .sft.state import SFTState
 
@@ -70,6 +71,7 @@ class SFTTrainer:
         self._tokenizer = self._client.get_tokenizer()
         self._objective = BuiltinPyTrioObjective(LossSpec("cross_entropy"))
         self.state = SFTState()
+        self._sampler_checkpoint = SamplerCheckpoint(self.args.checkpoint.sampler, "sft")
         self._last_eval_step: int | None = None
         self._train_tokens = 0
         self._metrics_api = MetricsAPI.from_config(
@@ -249,6 +251,15 @@ class SFTTrainer:
                 "save_state",
                 name=f"sft-step-{step:08d}",
             )
+        sampler_future = None
+        sampler_error = None
+        if self._sampler_checkpoint.due(step):
+            try:
+                sampler_future = await self._sampler_checkpoint.submit_async(self._client, step)
+            except Exception as error:
+                # A rejected export submission must not discard the already
+                # submitted optimizer and Train-save acknowledgements.
+                sampler_error = error
         token_count = sum(
             target != -100
             for example in examples
@@ -315,9 +326,28 @@ class SFTTrainer:
             )
             if save_future is not None:
                 self._checkpoint.remote_saved(self)
+            if sampler_error is not None:
+                raise sampler_error
+            if sampler_future is not None:
+                await self._sampler_checkpoint.collect_async(
+                    sampler_future, self.state, self._metrics_api, step
+                )
+                self._checkpoint.publish(self)
             return metrics
 
         return asyncio.create_task(collect())
+
+    async def save_sampler_checkpoint_async(self) -> str | None:
+        """Export the completed policy for Playground when sampler.enabled is true.
+
+        Call after step()/train(), with no pipeline submissions outstanding.
+        Train checkpoints and optimizer state are unaffected.
+        """
+        path = await self._sampler_checkpoint.save_async(
+            self._client, self.state, self._metrics_api
+        )
+        self._checkpoint.publish(self)
+        return path
 
     async def _save_state(self) -> None:
         """Save weights and optimizer state at the current completed step."""
@@ -438,6 +468,8 @@ class SFTTrainer:
                     data=self.state.checkpoint_path,
                     step=self.state.global_step,
                 )
+            if not paused and self._sampler_checkpoint.due(self.state.global_step, final=True):
+                await self.save_sampler_checkpoint_async()
             if self.state.checkpoint_path is not None:
                 self._checkpoint.publish(self)
             self._metrics_api.finish(flush=not paused)
