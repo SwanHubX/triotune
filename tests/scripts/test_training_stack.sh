@@ -11,7 +11,7 @@ export HF_HUB_OFFLINE=1
 # trio_test.py is an executable cloud service probe, not a regression test.
 "${AUDIT_PYTHON}" -m pytest -q tests tests/audit_agentrl_functionality.py \
   --ignore=tests/trio_test.py -rs
-if [[ -f examples/agent/webshop-opd/train/scripts/test-agent-opd.sh ]]; then
-  PYTHON="${AUDIT_PYTHON}" bash examples/agent/webshop-opd/train/scripts/test-agent-opd.sh
+if [[ -f examples/agent/webshop-tcod/train/scripts/test-agent-opd.sh ]]; then
+  PYTHON="${AUDIT_PYTHON}" bash examples/agent/webshop-tcod/train/scripts/test-agent-opd.sh
 fi
 "${AUDIT_PYTHON}" tests/verify_agentrl_wheel.py --output "${AUDIT_OUTPUT}/dist"

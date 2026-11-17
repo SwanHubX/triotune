@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../.." && pwd)"
-EXAMPLE_ROOT="${REPO_ROOT}/examples/agent/webshop-opd"
+EXAMPLE_ROOT="${REPO_ROOT}/examples/agent/webshop-tcod"
 
 cd "${REPO_ROOT}"
 source "${EXAMPLE_ROOT}/eval/scripts/setup-java.sh" "$@"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../.." && pwd)"
-EXAMPLE_ROOT="${REPO_ROOT}/examples/agent/webshop-opd"
+EXAMPLE_ROOT="${REPO_ROOT}/examples/agent/webshop-tcod"
 
 # Exercise the unified repository package with WebShop adapters.  Root test
 # support supplies deterministic fake clients and a calculator environment;

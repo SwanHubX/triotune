@@ -7,8 +7,8 @@ the usual environment settings before starting a real evaluation.
 From the repository root:
 
 ```bash
-bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh
-bash examples/agent/webshop-opd/eval/scripts/run-teacher-eval.sh
+bash examples/agent/webshop-tcod/eval/scripts/run-student-eval.sh
+bash examples/agent/webshop-tcod/eval/scripts/run-teacher-eval.sh
 ```
 
 Add `--check-config` to either command to validate settings without accessing
@@ -23,8 +23,8 @@ Both configurations select the same first 200 official validation goals
 Override the YAML for one run with `--pass-k 1` or `--pass-k 4`:
 
 ```bash
-bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh --pass-k 4
-bash examples/agent/webshop-opd/eval/scripts/run-teacher-eval.sh --pass-k 4
+bash examples/agent/webshop-tcod/eval/scripts/run-student-eval.sh --pass-k 4
+bash examples/agent/webshop-tcod/eval/scripts/run-teacher-eval.sh --pass-k 4
 ```
 
 Each response selects one action. Each episode

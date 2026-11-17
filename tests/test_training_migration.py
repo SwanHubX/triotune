@@ -333,7 +333,7 @@ class CheckpointMigrationTests(unittest.IsolatedAsyncioTestCase):
 
 class RealReportingTests(unittest.TestCase):
     def test_webshop_entries_select_root_and_reject_a_preloaded_copy(self):
-        example = ROOT / "examples/agent/webshop-opd"
+        example = ROOT / "examples/agent/webshop-tcod"
         if not example.exists():
             self.skipTest("WebShop application is not present in this checkout.")
         scripts = [

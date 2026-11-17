@@ -39,7 +39,7 @@ class WebShopBackend:
         source_dir = source_dir.resolve()
         if not (source_dir / "web_agent_site/envs/web_agent_text_env.py").is_file():
             raise FileNotFoundError(
-                f"WebShop source missing: {source_dir}; see examples/agent/webshop-opd/README.md."
+                f"WebShop source missing: {source_dir}; see examples/agent/webshop-tcod/README.md."
             )
         revision = subprocess.check_output(
             ["git", "-C", str(source_dir), "rev-parse", "HEAD"], text=True

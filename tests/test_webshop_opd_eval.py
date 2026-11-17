@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-EVAL = ROOT / "examples/agent/webshop-opd/eval"
+EVAL = ROOT / "examples/agent/webshop-tcod/eval"
 SPEC = importlib.util.spec_from_file_location(
     "webshop_opd_eval", EVAL / "beforetraining_eval.py"
 )

@@ -11,7 +11,7 @@ The example requires **Python 3.12, Java 11, and valid PyTRIO credentials**. Run
 ```bash
 uv sync
 uv pip install "torch>=2.3" --index-url https://download.pytorch.org/whl/cpu
-uv pip install -r examples/agent/webshop-opd/requirements-webshop.txt
+uv pip install -r examples/agent/webshop-tcod/requirements-webshop.txt
 ```
 
 Set JAVA_HOME to a Java 11 installation, or place the JDK under data/webshop-opd/java. CPU-only PyTorch is sufficient because model computation runs through PyTRIO.
@@ -24,7 +24,7 @@ Set JAVA_HOME to a Java 11 installation, or place the JDK under data/webshop-opd
 mkdir -p data/webshop-opd
 git clone https://github.com/princeton-nlp/WebShop.git data/webshop-opd/WebShop
 git -C data/webshop-opd/WebShop checkout 64fa2a5c15c7daa698b9ac93f5bb5437b634c9bd
-bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh --prepare-data --download
+bash examples/agent/webshop-tcod/eval/scripts/run-student-eval.sh --prepare-data --download
 ```
 
 The generated files are stored in the following locations:
@@ -89,7 +89,7 @@ Run all commands from the repository root. Add --check-config to any training co
 Train the Qwen3.5-4B teacher used by later OPD and TCOD experiments:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-grpo-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/run-grpo-teacher.sh
 ```
 
 ### 2. Vanilla OPD
@@ -97,13 +97,13 @@ bash examples/agent/webshop-opd/train/scripts/run-grpo-teacher.sh
 Use the original Qwen3.8-27B teacher:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-vanilla-opd.sh
+bash examples/agent/webshop-tcod/train/scripts/run-vanilla-opd.sh
 ```
 
 Use the GRPO-trained Qwen3.5-4B teacher:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-vanilla-opd-grpo-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/run-vanilla-opd-grpo-teacher.sh
 ```
 
 ### 3. TCOD-F2B
@@ -111,13 +111,13 @@ bash examples/agent/webshop-opd/train/scripts/run-vanilla-opd-grpo-teacher.sh
 Use the original Qwen3.8-27B teacher:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-f2b-qwen3.8-27b-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/run-tcod-f2b-qwen3.8-27b-teacher.sh
 ```
 
 Use the GRPO-trained Qwen3.5-4B teacher:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-f2b-grpo-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/run-tcod-f2b-grpo-teacher.sh
 ```
 
 F2B starts with one turn and **adds one turn every four training steps**, up to 15 turns:
@@ -131,13 +131,13 @@ k = min(1 + completed_steps // 4, 15)
 B2F uses the GRPO-trained Qwen3.5-4B teacher to generate successful trajectories, then trains a fresh Qwen3.5-4B student. The main launcher collects missing trajectories before starting training:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/run-tcod-b2f-grpo-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/run-tcod-b2f-grpo-teacher.sh
 ```
 
 To collect teacher trajectories without starting student training:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/collect-tcod-b2f-grpo-teacher.sh
+bash examples/agent/webshop-tcod/train/scripts/collect-tcod-b2f-grpo-teacher.sh
 ```
 
 The expert cache is stored under data/webshop-opd/tcod-b2f/ and is excluded from Git.
@@ -147,14 +147,14 @@ The expert cache is stored under data/webshop-opd/tcod-b2f/ and is excluded from
 Run the before-training evaluations with:
 
 ```bash
-bash examples/agent/webshop-opd/eval/scripts/run-student-eval.sh
-bash examples/agent/webshop-opd/eval/scripts/run-teacher-eval.sh
+bash examples/agent/webshop-tcod/eval/scripts/run-student-eval.sh
+bash examples/agent/webshop-tcod/eval/scripts/run-teacher-eval.sh
 ```
 
 The offline test suite does not access model services, Java, or WebShop data:
 
 ```bash
-bash examples/agent/webshop-opd/train/scripts/test-agent-opd.sh
+bash examples/agent/webshop-tcod/train/scripts/test-agent-opd.sh
 ```
 
 Training outputs are written under output/webshop-opd/, including episode records, metrics, reports, and checkpoint manifests. See the [evaluation guide](eval/README.md) for detailed evaluation definitions.
