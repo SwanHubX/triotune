@@ -16,6 +16,22 @@ uv pip install -r examples/agent/webshop-tcod/requirements-webshop.txt
 
 Set JAVA_HOME to a Java 11 installation, or place the JDK under data/webshop-opd/java. CPU-only PyTorch is sufficient because model computation runs through PyTRIO.
 
+The launchers also require envsubst, which is provided by the gettext package.
+
+### Configuration Paths
+
+All YAML paths use PROJECT_ROOT instead of multi-level parent paths:
+
+```yaml
+data:
+  directory: $PROJECT_ROOT/data/webshop-opd/assets
+
+environment:
+  source_dir: $PROJECT_ROOT/data/webshop-opd/WebShop
+```
+
+Each launcher obtains the repository root with Git, exports PROJECT_ROOT, renders the selected YAML into a temporary configuration, and removes that file after the command finishes. The same rendering applies when a custom configuration is supplied with --config.
+
 ## Build the Dataset
 
 **Use the following commands to prepare the dataset.** They download the pinned data files, link them into WebShop, and build a Lucene index for 1,000 products. No model service is used during this process.

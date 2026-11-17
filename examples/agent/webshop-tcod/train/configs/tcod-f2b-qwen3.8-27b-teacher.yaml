@@ -1,11 +1,11 @@
 # Distill Qwen3.8-27B into a fresh Qwen3.5-4B student with TCOD-F2B.
 # Run 200 updates while expanding the student rollout prefix from 1 to 15 turns.
-output_dir: ../../../../../output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
+output_dir: $PROJECT_ROOT/output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
 
 data:
   repo_id: YWZBrandon/webshop-data
   revision: ce990fff5aee388db2706f07820c578ab68e0453
-  directory: ../../../../../data/webshop-opd/assets
+  directory: $PROJECT_ROOT/data/webshop-opd/assets
   local_files_only: true
   split_protocol: official
   seed: 42
@@ -19,7 +19,7 @@ curriculum:
   growth_interval: 4
 
 environment:
-  source_dir: ../../../../../data/webshop-opd/WebShop
+  source_dir: $PROJECT_ROOT/data/webshop-opd/WebShop
   seed: 42
 
 trainer:
@@ -39,7 +39,7 @@ trainer:
     grad_clip_norm: 1.0
   checkpoint:
     save_every: 20
-    state_dir: ../../../../../output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/state
+    state_dir: $PROJECT_ROOT/output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/state
     sampler:
       enabled: true
   evaluation:
@@ -71,7 +71,7 @@ trainer:
     project: webshop-agentrl-TCOD
     tags: [opd, tcod-f2b, qwen3.5-4b, qwen3.8-27b-teacher]
     run_name: tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42
-    log_dir: ../../../../../output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/metrics
+    log_dir: $PROJECT_ROOT/output/webshop-opd/train/tcod-f2b-qwen3.5-4b-qwen3.8-27b-k1-g4-s200-b16-t15-eval1-e20-lr1e-6-kl1-seed42/metrics
     logging_step: 1
 
 agent:

@@ -5,14 +5,14 @@ model:
 data:
   repo_id: YWZBrandon/webshop-data
   revision: ce990fff5aee388db2706f07820c578ab68e0453
-  directory: ../../../../../data/webshop-opd/assets
+  directory: $PROJECT_ROOT/data/webshop-opd/assets
   local_files_only: true
   split_protocol: official
   seed: 42
   train_epochs: 1
   eval_limit: 200
 environment:
-  source_dir: ../../../../../data/webshop-opd/WebShop
+  source_dir: $PROJECT_ROOT/data/webshop-opd/WebShop
   seed: 42
 evaluation:
   # 1: one attempt and Pass@1; 4: four attempts and Pass@4.
@@ -30,4 +30,4 @@ evaluation:
   sampling_timeout: 120
   tool_timeout: 60
   episode_timeout: 1800
-output_dir: ../../../../../output/webshop-opd/eval/student
+output_dir: $PROJECT_ROOT/output/webshop-opd/eval/student

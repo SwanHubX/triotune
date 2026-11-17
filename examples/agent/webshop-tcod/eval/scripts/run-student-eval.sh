@@ -2,7 +2,12 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../.." && pwd)"
+EXAMPLE_ROOT="${REPO_ROOT}/examples/agent/webshop-tcod"
+PROJECT_ROOT="${REPO_ROOT}"
 cd "${REPO_ROOT}"
 source "${SCRIPT_DIR}/setup-java.sh" "$@"
-exec "${PYTHON:-${REPO_ROOT}/.venv/bin/python}" "${SCRIPT_DIR}/../beforetraining_eval.py" \
-  --config "${SCRIPT_DIR}/../configs/student.yaml" "$@"
+source "${EXAMPLE_ROOT}/scripts/render-config.sh"
+render_config_args "${SCRIPT_DIR}/../configs/student.yaml" "$@"
+trap 'rm -f -- "${RENDERED_CONFIG}"' EXIT
+"${PYTHON:-${REPO_ROOT}/.venv/bin/python}" "${SCRIPT_DIR}/../beforetraining_eval.py" \
+  --config "${RENDERED_CONFIG}" "${CONFIG_ARGS[@]}"

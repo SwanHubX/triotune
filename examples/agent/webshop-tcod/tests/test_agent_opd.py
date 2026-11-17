@@ -111,7 +111,7 @@ class ExampleConfigurationTests(unittest.TestCase):
         self.assertEqual(experiment.agent.evaluation.pass_ks, (1,))
         self.assertEqual(experiment.trainer.eval_steps, 20)
         self.assertEqual(experiment.trainer.report_to, "swanlab")
-        self.assertEqual(experiment.trainer.workspace, "pytrio")
+        self.assertEqual(experiment.trainer.workspace, "your-workspace")
         self.assertEqual(experiment.trainer.project, "webshop-agentrl-TCOD")
         self.assertFalse(experiment.agent.async_rollouts)
         self.assertEqual(

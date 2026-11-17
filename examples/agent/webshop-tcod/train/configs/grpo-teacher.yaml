@@ -1,10 +1,10 @@
 # Train a WebShop-specialized Qwen3.5-4B checkpoint for later OPD/TCOD use.
-output_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
+output_dir: $PROJECT_ROOT/output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
 
 data:
   repo_id: YWZBrandon/webshop-data
   revision: ce990fff5aee388db2706f07820c578ab68e0453
-  directory: ../../../../../data/webshop-opd/assets
+  directory: $PROJECT_ROOT/data/webshop-opd/assets
   local_files_only: true
   split_protocol: official
   seed: 42
@@ -12,7 +12,7 @@ data:
   eval_limit: 200
 
 environment:
-  source_dir: ../../../../../data/webshop-opd/WebShop
+  source_dir: $PROJECT_ROOT/data/webshop-opd/WebShop
   seed: 42
   # Preserve dense partial credit while making an exact purchase substantially
   # more valuable relative to an imperfect purchase.  This mixture is applied
@@ -50,7 +50,7 @@ trainer:
     grad_clip_norm: 1.0
   checkpoint:
     save_every: 20
-    state_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/state
+    state_dir: $PROJECT_ROOT/output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/state
     sampler:
       enabled: true
   evaluation:
@@ -64,7 +64,7 @@ trainer:
     workspace: your-workspace
     project: webshop-agentrl-TCOD
     run_name: grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42
-    log_dir: ../../../../../output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/metrics
+    log_dir: $PROJECT_ROOT/output/webshop-opd/train/grpo-teacher-qwen3.5-4b-s200-b8-g8-t15-eval1-e20-lr1e-6-a0.5-seed42/metrics
     logging_step: 1
 
 agent:

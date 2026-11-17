@@ -28,6 +28,12 @@ from webshop_env.data_prepare import cached_files, DataConfig, task_rows
 from webshop_env.environment import SessionPool
 
 
+def render_config(source: Path, directory: str | Path) -> Path:
+    target = Path(directory) / source.name
+    target.write_text(source.read_text().replace("$PROJECT_ROOT", str(ROOT)))
+    return target
+
+
 class AgentTokenizer:
     """Keep inference-only tests independent of optional training dependencies."""
 
@@ -215,8 +221,13 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
 
     def test_policies_share_exactly_200_validation_goals_and_sampling_settings(self):
-        student = evaluation.load_experiment(EVAL / "configs/student.yaml")
-        teacher = evaluation.load_experiment(EVAL / "configs/teacher.yaml")
+        with tempfile.TemporaryDirectory() as directory:
+            student = evaluation.load_experiment(
+                render_config(EVAL / "configs/student.yaml", directory)
+            )
+            teacher = evaluation.load_experiment(
+                render_config(EVAL / "configs/teacher.yaml", directory)
+            )
         self.assertEqual(student.model, "Qwen/Qwen3.5-4B")
         self.assertEqual(teacher.model, "Qwen/Qwen3.8-27B")
         self.assertEqual(student.evaluation, teacher.evaluation)
@@ -272,27 +283,28 @@ class ConfigurationTests(unittest.TestCase):
                 evaluation.EvaluationSettings(**settings)
 
     def test_prepare_cli_uses_local_example_without_opening_model_service(self):
-        argv = [
-            "beforetraining_eval.py",
-            "--config",
-            str(EVAL / "configs/student.yaml"),
-            "--prepare-data",
-            "--download",
-        ]
-        with (
-            patch.object(sys, "argv", argv),
-            patch.object(evaluation, "prepare", return_value={}) as prepare,
-            patch.object(evaluation.pytrio, "ServiceClient") as service,
-            patch("sys.stdout", new_callable=io.StringIO),
-        ):
-            evaluation.main()
-            prepare.assert_called_once()
-            self.assertTrue(prepare.call_args.kwargs["download"])
-            self.assertEqual(
-                prepare.call_args.args[0].data.directory,
-                ROOT / "data/webshop-opd/assets",
-            )
-            service.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [
+                "beforetraining_eval.py",
+                "--config",
+                str(render_config(EVAL / "configs/student.yaml", directory)),
+                "--prepare-data",
+                "--download",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(evaluation, "prepare", return_value={}) as prepare,
+                patch.object(evaluation.pytrio, "ServiceClient") as service,
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                evaluation.main()
+                prepare.assert_called_once()
+                self.assertTrue(prepare.call_args.kwargs["download"])
+                self.assertEqual(
+                    prepare.call_args.args[0].data.directory,
+                    ROOT / "data/webshop-opd/assets",
+                )
+                service.assert_not_called()
 
 
 class DataTests(unittest.TestCase):
@@ -675,7 +687,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_uses_only_base_sampling_client_and_writes_auditable_report(self):
         backend, client = FakeBackend(), SamplingClient(failure=False)
         service = SimpleNamespace(create_sampling_client=lambda **kwargs: client)
-        config = evaluation.load_experiment(EVAL / "configs/student.yaml")
+        with tempfile.TemporaryDirectory() as config_directory:
+            config = evaluation.load_experiment(
+                render_config(EVAL / "configs/student.yaml", config_directory)
+            )
         config = replace(
             config,
             data=replace(config.data, eval_limit=1),
